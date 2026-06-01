@@ -14,6 +14,7 @@ Configuring a server is the opt-in act; MCP is off unless ``mcp.enabled`` is set
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any
 
 log = logging.getLogger("protoagent.mcp")
@@ -50,8 +51,13 @@ def _server_connection(server: dict) -> dict | None:
     if not command:
         return None
     conn = {"transport": "stdio", "command": str(command), "args": list(server.get("args") or [])}
-    if server.get("env"):
-        conn["env"] = dict(server["env"])
+    # Pass the parent environment through to the stdio subprocess. The MCP SDK's
+    # stdio client uses a MINIMAL env by default (PATH/HOME-ish), which strips
+    # custom vars like API keys / base URLs — so a containerized server that
+    # reads e.g. AUTOMAKER_API_KEY from the env would see it unset and fail
+    # discovery. Merge os.environ first; a per-server ``env:`` block still
+    # overrides individual keys on top.
+    conn["env"] = {**os.environ, **{str(k): str(v) for k, v in (server.get("env") or {}).items()}}
     if server.get("cwd"):
         conn["cwd"] = str(server["cwd"])
     return conn
