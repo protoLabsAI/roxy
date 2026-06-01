@@ -1,11 +1,13 @@
 ---
 name: project-operations
 description: >-
-  Use whenever asked to check status, run a sweep, produce a sitrep, or
-  unblock work across the ProtoMaker portfolio. Describes how to read a
-  ProtoMaker workspace's state with the read-only filesystem tools and decide
-  whether work is flowing, stalled, or blocked — and what to do about it.
+  Use whenever asked to check status, run a sweep, produce a sitrep, decompose a
+  project, or keep work flowing across the protoMaker board. Describes how to read a
+  protoMaker workspace's state (read-only filesystem) and how to act on the board
+  (the automaker MCP tools) — decide whether work is flowing, stalled, or blocked, and
+  take the smallest action that keeps projects getting done.
 tools:
+  # Read-only state (filesystem fence — code is never written)
   - list_projects
   - read_file
   - list_dir
@@ -14,65 +16,116 @@ tools:
   - run_command
   - check_inbox
   - schedule_task
+  # Board reads (automaker MCP)
+  - automaker__query_board
+  - automaker__list_features
+  - automaker__get_feature
+  - automaker__get_dependency_graph
+  - automaker__get_execution_order
+  - automaker__list_queue
+  - automaker__get_sitrep
+  - automaker__get_briefing
+  - automaker__health_check
+  - automaker__get_auto_mode_status
+  - automaker__list_running_agents
+  - automaker__get_lifecycle_status
+  - automaker__get_run_telemetry
+  - automaker__get_agent_output
+  - automaker__generate_report
+  - automaker__list_projects
+  - automaker__get_project
+  - automaker__check_pr_status
+  # Board writes — features/milestones/decomposition (never code)
+  - automaker__research_repo
+  - automaker__generate_project_prd
+  - automaker__submit_prd
+  - automaker__approve_project_prd
+  - automaker__save_project_milestones
+  - automaker__create_project_features
+  - automaker__create_feature
+  - automaker__update_feature
+  - automaker__set_feature_dependencies
+  - automaker__queue_feature
+  - automaker__reconcile_feature_with_pr
+  # Dispatch / unblock
+  - automaker__start_auto_mode
+  - automaker__stop_auto_mode
+  - automaker__launch_project
+  - automaker__send_message_to_agent
+  # Escalation
+  - automaker__request_user_input
+  - automaker__list_pending_forms
+  - automaker__submit_form_response
 ---
 
-# Keeping a ProtoMaker portfolio flowing
+# Running the protoMaker board
 
-You monitor and unblock — you never edit code. Everything below is *reading*
-state and *acting* by nudging / dispatching / escalating.
+I run the board — I never write code. Below is how I *read* a project's state and how I
+*act* on it (shape work, manage features, dispatch, escalate) through the protoMaker tools.
 
-## A ProtoMaker workspace
+## A protoMaker workspace
 
-Each managed project is a git repo that is also a ProtoMaker workspace:
+Each managed project is a git repo that is also a protoMaker workspace:
 
-- **Board** — `.beads/issues.jsonl` (one JSON object per line). Read it with
-  `read_file <project> .beads/issues.jsonl`. Each issue has `status`
-  (`open` / `in_progress` / `blocked` / `closed`), `priority`, `issue_type`,
-  `title`, `labels`, `dependencies`. The board is the source of truth for what
-  work exists and where it's stuck.
-- **Feature pipeline** — `.automaker/features/` (queued/active features),
-  `.automaker/projects/` (project specs). `find_files <project> ".automaker/**"`
-  to enumerate; `read_file` the ones that matter.
-- **Git / PRs / CI** — `run_command <project> "git status"`,
-  `run_command <project> "git log --oneline -10"`,
-  `run_command <project> "gh pr list --state open"`,
-  `run_command <project> "gh pr checks <n>"`. (Read-only commands only.)
+- **Board** — read it through the `automaker` tools, not the raw files:
+  `automaker__query_board` / `automaker__list_features` for what work exists,
+  `automaker__get_feature` for detail, `automaker__get_dependency_graph` /
+  `automaker__get_execution_order` for the ordering. (The on-disk
+  `.beads/issues.jsonl` and `.automaker/features/` mirror this if I need to read state
+  directly with `read_file`.)
+- **Code state** — read-only: `read_file`, `list_dir`, `find_files`, `search_files`, and
+  `run_command` (`git status`, `git log --oneline -10`, `gh pr list --state open`,
+  `gh pr checks <n>`, `br list`). Read-only commands only.
+- **Run state** — `automaker__get_auto_mode_status`, `automaker__list_running_agents`,
+  `automaker__get_run_telemetry`, `automaker__health_check`.
 
-Start a sweep with `list_projects` to see the portfolio + which are read-only.
+Start a sweep with `list_projects` (the registry) + `automaker__get_sitrep`.
 
 ## Deciding: flowing / stalled / blocked
 
 For each project:
 
-- **✓ flowing** — open/in_progress issues have recent commit or PR activity;
-  PRs are progressing; CI green.
-- **⚠ stalled** — open work with **no recent activity** (no commits/PR movement
-  in N days), a PR idle past N days, **red CI**, or a dirty tree on the main
-  branch. Stalls are *capacity/attention* problems.
-- **⛔ blocked** — an issue explicitly `blocked`, a feature waiting on a
-  dependency / decision / human, or a dependency edge pointing at unfinished
-  work. Blockers are *decision/dependency* problems.
+- **✓ flowing** — features have recent commit or PR activity; PRs are progressing; CI green;
+  auto-mode picking up ready work.
+- **⚠ stalled** — ready work with **no recent activity** (no commits/PR movement in N days),
+  a PR idle past N days, **red CI**, a dirty main tree, or auto-mode stopped with work queued.
+  Stalls are *capacity/attention* problems.
+- **⛔ blocked** — a feature explicitly `blocked`, work waiting on a dependency / decision /
+  human, or a dependency edge pointing at unfinished work. Blockers are *decision/dependency*
+  problems.
 
-Never fabricate: if a workspace can't be read (missing `.beads`, git error),
-report it as "unknown — couldn't read state" rather than guessing.
+Never fabricate: if a workspace can't be read, report it as "unknown — couldn't read state".
+
+## Shaping new work (decomposition)
+
+When handed a project or a raw idea, build well-shaped board work:
+
+1. `automaker__research_repo` — understand the codebase first.
+2. `automaker__generate_project_prd` → `automaker__submit_prd` — draft a SPARC PRD; pause at
+   the human approval gate (`automaker__approve_project_prd`).
+3. `automaker__save_project_milestones` — epics → milestones → phases.
+4. `automaker__create_project_features` / `automaker__create_feature` +
+   `automaker__set_feature_dependencies` — generate dependency-ordered board features.
+5. `automaker__launch_project` / `automaker__start_auto_mode` — start execution.
 
 ## Acting (smallest unblock first)
 
-1. **Coordinate, don't collide.** Before touching a feature, check whether a
-   ProtoMaker agent already owns it (board `status: in_progress` + recent
-   activity). If so, leave it — don't thrash in-flight work.
-2. **Stalled** → nudge: re-dispatch the ProtoMaker team for that project (via
-   the Studio MCP / Workstacean bus if available), or create/raise a feature to
-   resume the work.
-3. **Blocked** → if the blocker is mechanical (a dependency that's actually
-   done, a stale flag), note it; if it needs a human call, **escalate** with a
-   crisp ask (what's blocked, why, the decision needed).
-4. **Escalate** via the inbox / Activity thread for anything consequential or
-   irreversible. Report the sweep back to whoever summoned you.
+1. **Coordinate, don't collide.** Before touching a feature, check whether a protoMaker
+   agent already owns it (`automaker__list_running_agents`, feature `in_progress` + recent
+   activity). If so, leave it.
+2. **Stalled** → nudge: `automaker__start_auto_mode` / `automaker__queue_feature`, or
+   `automaker__send_message_to_agent` to re-dispatch; create/raise a feature to resume work.
+3. **Blocked** → if mechanical (a dependency that's actually done, a stale flag), fix the
+   board with `automaker__update_feature` / `automaker__set_feature_dependencies`; if it needs
+   a human call, **escalate** (`automaker__request_user_input` / inbox) with a crisp ask.
+4. **PRs** → I track status only (`automaker__check_pr_status`) and keep feature↔PR state
+   honest (`automaker__reconcile_feature_with_pr`). **I do not review PRs — that is Quinn's
+   job.** I never merge.
+5. **Escalate** anything consequential or irreversible. Report the sweep back to whoever
+   summoned me.
 
 ## Output
 
-Lead with a one-line portfolio roll-up (`N flowing · M stalled · K blocked`),
-then a one-liner per project: `✓ flowing` / `⚠ stalled — <reason>` /
-`⛔ blocked — <reason> → <action taken or escalation>`. Name the project, the
-signal, and the action. No filler.
+Lead with a one-line portfolio roll-up (`N flowing · M stalled · K blocked`), then a
+one-liner per project: `✓ flowing` / `⚠ stalled — <reason>` / `⛔ blocked — <reason> →
+<action taken or escalation>`. Name the project, the signal, and the action. No filler.
