@@ -344,6 +344,16 @@ server — not the client — decides which directories they may read and write.
 - The runtime-status `project.allowed_dirs` field feeds the project-path
   picker's suggestions; it does not relax the server-side check.
 
+## Studio & Activity surfaces (the control stack)
+
+Per [ADR 0009](/adr/0009-studio-control-stack), the Studio tabs are ordered by
+altitude — **Goals** (autonomy: when to stop) → **Workflows** (orchestration: the
+order) → **Run** (execution: one focused worker, with the Single/Batch toggle).
+They're layers of one control loop, not peers. **Schedule** moved to **Activity**
+(Thread · Inbox · Schedule) — cron is a *trigger* ("when"), grouped with the
+inbox/event-bus (ADR 0003), not a Studio work-type. Skills moved to the
+**Knowledge ▸ Playbooks** surface (below) — they're retrieved memory, not work.
+
 ## Telemetry surface
 
 The **System ▸ Telemetry** sub-tab (`apps/web/src/telemetry/TelemetrySurface.tsx`,
@@ -352,6 +362,18 @@ cost, turns, success rate, cache-hit %, p50/p95 latency, tokens, tool calls), a
 by-model table, and a recent-turns table. It reads `GET /api/telemetry/summary`
 + `/api/telemetry/recent` — no chat-stream coupling — and degrades to a clear
 note when the store is disabled or empty.
+
+## Playbooks surface
+
+The **Knowledge ▸ Playbooks** surface (`apps/web/src/playbooks/PlaybooksSurface.tsx`,
+ADR 0009) browses the procedural-memory skill index (`skills.db`) the operator
+was otherwise blind to. It lists each skill as **pinned** (a `SKILL.md` on disk,
+re-seeded at boot) or **learned** (agent-emitted, curated/decaying), with
+confidence + last-used, a search filter, and delete-with-confirm. Reads
+`GET /api/playbooks`; deletes via `DELETE /api/playbooks/{id}`. "Playbooks" is
+the operator-facing name for skill-v1 artifacts — see ADR 0009 (it disambiguates
+from the A2A agent-card `skills` field). Confidence-tuning + curator-audit
+read-back are noted follow-ups.
 
 ## Settings surface
 

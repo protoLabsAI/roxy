@@ -11,6 +11,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Docs
+- Reconcile drift after the recent releases: fix the deploy guide's stale
+  "every merge auto-cuts a patch" note (releases are manual now), document the
+  UI tiers + `--build-arg UI=full` for the image, link the orphaned "Eval your
+  fork" guide, and run the OpenShell deploy example with `--ui none`.
+
+## [0.8.0] - 2026-06-01
+
+### Added
+- **Headless setup + UI deployment tiers** (ADR 0010): `--ui {full,console,none}`
+  (env `PROTOAGENT_UI`). `none` serves API + A2A + `/metrics` only — no Gradio,
+  no React console — the lean headless stack. `python server.py --setup` (and
+  boot-time auto-complete in the `none` tier) finishes setup from a validated
+  config — no wizard. `GET /healthz` readiness probe (503 until the graph
+  compiles). `gradio` is now an optional dep (`requirements-core.txt` vs
+  `requirements-ui.txt`); the Docker image defaults to the lean tier
+  (`--build-arg UI=full` for the all-in-one). `--headless` is a deprecated alias
+  for `--ui console`.
+
+## [0.7.0] - 2026-06-01
+
+### Added
+- **Playbooks surface** (ADR 0009) — a Knowledge ▸ Playbooks console surface to
+  browse + manage the procedural-memory skill index (`skills.db`): pinned
+  (SKILL.md) vs learned (agent-emitted), confidence/last-used, search, and
+  delete-with-confirm. New API: `GET /api/playbooks` + `DELETE /api/playbooks/{id}`.
+
+### Changed
+- **Studio console reshaped to the control stack** (ADR 0009): tabs ordered
+  Goals → Workflows → **Run** (Single/Batch is a mode on Run, not a tab);
+  **Schedule** moved to **Activity** (it's a trigger, not a work-type). Skills
+  now live under **Knowledge ▸ Playbooks**.
+- Default model alias is now **`protolabs/reasoning`** (was `protolabs/agent`) —
+  forks point at the reasoning model out of the box (override per agent in YAML).
+
+## [0.6.0] - 2026-06-01
+
 ### Added
 - **Operator primitives** (ADR 0007): a fenced multi-project filesystem toolset
   (`tools/fs_tools.py`) + project registry — opt-in, off by default. Enables a
@@ -20,6 +57,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   NVIDIA OpenShell sandbox policy from config (project registry → Landlock
   paths, egress allowlist + gateway → network policy). New guides:
   "Build an operator fork (Roxy)" and "Sandboxing & egress".
+- **Run protoAgent under OpenShell** — `deploy/openshell/` managed example:
+  gateway compose + a sandbox-create script (Docker), and Helm values + an
+  Agent-Sandbox CRD template (Kubernetes), policy generated from config.
 
 ## [0.5.1] - 2026-06-01
 
