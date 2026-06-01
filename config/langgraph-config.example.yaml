@@ -1,10 +1,32 @@
-# protoAgent — LangGraph runtime configuration
+# Roxy — ProtoMaker Portfolio Manager (a protoAgent fork)
 #
-# The template ships with a single ``researcher`` subagent and no knowledge
-# store. Fork this file to match your agent's skills / subagents /
-# middleware needs. Anything referenced here must also have a matching
-# entry in ``graph/subagents/config.py`` (for subagents) or a tool
-# registered in ``tools/lg_tools.py``.
+# Roxy MONITORS and UNBLOCKS a portfolio of ProtoMaker workspaces — she does
+# not write code. Copy this to ``config/langgraph-config.yaml`` (gitignored)
+# and set your real project paths + A2A bearer there. The committed file is the
+# example template. See docs (upstream): guides/operator-fork.md.
+
+# Agent identity — namespaces metrics/stores + names the agent on its card.
+identity:
+  name: roxy
+
+# A2A — Roxy is summoned over A2A (message/send · message/stream) and dispatched
+# by the protoWorkstacean bus. Set a bearer so inbound is authenticated (or via
+# the A2A_AUTH_TOKEN env). Leave blank only for trusted local testing.
+auth:
+  token: ""  # set in the live (gitignored) config or A2A_AUTH_TOKEN env
+
+# Fenced multi-project filesystem (ADR 0007) — Roxy's read-only window onto the
+# portfolio. Every project is write:false (she monitors, never edits);
+# allow_run gives her git/gh/br READS via run_command. Replace these example
+# projects with your real workspace paths in the live config.
+filesystem:
+  enabled: true
+  allow_run: true
+  projects:
+    - { name: orbis,    path: /work/ORBIS,    write: false }
+    - { name: pixelgen, path: /work/pixelgen, write: false }
+    # - { name: <project>, path: /work/<dir>, write: false }
+
 
 model:
   provider: openai

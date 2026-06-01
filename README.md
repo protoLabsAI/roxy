@@ -1,3 +1,20 @@
+# Roxy — ProtoMaker Portfolio Manager
+
+> **A [protoAgent](https://github.com/protoLabsAI/protoAgent) fork.** Roxy
+> **monitors and unblocks** a portfolio of ProtoMaker workspaces — she does not
+> write code. Summoned over A2A; dispatched via the protoWorkstacean bus. She
+> watches each project's board / features / PRs / CI, flags stalls and blockers,
+> takes the smallest unblocking action (nudge, re-dispatch, escalate), and
+> reports a portfolio sitrep.
+>
+> The operator behavior lives in **`config/SOUL.md`** (persona) + the
+> **`project-operations`** skill (`config/skills/`) + **`config/langgraph-config.yaml`**
+> (read-only project registry) — composed from protoAgent's generic primitives
+> (the fenced filesystem toolset, ADR 0007). Pull template updates from the
+> `upstream` remote. See protoAgent's `docs/guides/operator-fork.md`.
+
+---
+
 # protoAgent
 
 Template repository for building protoLabs A2A agents on LangGraph.
