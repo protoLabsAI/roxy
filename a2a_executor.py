@@ -422,8 +422,18 @@ def _terminal_parts(
             cost_usd=round(cost_usd, 6) if cost_usd > 0 else None,
             success=success,
         )))
-    if confidence is not None:
-        parts.append(_ext_data_part(pa.emit_confidence(
-            confidence, explanation=confidence_expl, success=success,
-        )))
+    # Always emit confidence-v1 — it's declared on the agent card, so the fleet
+    # expects a sample every turn (roxy#22). Prefer the model's self-reported
+    # <confidence> when present (real self-assessment); otherwise fall back to a
+    # programmatic default keyed on the turn outcome, with an honest explanation,
+    # so the DataPart is never absent.
+    if confidence is None:
+        confidence = 0.9 if success else 0.4
+        confidence_expl = confidence_expl or (
+            "default — clean completion, no explicit self-assessment"
+            if success else "default — turn did not complete cleanly"
+        )
+    parts.append(_ext_data_part(pa.emit_confidence(
+        confidence, explanation=confidence_expl, success=success,
+    )))
     return parts
