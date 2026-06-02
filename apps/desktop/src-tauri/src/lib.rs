@@ -1,9 +1,10 @@
+use std::net::TcpListener;
 use std::sync::Mutex;
 
 use tauri::{
     menu::{Menu, MenuItem, PredefinedMenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
-    AppHandle, Manager, RunEvent, Runtime, WindowEvent,
+    AppHandle, Manager, RunEvent, Runtime, WebviewUrl, WebviewWindowBuilder, WindowEvent,
 };
 use tauri_plugin_global_shortcut::{Code, Modifiers, Shortcut, ShortcutState};
 use tauri_plugin_shell::{
@@ -11,21 +12,32 @@ use tauri_plugin_shell::{
     ShellExt,
 };
 
-/// Port the bundled server binds and the React console talks to. Matches the
-/// connect-to-local-server default in `apps/web/src/lib/api.ts`.
-const SIDECAR_PORT: &str = "7870";
+/// Fallback port if probing for a free one fails (matches the historical
+/// hardcoded default + the web client's last-resort base).
+const FALLBACK_PORT: u16 = 7870;
+
+/// Pick a free localhost port for the bundled sidecar, so several agents (and a
+/// pre-existing server on 7870) can coexist without a collision. We bind :0,
+/// read the OS-assigned port, then drop the listener and hand the port to the
+/// sidecar — a tiny TOCTOU window, acceptable for a single local launch.
+fn pick_free_port() -> u16 {
+    TcpListener::bind("127.0.0.1:0")
+        .and_then(|l| l.local_addr())
+        .map(|addr| addr.port())
+        .unwrap_or(FALLBACK_PORT)
+}
 
 /// Holds the running sidecar so it can be killed when the app exits.
 #[derive(Default)]
 struct SidecarProcess(Mutex<Option<CommandChild>>);
 
-/// Launch the bundled headless protoAgent server as a sidecar.
+/// Launch the bundled protoAgent server (console UI tier) as a sidecar.
 ///
 /// The frozen binary is read-only, so its writable state (live config,
 /// secrets, setup marker) is pointed at the per-user app-config dir via
 /// `PROTOAGENT_CONFIG_DIR`. Failures are logged, not fatal — the window still
 /// opens (and shows the API error) rather than the whole app refusing to boot.
-fn spawn_sidecar<R: Runtime>(app: &AppHandle<R>) {
+fn spawn_sidecar<R: Runtime>(app: &AppHandle<R>, port: u16) {
     let config_dir = match app.path().app_config_dir() {
         Ok(dir) => dir,
         Err(e) => {
@@ -45,9 +57,16 @@ fn spawn_sidecar<R: Runtime>(app: &AppHandle<R>) {
             return;
         }
     };
+    let port_arg = port.to_string();
     let command = command
-        .args(["--headless", "--port", SIDECAR_PORT])
-        .env("PROTOAGENT_HEADLESS", "1")
+        // The desktop renders the React operator console, so run the server in
+        // its 'console' UI tier (API + A2A + console, no Gradio) — ADR 0010.
+        // (Was the now-deprecated --headless / PROTOAGENT_HEADLESS alias.)
+        .args(["--ui", "console", "--port", &port_arg])
+        .env("PROTOAGENT_UI", "console")
+        // So the sidecar exits if we die without a clean kill (the frozen
+        // onefile's child process otherwise outlives us, holding its port).
+        .env("PROTOAGENT_PARENT_PID", std::process::id().to_string())
         .env("PROTOAGENT_CONFIG_DIR", config_dir.to_string_lossy().to_string());
 
     let (mut rx, child) = match command.spawn() {
@@ -120,7 +139,12 @@ fn build_tray(app: &tauri::App) -> tauri::Result<()> {
     let separator = PredefinedMenuItem::separator(app)?;
     let menu = Menu::with_items(app, &[&show, &hide, &separator, &quit])?;
 
-    let mut builder = TrayIconBuilder::new()
+    // The protoLabs robot mark, at the menu-bar size + template treatment Orbis
+    // used for fleet agents (icons/tray-robot.png, 44×44; system-tinted). Each
+    // protoLabs.studio app owns its own menu-bar item.
+    let icon = tauri::image::Image::from_bytes(include_bytes!("../icons/tray-robot.png"))?;
+    let builder = TrayIconBuilder::new()
+        .icon(icon)
         .menu(&menu)
         .tooltip("protoAgent")
         .icon_as_template(true)
@@ -144,10 +168,6 @@ fn build_tray(app: &tauri::App) -> tauri::Result<()> {
             _ => {}
         });
 
-    if let Some(icon) = app.default_window_icon().cloned() {
-        builder = builder.icon(icon);
-    }
-
     builder.build(app)?;
     Ok(())
 }
@@ -156,6 +176,10 @@ fn build_tray(app: &tauri::App) -> tauri::Result<()> {
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
+        // Notifications — bridges the web Notification API in the webview so the
+        // console can alert (e.g. a HITL form awaiting input) even when the
+        // menu-bar window is hidden.
+        .plugin(tauri_plugin_notification::init())
         .plugin(
             tauri_plugin_global_shortcut::Builder::new()
                 .with_shortcut(Shortcut::new(
@@ -179,8 +203,47 @@ pub fn run() {
                 )?;
             }
             app.manage(SidecarProcess::default());
-            spawn_sidecar(app.handle());
-            build_tray(app)?;
+
+            // Pick a free port, boot the sidecar on it, and create the window
+            // ourselves so we can inject the chosen API base *before* any page
+            // script runs (race-free). The web client reads
+            // `window.__PROTOAGENT_API_BASE__` (see apps/web/src/lib/api.ts).
+            let port = pick_free_port();
+            spawn_sidecar(app.handle(), port);
+            let init = format!(
+                "window.__PROTOAGENT_API_BASE__ = \"http://127.0.0.1:{port}\";"
+            );
+            let mut win = WebviewWindowBuilder::new(app, "main", WebviewUrl::default())
+                .title("protoAgent")
+                .inner_size(1280.0, 820.0)
+                .min_inner_size(980.0, 640.0)
+                .resizable(true)
+                .center()
+                .initialization_script(&init);
+            // Invisible title bar (macOS): no opaque chrome — content fills the
+            // frame and the native traffic lights float top-left. The web shell
+            // restores window-dragging + insets its topbar for the lights
+            // (apps/web `.is-tauri`). ADR-adjacent polish for the desktop build.
+            #[cfg(target_os = "macos")]
+            {
+                win = win
+                    .title_bar_style(tauri::TitleBarStyle::Overlay)
+                    .hidden_title(true);
+            }
+            win.build()?;
+
+            // Menu-bar-only: build the tray, and only drop the dock icon
+            // (Accessory) if it succeeds — so a tray failure leaves us reachable
+            // in the dock rather than with no way to surface the window. Closing
+            // the window then hides the UI while the app + sidecar keep running
+            // in the menu bar; the tray's Quit is the real exit.
+            match build_tray(app) {
+                Ok(()) => {
+                    #[cfg(target_os = "macos")]
+                    let _ = app.set_activation_policy(tauri::ActivationPolicy::Accessory);
+                }
+                Err(e) => log::error!("tray setup failed; staying in the dock: {e}"),
+            }
             Ok(())
         })
         .on_window_event(|window, event| {

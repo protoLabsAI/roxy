@@ -7,13 +7,16 @@
   ],
   "permissions": [
     "core:default",
+    "core:window:allow-start-dragging",
+    "shell:allow-open",
+    "notification:default",
     {
       "identifier": "shell:allow-execute",
       "allow": [
         {
           "name": "binaries/protoagent-server",
           "sidecar": true,
-          "args": ["--headless", "--port", { "validator": "\\d+" }]
+          "args": ["--ui", "console", "--port", { "validator": "\\d+" }]
         }
       ]
     }

@@ -4,9 +4,10 @@ This is the main entry point. It:
 
 1. Initializes LangGraph (``graph/agent.py``) + the LiteLLM gateway
    connection via ``graph/llm.py``.
-2. Mounts the full A2A surface (``a2a_handler.register_a2a_routes``)
+2. Mounts the full A2A 1.0 surface (``a2a-sdk`` ``DefaultRequestHandler`` +
+   ``a2a_executor.ProtoAgentExecutor``, conventions via ``protolabs_a2a``)
    — JSON-RPC on ``POST /a2a``, SSE streaming, push notifications,
-   ``tasks/*`` CRUD, agent card at ``/.well-known/agent.json``.
+   ``tasks/*`` CRUD, agent card at ``/.well-known/agent-card.json``.
 3. Mounts an OpenAI-compatible chat-completions endpoint so the agent
    can be registered as a model in the LiteLLM gateway / OpenWebUI.
 4. Optionally mounts a Gradio chat UI for direct operator access.
@@ -15,8 +16,8 @@ This is the main entry point. It:
 
 ### Forking checklist
 
-- Change the agent identity in ``_build_agent_card`` (name, description,
-  skills, extensions).
+- Change the agent identity in ``_build_agent_card_proto`` /
+  ``protolabs_a2a.build_agent_card`` (name, description, skills, extensions).
 - Drop ``SOUL.md`` in the workspace to override the default agent prompt.
 - Add your real tools to ``tools/lg_tools.py`` and wire them into
   ``graph/subagents/config.py`` if you want specialized delegation.
@@ -32,6 +33,8 @@ import os
 import re
 import sys
 import time
+
+import httpx
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -99,6 +102,61 @@ _goal_controller = None  # Optional GoalController (goal mode). Parses /goal
 _event_bus = EventBus()  # Server→client SSE push channel (ADR 0003). Process-
                          # lifetime singleton; producers publish, /api/events
                          # streams to connected consoles.
+
+
+def _resolve_operator_project_root() -> str:
+    """The operator console's default project root (+ its always-allowed dir).
+
+    In a source checkout this is the repo root (``__file__``'s dir). But in a
+    PyInstaller-frozen sidecar (the desktop app) ``__file__`` lives inside the
+    ephemeral ``_MEIxxxx`` onefile extraction dir — which doesn't persist and
+    isn't a real workspace, so the console's project-scoped APIs (notes/beads)
+    fail with "project_path does not exist". Resolve a stable, writable dir
+    instead: an explicit ``PROTOAGENT_PROJECT_DIR`` wins; else (when frozen) the
+    per-user app dir the desktop already provides via ``PROTOAGENT_CONFIG_DIR``,
+    else the home dir."""
+    env = os.environ.get("PROTOAGENT_PROJECT_DIR")
+    if env:
+        return str(Path(env).expanduser().resolve())
+    if getattr(sys, "frozen", False):
+        cfg = os.environ.get("PROTOAGENT_CONFIG_DIR")
+        base = Path(cfg) if cfg else Path.home()
+        return str(base.expanduser().resolve())
+    return str(Path(__file__).parent.resolve())
+
+
+def _install_parent_death_watchdog() -> None:
+    """Exit if the launcher process (``PROTOAGENT_PARENT_PID``) goes away.
+
+    Set by the desktop's Tauri shell (apps/desktop/src-tauri/src/lib.rs) when it
+    spawns this server as a sidecar. A PyInstaller onefile runs as a bootloader
+    + re-exec'd child, so the shell killing the tracked bootloader on exit can
+    leave this process orphaned and holding its port. Polling the launcher PID
+    and exiting when it dies reaps the whole tree regardless of how the shell
+    went away (clean quit, crash, or SIGKILL). No-op when the env isn't set
+    (normal standalone / container runs)."""
+    ppid_s = os.environ.get("PROTOAGENT_PARENT_PID")
+    if not ppid_s:
+        return
+    try:
+        ppid = int(ppid_s)
+    except ValueError:
+        return
+
+    import threading
+
+    def _watch() -> None:
+        while True:
+            time.sleep(2)
+            try:
+                os.kill(ppid, 0)  # signal 0 = liveness probe; raises if gone
+            except OSError:
+                log.info("[watchdog] launcher pid %d gone — exiting sidecar", ppid)
+                os._exit(0)
+            except Exception:  # noqa: BLE001 — never let the watchdog crash the server
+                return
+
+    threading.Thread(target=_watch, daemon=True, name="parent-death-watchdog").start()
 
 
 def _init_langgraph_agent(headless_setup: bool = False):
@@ -495,54 +553,6 @@ def _build_inbox_store(config):
         return None
 
 
-def _build_a2a_task_persistence():
-    """Durable A2A task-record store (survives restart/eviction, 24h TTL,
-    instance-scoped per ADR 0004). Best-effort; failure → tasks in-memory only."""
-    from a2a_task_store import A2ATaskPersistence
-
-    configured = scope_leaf(Path("/sandbox/a2a-tasks.db"))
-    try:
-        configured.parent.mkdir(parents=True, exist_ok=True)
-        if not os.access(configured.parent, os.W_OK):
-            raise OSError
-        path = str(configured)
-    except OSError:
-        fallback = scope_leaf(Path.home() / ".protoagent" / "a2a-tasks.db")
-        fallback.parent.mkdir(parents=True, exist_ok=True)
-        path = str(fallback)
-    try:
-        return A2ATaskPersistence(path)
-    except Exception:
-        log.exception("[a2a] failed to build task persistence at %s; tasks in-memory only", path)
-        return None
-
-
-def _build_a2a_push_store():
-    """Durable A2A push-config store (A2A spec / ADR 0003). Path resolves like
-    the other stores (/sandbox → ~/.protoagent fallback) and is instance-scoped
-    (ADR 0004). Best-effort; a failure leaves push configs in-memory only."""
-    from a2a_push_store import A2APushStore
-
-    configured = scope_leaf(Path("/sandbox/a2a-push.db"))
-    try:
-        configured.parent.mkdir(parents=True, exist_ok=True)
-        if not os.access(configured.parent, os.W_OK):
-            raise OSError
-        path = str(configured)
-    except OSError:
-        fallback = scope_leaf(Path.home() / ".protoagent" / "a2a-push.db")
-        fallback.parent.mkdir(parents=True, exist_ok=True)
-        path = str(fallback)
-    try:
-        store = A2APushStore(path)
-        loaded = store.load()  # sweep expired + report survivors
-        log.info("[a2a] push-config store ready (%d persisted) at %s", len(loaded), path)
-        return store
-    except Exception:
-        log.exception("[a2a] failed to build push-config store at %s; configs in-memory only", path)
-        return None
-
-
 def _build_telemetry_store(config):
     """Local per-turn telemetry store (ADR 0006 Slice 2). Path resolves like the
     other stores (/sandbox → ~/.protoagent fallback) and is instance-scoped
@@ -859,12 +869,12 @@ def _reload_langgraph_agent() -> tuple[bool, str]:
     except Exception:  # noqa: BLE001 — never block a reload on the egress update
         pass
     try:
-        from a2a_handler import set_a2a_token
+        import a2a_auth
 
-        set_a2a_token(new_config.auth_token or None)
+        a2a_auth.set_bearer_token(new_config.auth_token or None)
     except ImportError:
-        # a2a_handler not yet imported (e.g. during early-boot reload
-        # before _main wires routes) — harmless.
+        # a2a_auth not yet imported (e.g. during early-boot reload before
+        # _main wires routes) — harmless.
         pass
     _graph = new_graph
     _workflow_registry = new_workflow_registry
@@ -1210,10 +1220,12 @@ def _interrupt_payload(val) -> dict:
     """Shape a LangGraph interrupt value into the ``input-required`` payload the
     A2A layer parks and the console renders. Richer HITL shapes pass through:
     ``ask_human`` → ``{"question": …}``; ``request_user_input`` → ``{"kind":"form",
-    "title", "description", "steps":[…]}``. Anything else degrades to a question
-    with the stringified value. The console renders by shape (prompt vs JSON-schema
-    form); the resume value is a string for a question, a dict for a form."""
-    if isinstance(val, dict) and (val.get("question") or val.get("kind") == "form"):
+    "title", "description", "steps":[…]}``; ``run_command`` approval →
+    ``{"kind":"approval", "title", "detail", …}``. Anything else degrades to a
+    question with the stringified value. The console renders by shape (prompt vs
+    JSON-schema form vs Approve/Deny); the resume value is a string for a
+    question, a dict for a form, and a decision for an approval."""
+    if isinstance(val, dict) and (val.get("question") or val.get("kind") in ("form", "approval")):
         return val
     return {"question": (str(val) if val is not None else "Input required.")}
 
@@ -1445,8 +1457,8 @@ async def _chat_langgraph_stream(
     resume: bool = False,
 ):
     """Async generator — yields (event_type, payload) tuples from the
-    LangGraph run. Consumed by ``a2a_handler.register_a2a_routes`` to
-    drive the background task runner + SSE streaming.
+    LangGraph run. Consumed by ``a2a_executor.ProtoAgentExecutor`` to
+    drive the SDK task lifecycle + SSE streaming.
 
     Event contract (matches what the A2A handler expects):
 
@@ -1768,22 +1780,49 @@ def _bearer_configured() -> bool:
     return bool(os.environ.get("A2A_AUTH_TOKEN", "") or (_graph_config and _graph_config.auth_token))
 
 
-def _build_security_schemes() -> dict:
-    """Return securitySchemes dict, adding bearer only when A2A_AUTH_TOKEN is set."""
-    schemes: dict = {"apiKey": {"type": "apiKey", "in": "header", "name": "X-API-Key"}}
-    if _bearer_configured():
-        schemes["bearer"] = {"type": "http", "scheme": "bearer"}
-    return schemes
+def _agent_skills():
+    """Roxy's A2A skills — the protoMaker-board PM surface the fleet dispatches
+    (Workstacean ceremonies send these as ``skillHint``; the executor surfaces
+    them as ``[skill: <id>]`` so the skill loop keys on them)."""
+    from a2a.types import AgentSkill
 
-
-def _build_security_requirements() -> list[dict]:
-    """The `security` array — which schemes a caller may use. Advertises bearer
-    (as an OR alternative) when a token is configured, so the served card
-    actually tells clients bearer is accepted, not just apiKey."""
-    reqs: list[dict] = [{"apiKey": []}]
-    if _bearer_configured():
-        reqs.append({"bearer": []})
-    return reqs
+    return [
+        AgentSkill(
+            id="portfolio_sitrep",
+            name="Portfolio SitRep",
+            description="Sweep every managed protoMaker project and return a roll-up: a portfolio total then per-project flowing / stalled / blocked.",
+            tags=["pm", "status"],
+            examples=["portfolio_sitrep"],
+        ),
+        AgentSkill(
+            id="board_sweep",
+            name="Board Sweep",
+            description="Sweep the portfolio, then take the smallest unblocking action per project and report what was done.",
+            tags=["pm", "unblock"],
+            examples=["board_sweep", "board_sweep protocli"],
+        ),
+        AgentSkill(
+            id="project_decompose",
+            name="Project Decompose",
+            description="Decompose a project into epics -> milestones -> features (research -> PRD -> milestones -> features), pausing at the human approval gate.",
+            tags=["pm", "planning"],
+            examples=["project_decompose <project>"],
+        ),
+        AgentSkill(
+            id="unblock_feature",
+            name="Unblock Feature",
+            description="Investigate a blocked/stalled feature and take the smallest unblocking action, or escalate with a crisp ask.",
+            tags=["pm", "unblock"],
+            examples=["unblock_feature <featureId>"],
+        ),
+        AgentSkill(
+            id="chat",
+            name="Chat",
+            description="General-purpose chat / Q&A about the portfolio.",
+            tags=["general"],
+            examples=["what's the portfolio status?"],
+        ),
+    ]
 
 
 def _package_version() -> str:
@@ -1816,90 +1855,92 @@ def _package_version() -> str:
     return "0.0.0"
 
 
-def _build_agent_card(host: str) -> dict:
-    """Build the A2A agent card served at /.well-known/agent-card.json.
+def _build_agent_card_proto(host: str):
+    """Build the A2A 1.0 ``AgentCard`` (proto) served at
+    ``/.well-known/agent-card.json``, applying the protoLabs fleet conventions
+    via ``protolabs_a2a.build_agent_card``.
 
-    **Fork this.** Replace ``name``, ``description``, ``skills``, and
-    any extensions with your agent's actual surface. Keep the
-    ``capabilities`` block as-is unless you have a reason to turn off
-    streaming or push notifications — the A2A handler supports both
-    and consumers rely on the flags being honest.
+    **Fork this.** Replace ``name``, ``description``, and ``_agent_skills()``
+    with your agent's actual surface. The four custom extensions
+    (cost / confidence / worldstate-delta / tool-call) are declared by default
+    — this template emits cost-v1 + confidence-v1 from ``_chat_langgraph_stream``
+    and worldstate-delta / tool-call when a tool reports them.
 
-    Extension declarations:
-
-    - ``effect-domain-v1`` — declare per-skill world-state mutations
-      so Workstacean's L1 planner can rank your agent against
-      goals that target those state selectors. Only declare effects
-      that actually mutate shared state.
-    - ``cost-v1`` — declare that your agent emits a cost-v1 DataPart
-      on every terminal task. This template DOES emit it automatically
-      (see the ``on_chat_model_end`` handler in
-      ``_chat_langgraph_stream``), so the declaration is kept — drop
-      it only if you strip the usage-capture.
+    The card ``url`` must target the JSON-RPC endpoint (``/a2a``), NOT the server
+    root — clients send ``message/send`` to whatever the interface url says.
     """
-    return {
-        "name": agent_name(),
-        "description": (
-            "protoAgent template — A2A-compliant LangGraph agent. "
-            "Replace this description with your agent's actual purpose."
+    import protolabs_a2a as pa
+
+    return pa.build_agent_card(
+        name=agent_name(),
+        description=(
+            "Roxy — autonomous project manager for the protoMaker board. Sweeps "
+            "the portfolio, keeps work flowing, decomposes projects into "
+            "epics/milestones/features, and unblocks work. Read-only on code "
+            "(PR review is Quinn's); delegates triage/review to the fleet."
         ),
-        # A2A spec: the url field must point at the JSON-RPC endpoint
-        # (where message/send is accepted), NOT the server root.
-        "url": f"http://{host}/a2a",
-        "version": _package_version(),
-        "provider": {
-            "organization": "protoLabsAI",
-            "url": "https://github.com/protoLabsAI",
-        },
-        "capabilities": {
-            "streaming": True,
-            "pushNotifications": True,
-            "stateTransitionHistory": False,
-            "extensions": [
-                # cost-v1 emission is wired by default via the `on_chat_model_end`
-                # capture in _chat_langgraph_stream above.
-                {"uri": "https://proto-labs.ai/a2a/ext/cost-v1"},
-                # confidence-v1: emitted when the model self-reports a
-                # <confidence> tag (see graph/output_format.py::extract_confidence
-                # and the confidence handler in _run_task_background).
-                {"uri": "https://proto-labs.ai/a2a/ext/confidence-v1"},
-                # ── Per-skill policy metadata (optional; declarative only) ──────
-                # Uncomment and fill with YOUR real skill IDs once you've replaced
-                # the placeholder card below. A consumer (e.g. Workstacean) reads
-                # these to gate execution; the template makes no claims for you.
-                #
-                # blast-v1 — scope of effect per skill (self | project | repo),
-                # so higher-blast work can be policy-gated:
-                # {
-                #     "uri": "https://proto-labs.ai/a2a/ext/blast-v1",
-                #     "params": {"skills": {"my_skill": {"radius": "self"}}},
-                # },
-                # hitl-mode-v1 — the agent supports human-in-the-loop: it can
-                # pause a task as `input-required` (via the `ask_human` tool /
-                # LangGraph interrupt) and resume on a follow-up message to the
-                # same taskId. Add per-skill `params` once you've replaced the
-                # placeholder skill below — a consumer (e.g. Workstacean) reads
-                # them to gate execution (autonomous | notification | veto |
-                # gated | compound):
-                #   "params": {"skills": {"my_skill": {"mode": "gated"}}}
-                {"uri": "https://proto-labs.ai/a2a/ext/hitl-mode-v1"},
-            ],
-        },
-        "defaultInputModes": ["text/plain"],
-        "defaultOutputModes": ["text/markdown"],
-        "skills": [
-            # REPLACE — template ships one placeholder skill.
-            {
-                "id": "chat",
-                "name": "Chat",
-                "description": "General-purpose chat interface. Replace with your agent's real skills.",
-                "tags": ["template"],
-                "examples": ["hello", "what can you do?"],
-            },
-        ],
-        "securitySchemes": _build_security_schemes(),
-        "security": _build_security_requirements(),
-    }
+        url=f"http://{host}/a2a",
+        version=_package_version(),
+        skills=_agent_skills(),
+        bearer=_bearer_configured(),
+    )
+
+
+def _record_a2a_telemetry(outcome) -> None:
+    """Write one per-turn telemetry row from an executor ``TurnOutcome``
+    (ADR 0006 Slice 2). No-op when the telemetry store is off; best-effort so a
+    failure never affects the turn."""
+    store = _telemetry_store
+    if store is None:
+        return
+    try:
+        u = outcome.usage or {}
+        primary_model = outcome.models[0] if outcome.models else (
+            (_graph_config.model_name if _graph_config else "") or ""
+        )
+        input_tokens = int(u.get("input_tokens", 0) or 0)
+        output_tokens = int(u.get("output_tokens", 0) or 0)
+        from datetime import datetime, timedelta, timezone
+        ended = datetime.now(timezone.utc)
+        created = ended - timedelta(milliseconds=int(outcome.duration_ms or 0))
+        store.record({
+            "task_id": outcome.task_id,
+            "session_id": outcome.context_id,
+            "state": outcome.state,
+            "success": 1 if outcome.state == "completed" else 0,
+            "model": primary_model,
+            "models": ",".join(outcome.models),
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "total_tokens": input_tokens + output_tokens,
+            "cache_read_input_tokens": int(u.get("cache_read_input_tokens", 0) or 0),
+            "cache_creation_input_tokens": int(u.get("cache_creation_input_tokens", 0) or 0),
+            "cost_usd": float(outcome.cost_usd or 0.0),
+            "duration_ms": int(outcome.duration_ms or 0),
+            "llm_calls": int(outcome.llm_calls),
+            "tool_calls": int(outcome.tool_calls),
+            "created_at": created.isoformat(),
+            "ended_at": ended.isoformat(),
+        })
+    except Exception:  # noqa: BLE001 — telemetry is best-effort
+        log.exception("[telemetry] failed to record turn %s", outcome.task_id)
+
+
+def _a2a_terminal(outcome) -> None:
+    """A2A terminal hook (ADR 0003 / 0006). Fired by ``ProtoAgentExecutor`` with
+    a ``TurnOutcome`` when a turn reaches a terminal state. Records the per-turn
+    telemetry row and surfaces the Activity thread's answer on the event bus.
+    Best-effort — never raises into the executor."""
+    _record_a2a_telemetry(outcome)
+    if outcome.context_id != ACTIVITY_CONTEXT:
+        return
+    text = extract_output(outcome.text) or outcome.text
+    if not text.strip():
+        return
+    _event_bus.publish(
+        "activity.message",
+        {"role": "assistant", "text": text, "context_id": ACTIVITY_CONTEXT},
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -2025,7 +2066,7 @@ def _main():
         run_manual_subagent_batch as _operator_run_manual_subagent_batch,
     )
 
-    _operator_repo_root = str(Path(__file__).parent.resolve())
+    _operator_repo_root = _resolve_operator_project_root()
 
     def _operator_allowed_dirs() -> list[str]:
         # The repo root is always operable (it's the default project);
@@ -2142,6 +2183,24 @@ def _main():
             knowledge_store=_knowledge_store, scheduler=_scheduler,
             name=name, inputs=inputs or {},
         )
+
+    def _operator_workflow_save(recipe: dict) -> dict:
+        # Validate against the live subagent registry before writing, so a
+        # UI-authored recipe can't reference an unknown subagent / bad DAG.
+        if _workflow_registry is None:
+            raise RuntimeError("workflows are not available")
+        from graph.subagents.config import SUBAGENT_REGISTRY
+        from graph.workflows.engine import validate_recipe
+        errors = validate_recipe(recipe, known_subagents=set(SUBAGENT_REGISTRY))
+        if errors:
+            raise ValueError("invalid recipe: " + "; ".join(errors))
+        path = _workflow_registry.save(recipe)
+        return {"saved": True, "name": recipe.get("name"), "path": path}
+
+    def _operator_workflow_delete(name: str) -> dict:
+        if _workflow_registry is None:
+            raise RuntimeError("workflows are not available")
+        return {"deleted": _workflow_registry.delete(name)}
 
     def _publish_activity_terminal(record) -> None:
         """Terminal hook (ADR 0003): when a turn in the Activity thread completes,
@@ -2291,6 +2350,7 @@ def _main():
         subagent_list=_operator_subagent_list,
         subagent_run=_operator_subagent_run,
         subagent_batch=_operator_subagent_batch,
+        beads_store=_beads_store,
         allowed_dirs=_operator_allowed_dirs,
         scheduler_list=_operator_scheduler_list,
         scheduler_add=_operator_scheduler_add,
@@ -2300,6 +2360,8 @@ def _main():
         chat_commands=_operator_chat_commands,
         workflows_list=_operator_workflows_list,
         workflows_run=_operator_workflow_run,
+        workflows_save=_operator_workflow_save,
+        workflows_delete=_operator_workflow_delete,
         events_subscribe=_event_bus.subscribe,
         activity_list=_operator_activity_list,
         inbox_add=_operator_inbox_add,
@@ -2397,7 +2459,15 @@ def _main():
         from graph.config_io import is_setup_complete
         ready = _graph is not None
         return JSONResponse(
-            {"ok": ready, "graph_compiled": ready, "setup_complete": is_setup_complete(), "ui": ui},
+            {
+                "ok": ready,
+                "graph_compiled": ready,
+                "setup_complete": is_setup_complete(),
+                "ui": ui,
+                # Surface the active model so eval reports can be tagged with the
+                # model under test without guessing (evals.runner auto-detects).
+                "model": _graph_config.model_name if _graph_config else None,
+            },
             status_code=200 if ready else 503,
         )
 
@@ -2646,49 +2716,64 @@ def _main():
             "data": [{"id": agent_name(), "object": "model", "created": 1774600000, "owned_by": "protolabs"}],
         }
 
-    # --- A2A agent card -----------------------------------------------------
-    @fastapi_app.get("/.well-known/agent.json", include_in_schema=False)
-    @fastapi_app.get("/.well-known/agent-card.json", include_in_schema=False)
-    async def _a2a_agent_card(request: Request):
-        host = request.headers.get("host", f"{agent_name()}:7870")
-        return JSONResponse(
-            content=_build_agent_card(host),
-            headers={"Cache-Control": "public, max-age=60"},
-        )
+    # --- A2A protocol (a2a-sdk 1.0) -----------------------------------------
+    # a2a-sdk owns all protocol mechanics: JSON-RPC dispatch, SSE streaming,
+    # the task lifecycle, and push delivery. Our ProtoAgentExecutor bridges
+    # protoagent's LangGraph stream onto it, and protolabs_a2 builds the card +
+    # emits the four custom extensions. Task + push-config state is durable
+    # (SQLite via a2a_stores), and push callbacks are SSRF-guarded.
+    from a2a.server.request_handlers import DefaultRequestHandler
+    from a2a.server.routes.agent_card_routes import create_agent_card_routes
+    from a2a.server.routes.fastapi_routes import add_a2a_routes_to_fastapi
+    from a2a.server.routes.jsonrpc_routes import create_jsonrpc_routes
 
-    # --- A2A protocol -------------------------------------------------------
-    # JSON-RPC + REST, streaming, polling, cancel, push webhooks.
-    from a2a_handler import register_a2a_routes
+    import a2a_auth
+    from a2a_executor import ProtoAgentExecutor, set_terminal_hook
+    from a2a_stores import (
+        build_a2a_stores,
+        build_push_sender,
+        initialize_a2a_stores,
+    )
 
-    # Two independent A2A auth surfaces:
-    #
-    # 1. **Bearer** (modern) — ``auth.token`` in YAML, captured by the
-    #    wizard as "A2A bearer token". Passed via the ``auth_token``
-    #    argument, with ``A2A_AUTH_TOKEN`` env as fallback. Updates
-    #    from a wizard/drawer-driven reload propagate live through
-    #    ``a2a_handler.set_a2a_token`` — no restart needed.
-    # 2. **X-API-Key** (legacy) — ``<AGENT>_API_KEY`` env var, threaded
-    #    through the ``api_key`` argument. Kept env-driven; forks that
-    #    want it YAML-configurable can add a field later.
-    yaml_bearer = _graph_config.auth_token if _graph_config else ""
-    auth_env = f"{AGENT_NAME_ENV.upper()}_API_KEY"
     global _telemetry_store
     _telemetry_store = _build_telemetry_store(_graph_config)
-    register_a2a_routes(
-        app=fastapi_app,
-        chat_stream_fn_factory=_chat_langgraph_stream,
-        chat_fn=chat,
-        api_key=os.environ.get(auth_env, ""),
-        auth_token=yaml_bearer,
-        agent_card={},
-        register_card_route=False,  # card is already served above
-        on_terminal=_publish_activity_terminal,  # ADR 0003: surface Activity turns
-        card_provider=_build_agent_card,  # agent/getAuthenticatedExtendedCard
-        push_store=_build_a2a_push_store(),  # durable push configs (24h TTL)
-        task_persistence=_build_a2a_task_persistence(),  # durable task records (24h TTL)
-        telemetry=_telemetry_store,  # per-turn cost/latency rollups (ADR 0006)
-        telemetry_model=(_graph_config.model_name if _graph_config else ""),
+
+    # ADR 0003 / 0006: record telemetry + surface Activity output on terminal.
+    set_terminal_hook(_a2a_terminal)
+
+    # Request-time auth + origin enforcement (a2a-sdk advertises schemes on the
+    # card but does not enforce them). Bearer = YAML auth.token / A2A_AUTH_TOKEN;
+    # X-API-Key = <AGENT>_API_KEY; origin = A2A_ALLOWED_ORIGINS.
+    a2a_auth.install(
+        fastapi_app,
+        bearer_token=(_graph_config.auth_token if _graph_config else ""),
+        api_key=os.environ.get(f"{AGENT_NAME_ENV.upper()}_API_KEY", ""),
+        allowed_origins_raw=os.environ.get("A2A_ALLOWED_ORIGINS", ""),
     )
+
+    a2a_card = _build_agent_card_proto(f"{agent_name()}:7870")
+
+    # Durable SQLite-backed task + push-config stores (survive restart; 24h TTL
+    # sweep on tasks). The push-config store rejects SSRF callback URLs at
+    # set-time; the matching push sender re-validates at send-time.
+    task_store, push_config_store, task_db, push_db = build_a2a_stores()
+    asyncio.run(initialize_a2a_stores(task_store, push_config_store))
+    log.info("[a2a] durable stores ready (tasks=%s, push=%s)", task_db, push_db)
+
+    _a2a_push_client = httpx.AsyncClient(timeout=30)
+    a2a_request_handler = DefaultRequestHandler(
+        agent_executor=ProtoAgentExecutor(_chat_langgraph_stream),
+        task_store=task_store,
+        agent_card=a2a_card,
+        push_config_store=push_config_store,
+        push_sender=build_push_sender(push_config_store, _a2a_push_client),
+    )
+    add_a2a_routes_to_fastapi(
+        fastapi_app,
+        agent_card_routes=create_agent_card_routes(a2a_card),
+        jsonrpc_routes=create_jsonrpc_routes(a2a_request_handler, rpc_url="/a2a"),
+    )
+    log.info("[a2a] a2a-sdk routes mounted (JSON-RPC at /a2a, card at /.well-known/agent-card.json)")
 
     # --- Prometheus metrics -------------------------------------------------
     if metrics.is_enabled():
@@ -2743,6 +2828,12 @@ def _main():
     else:
         app = fastapi_app
         log.info("Starting %s (ui=%s) on http://0.0.0.0:%d", agent_name(), ui, args.port)
+
+    # Don't outlive the launcher. When run as a desktop sidecar the Tauri shell
+    # sets PROTOAGENT_PARENT_PID; a PyInstaller-frozen onefile runs as a
+    # bootloader + child, so the shell killing the bootloader can leave this
+    # server orphaned (holding its port). Poll the launcher and exit if it dies.
+    _install_parent_death_watchdog()
 
     uvicorn.run(app, host="0.0.0.0", port=args.port)
 

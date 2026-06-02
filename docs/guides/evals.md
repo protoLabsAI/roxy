@@ -25,9 +25,80 @@ python -m evals.runner --category tool
 python -m evals.runner --tasks current_time_intent,daily_log_intent
 ```
 
-Reports land in `evals/results/run-<ts>.json`. The CLI prints a
-pass/fail board; the JSON report carries reply previews and timing
-for post-hoc inspection.
+Reports land in `evals/results/run-<ts>.json` (gitignored — they're run
+artifacts, not source). The CLI prints a pass/fail board; the JSON report
+carries reply previews, timing, and the **model under test** (auto-detected from
+`/healthz`, overridable with `--model-label`) so runs stay comparable.
+
+## Compare models, track over time
+
+Improving an agent means measuring it the same way every time and being able to
+swap the model and compare ([ADR 0012](/adr/0012-eval-strategy-and-model-comparison)).
+
+**Swap one model:** `PROTOAGENT_MODEL` wins over the YAML `model.name`, so you
+can point the same agent at a different model without editing config:
+
+```bash
+PROTOAGENT_MODEL=vendor/some-model python server.py --ui none
+```
+
+**Sweep several models** with one command — `evals/sweep.py` boots a throwaway,
+UI-less agent per model (its own port + `PROTOAGENT_INSTANCE`, so they never
+share data), runs the suite tagged with each model, tears each down, and prints a
+`model × category` matrix:
+
+```bash
+python -m evals.sweep --models protolabs/reasoning,protolabs/smart
+python -m evals.sweep --models a,b,c --category tool      # one category
+python -m evals.sweep --models a,b --tasks current_time_intent --keep
+```
+
+```
+| Model                 | a2a-protocol | tool        | **Overall**     |
+|-----------------------|--------------|-------------|-----------------|
+| `protolabs/reasoning` | 3/3 (100%)   | 6/6 (100%)  | **9/9 (100%)**  |
+| `protolabs/smart`     | 3/3 (100%)   | 4/6 (67%)   | **7/9 (78%)**   |
+```
+
+**Best-of-N for noisy cases** — tool selection and other non-deterministic
+behavior varies run to run, so a single sweep can mislead. `--repeat N` runs the
+suite N times per model (against the same booted agent, isolating model-sampling
+variance from boot variance) and prints a per-case `passes/N` table, scoring each
+model on the cases that passed the **majority** of runs:
+
+```bash
+python -m evals.sweep --models protolabs/reasoning,protolabs/smart,protolabs/fast \
+  --category tool --repeat 3
+```
+
+```
+| Case            | smart | reasoning | fast  |
+|-----------------|-------|-----------|-------|
+| `calculator`    | 3/3   | 3/3       | 0/3 ✗ |
+| `fetch_url`     | 3/3   | 3/3       | 0/3 ✗ |
+| `web_search`    | 3/3   | 3/3       | 2/3   |
+| **Best-of-N**   | 9/9   | 9/9       | 5/9   |
+```
+
+A `✗` marks a case that failed the majority of runs — e.g. a fast model that
+consistently answers inline instead of *calling* the tool (a structural gap),
+versus a one-off flake that still clears the majority.
+
+**Track the trend** across every run on the box — `evals/report.py` aggregates
+the model-tagged reports into a leaderboard (latest standing per model, best
+first) plus a per-model trend (pass rate by run, ▲/▼ vs the last one):
+
+```bash
+python -m evals.report                          # all models
+python -m evals.report --model protolabs/reasoning
+```
+
+For a single before/after of one change, `evals/compare.py` diffs two reports
+(pass-rate delta, per-category, which cases flipped):
+
+```bash
+python -m evals.compare evals/results/run-OLD.json evals/results/run-NEW.json
+```
 
 ## The three assertion channels
 
@@ -68,7 +139,7 @@ afterward catches it.
 }
 ```
 
-Three case `kind`s ship:
+The case `kind`s that ship:
 
 - `agent_card` — fetch `/.well-known/agent-card.json` and assert on
   the card's name, skill count, and declared extensions.
@@ -76,6 +147,62 @@ Three case `kind`s ship:
   assert the server returns the expected status (401 by default).
 - `ask` — the main shape. Sends `prompt`, then asserts on tool firing,
   reply patterns, and KB state.
+- `stream` — like `ask` over SSE, plus asserts the stream surfaced the
+  expected event kinds.
+- `goal` — set a goal, trigger the loop, assert the resulting goal state.
+- `workflow` — drive a recipe end-to-end via `POST /api/workflows/{name}/run`
+  and assert on its synthesized output (patterns + rubric). Used to track the
+  subagent workflows (research-and-brief, deep-research).
+
+## Asserting the agent layer (subagents & workflows)
+
+Beyond single-tool selection, the suite tracks the layers recent work has been
+about ([ADR 0012](/adr/0012-eval-strategy-and-model-comparison)):
+
+**Delegation** — for intent that's satisfied equally by several tools (the lead
+might delegate open-ended research via a `task` subagent *or* a `run_workflow`
+recipe), assert that *any* of them fired rather than over-constraining to one:
+
+```json
+{ "kind": "ask", "category": "subagent",
+  "prompt": "Go research X properly and report back.",
+  "expected_any_tools": ["task", "task_batch", "run_workflow"] }
+```
+
+**Workflows** — a `workflow` case runs a recipe and asserts on the output:
+
+```json
+{ "kind": "workflow", "category": "workflow", "workflow": "deep-research",
+  "inputs": {"topic": "…", "depth": "standard"},
+  "expected_patterns": ["counterpoint"],
+  "verify_rubric": { "criteria": ["…"], "threshold": 0.75 },
+  "timeout_s": 420 }
+```
+
+## Grading quality substrings can't — the LLM judge
+
+"Is the deep-research report *actually balanced*? Is the confidence *earned*?"
+can't be checked with a substring. Add a `verify_rubric` to any `ask` /
+`workflow` case: a grader model scores the output against independent yes/no
+criteria and the case passes when the fraction met clears `threshold`.
+
+```json
+"verify_rubric": {
+  "criteria": [
+    "Presents opposing/critical perspectives, not just the consensus",
+    "Has a counterpoints or caveats section that engages the opposition",
+    "States a confidence level that is justified, not merely asserted"
+  ],
+  "threshold": 0.66,
+  "model": "protolabs/reasoning"
+}
+```
+
+The grader reuses the gateway via `graph.llm.create_llm`; it defaults to
+`$EVAL_JUDGE_MODEL` then the agent's model. It's non-deterministic and costs
+tokens — treat rubric scores as a **tracked signal** (trend across models), with
+the deterministic channels (audit / substring / KB) as the hard pass/fail. A
+grader error never crashes the run (the case just fails with the reason).
 
 ## Prompt rule
 

@@ -240,6 +240,23 @@ async def _run_prompt_case(
             if not passed:
                 problems.append(detail)
 
+        # "Any of these tools fired" — for intent met equally by several tools
+        # (e.g. delegated research via `task` OR `run_workflow`).
+        any_tools = case.get("expected_any_tools")
+        if any_tools:
+            require_success = case.get("tool_outcome", "success") == "success"
+            deadline = asyncio.get_running_loop().time() + _AUDIT_POLL_DEADLINE_S
+            while True:
+                entries = verify.audit_entries_since(since)
+                passed, detail = verify.assert_any_tool_fired(
+                    entries, any_tools, require_success=require_success,
+                )
+                if passed or asyncio.get_running_loop().time() >= deadline:
+                    break
+                await asyncio.sleep(_AUDIT_POLL_INTERVAL_S)
+            if not passed:
+                problems.append(detail)
+
         # Text pattern assertions (case-insensitive substrings).
         text_lower = result.text.lower()
         for pattern in case.get("expected_patterns") or []:
@@ -254,6 +271,9 @@ async def _run_prompt_case(
             )
             if not chunk:
                 problems.append(f"no chunk containing {vk['find_chunk_containing']!r}")
+
+        # LLM-judge rubric (for quality substring/audit can't judge).
+        problems += _check_rubric(case, result.text)
 
         # Streaming-only: assert the SSE event sequence surfaced the
         # expected kinds at least once.
@@ -354,6 +374,64 @@ async def _run_goal_case(client: AgentClient, case: dict) -> CaseResult:
             pass
 
 
+def _check_rubric(case: dict, text: str) -> list[str]:
+    """Run a case's ``verify_rubric`` (if any) through the LLM judge; return a
+    list of problems (empty when it passes or no rubric is configured)."""
+    rubric = case.get("verify_rubric")
+    if not rubric:
+        return []
+    from evals import judge
+
+    criteria = rubric.get("criteria") or []
+    threshold = float(rubric.get("threshold", 0.7))
+    result = judge.score_rubric(text, criteria, model=rubric.get("model"))
+    if result.error:
+        return [f"rubric grader error: {result.error}"]
+    if result.score < threshold:
+        unmet = [c for c, ok in result.met.items() if not ok]
+        return [f"rubric {result.score:.0%} < {threshold:.0%} (unmet: {unmet})"]
+    return []
+
+
+async def _run_workflow_case(client: AgentClient, case: dict) -> CaseResult:
+    """Drive a workflow recipe end-to-end via ``POST /api/workflows/{name}/run``
+    and assert on its synthesized output (patterns + optional rubric).
+
+    Case schema: ``workflow`` (recipe name), ``inputs`` (dict),
+    ``expected_patterns`` / ``verify_rubric`` against the workflow output."""
+    cid, cat, name = case["id"], case.get("category", "workflow"), case.get("name", case["id"])
+    wf = case.get("workflow")
+    if not wf:
+        return CaseResult(cid, cat, name, False, "case missing 'workflow' name")
+    import time as _time
+
+    start = _time.time()
+    try:
+        out = await client.run_workflow(
+            wf, case.get("inputs") or {}, timeout_s=case.get("timeout_s", 300),
+        )
+    except Exception as e:  # noqa: BLE001
+        return CaseResult(cid, cat, name, False, f"workflow run failed: {e!r}")
+    duration_ms = int((_time.time() - start) * 1000)
+
+    text = out.get("output", "") if isinstance(out, dict) else str(out)
+    if not text.strip():
+        return CaseResult(cid, cat, name, False, "empty workflow output", duration_ms=duration_ms)
+
+    problems: list[str] = []
+    text_lower = text.lower()
+    for pattern in case.get("expected_patterns") or []:
+        if pattern.lower() not in text_lower:
+            problems.append(f"missing pattern {pattern!r}")
+    problems += _check_rubric(case, text)
+
+    detail = "; ".join(problems) if problems else f"OK ({duration_ms}ms, {len(text)} chars)"
+    return CaseResult(
+        cid, cat, name, passed=not problems, detail=detail,
+        duration_ms=duration_ms, raw={"output": text[:300]},
+    )
+
+
 # ── dispatch ────────────────────────────────────────────────────────────────
 
 
@@ -363,6 +441,7 @@ _RUNNERS = {
     "ask": _run_ask,
     "stream": _run_stream,
     "goal": _run_goal_case,
+    "workflow": _run_workflow_case,
 }
 
 
@@ -406,10 +485,15 @@ def _print_board(results: list[CaseResult]) -> None:
     print(f"\n{pass_count}/{len(results)} passed")
 
 
-def _save_report(results: list[CaseResult], path: Path) -> None:
+def _save_report(results: list[CaseResult], path: Path, *, model: str = "", base_url: str = "") -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "ts": datetime.now(UTC).isoformat(),
+        # The model under test — tagged so reports are comparable across model
+        # swaps (evals.compare / evals.report key off this). Auto-detected from
+        # /healthz, overridable with --model-label.
+        "model": model,
+        "base_url": base_url,
         "total": len(results),
         "passed": sum(1 for r in results if r.passed),
         "results": [asdict(r) for r in results],
@@ -424,6 +508,10 @@ async def main():
     p.add_argument("--tasks", default=None, help="comma-separated case IDs")
     p.add_argument("--category", default=None)
     p.add_argument("--out", default=None)
+    p.add_argument(
+        "--model-label", default=None,
+        help="tag the report with this model name (default: auto-detect from /healthz)",
+    )
     args = p.parse_args()
 
     tasks_path = Path(__file__).parent / "tasks.json"
@@ -441,7 +529,16 @@ async def main():
 
     client = AgentClient(base_url=args.base_url)
 
-    print(f"Running {len(cases)} case(s) against {client.base_url}")
+    # Tag the report with the model under test. --model-label wins; otherwise
+    # ask /healthz what the running agent is serving so swaps are traceable.
+    model_label = args.model_label or ""
+    if not model_label:
+        try:
+            model_label = (await client.health()).get("model") or ""
+        except Exception:
+            model_label = ""
+
+    print(f"Running {len(cases)} case(s) against {client.base_url}" + (f" [model: {model_label}]" if model_label else ""))
     results: list[CaseResult] = []
     for case in cases:
         sys.stdout.write(f"  {case['id']}... ")
@@ -455,7 +552,7 @@ async def main():
     out_path = Path(args.out) if args.out else (
         Path(__file__).parent / "results" / f"run-{int(time.time())}.json"
     )
-    _save_report(results, out_path)
+    _save_report(results, out_path, model=model_label, base_url=client.base_url)
 
     return 0 if all(r.passed for r in results) else 1
 

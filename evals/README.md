@@ -26,7 +26,30 @@ python -m evals.runner --tasks current_time,daily_log
 python -m evals.runner --base-url http://host:7870
 ```
 
-Reports land in `evals/results/run-<ts>.json` per run.
+Reports land in `evals/results/run-<ts>.json` per run (gitignored), each
+tagged with the model under test (auto-detected from `/healthz`,
+overridable with `--model-label`).
+
+## Compare models
+
+```bash
+# Boot one agent per model, run the suite against each, print a
+# model × category matrix. Each model gets its own throwaway --ui none
+# instance (PROTOAGENT_MODEL env override + a unique PROTOAGENT_INSTANCE).
+python -m evals.sweep --models protolabs/reasoning,protolabs/smart
+python -m evals.sweep --models a,b,c --category tool
+
+# Best-of-N: run the suite N times per model → per-case passes/N table,
+# scored on the cases that passed the majority of runs (sees past
+# single-run sampling noise on tool selection etc.).
+python -m evals.sweep --models a,b,c --category tool --repeat 3
+
+# Leaderboard + per-model trend across every report on the box.
+python -m evals.report
+
+# One before/after diff of two reports.
+python -m evals.compare results/run-OLD.json results/run-NEW.json
+```
 
 ## Categories
 
@@ -39,16 +62,22 @@ Reports land in `evals/results/run-<ts>.json` per run.
 | `chained` | Multi-step reasoning that calls 2+ tools |
 | `subsystem` | KnowledgeMiddleware retrieval, hot-memory injection |
 | `goal` | Goal mode: set a goal, trigger the loop, assert the resulting goal state + footer |
+| `subagent` | Lead delegates open-ended work (`expected_any_tools`: `task` / `run_workflow`) |
+| `workflow` | A recipe runs end-to-end via `/api/workflows/{name}/run`; assert on its output |
 
 ## File layout
 
 ```
 evals/
-  client.py     A2A client (message/send + poll, message/stream, agent card, cancel)
-  runner.py     CLI runner — print board, write JSON report
-  verify.py     Audit-log + KB side-effect assertions, setup/teardown
+  client.py     A2A client (message/send + poll, message/stream, agent card, health, workflows, cancel)
+  runner.py     CLI runner — print board, write model-tagged JSON report
+  verify.py     Audit-log + KB side-effect assertions (incl. any-of-tools), setup/teardown
+  judge.py      LLM-judge rubric scorer (verify_rubric) for quality substrings can't check
+  sweep.py      Boot one agent per model + run the suite → model × category matrix
+  report.py     Aggregate all reports → leaderboard + per-model trend over time
+  compare.py    Diff two reports (pass-rate delta, per-category, flips)
   tasks.json    Cases — 15 covering the starter tools end-to-end
-  results/      Per-run reports
+  results/      Per-run reports (gitignored)
 ```
 
 ## Adding a case
