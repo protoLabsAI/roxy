@@ -1,5 +1,7 @@
 ## [Unreleased]
 
+## [0.10.0] - 2026-06-02
+
 ### Added
 - **Structured-skill executor finalizer (#476).** Inherits the protoAgent side
   of schema-enforced skill outputs. When a turn carries a `skillHint` for a
