@@ -1780,49 +1780,93 @@ def _bearer_configured() -> bool:
     return bool(os.environ.get("A2A_AUTH_TOKEN", "") or (_graph_config and _graph_config.auth_token))
 
 
+# Skill declarations (ADR-0006 addendum / #476). A skill MAY declare an
+# ``output_schema`` (JSON Schema) + ``result_mime`` — when present, the agent
+# enforces the schema via a forced-tool-call finalizer in the executor and emits
+# the result as a typed DataPart (``protolabs_a2a.emit_skill_result``), and the
+# card advertises the MIME in that skill's ``output_modes``. No schema ⇒ free
+# text (today's default). The schema lives HERE (skill config), not on the card
+# — ``AgentSkill`` only carries ``output_modes`` (the MIME), per the A2A spec.
+#
+# REPLACE when forking. The template ships one free-text placeholder so a fresh
+# clone is callable; the commented fields below show a structured skill.
+#
+# Roxy's A2A skills — the protoMaker-board PM surface the fleet dispatches
+# (Workstacean ceremonies send these as ``skillHint``; the executor surfaces
+# them as ``[skill: <id>]`` so the skill loop keys on them). These are free-text
+# for now; declare ``output_schema`` + ``result_mime`` on a spec to make it emit
+# a schema-enforced structured result (the #476 finalizer wires it up).
+_SKILL_SPECS: list[dict] = [
+    {
+        "id": "portfolio_sitrep",
+        "name": "Portfolio SitRep",
+        "description": "Sweep every managed protoMaker project and return a roll-up: a portfolio total then per-project flowing / stalled / blocked.",
+        "tags": ["pm", "status"],
+        "examples": ["portfolio_sitrep"],
+    },
+    {
+        "id": "board_sweep",
+        "name": "Board Sweep",
+        "description": "Sweep the portfolio, then take the smallest unblocking action per project and report what was done.",
+        "tags": ["pm", "unblock"],
+        "examples": ["board_sweep", "board_sweep protocli"],
+    },
+    {
+        "id": "project_decompose",
+        "name": "Project Decompose",
+        "description": "Decompose a project into epics -> milestones -> features (research -> PRD -> milestones -> features), pausing at the human approval gate.",
+        "tags": ["pm", "planning"],
+        "examples": ["project_decompose <project>"],
+    },
+    {
+        "id": "unblock_feature",
+        "name": "Unblock Feature",
+        "description": "Investigate a blocked/stalled feature and take the smallest unblocking action, or escalate with a crisp ask.",
+        "tags": ["pm", "unblock"],
+        "examples": ["unblock_feature <featureId>"],
+    },
+    {
+        "id": "chat",
+        "name": "Chat",
+        "description": "General-purpose chat / Q&A about the portfolio.",
+        "tags": ["general"],
+        "examples": ["what's the portfolio status?"],
+    },
+]
+
+
 def _agent_skills():
-    """Roxy's A2A skills — the protoMaker-board PM surface the fleet dispatches
-    (Workstacean ceremonies send these as ``skillHint``; the executor surfaces
-    them as ``[skill: <id>]`` so the skill loop keys on them)."""
+    """Build the card's ``AgentSkill`` list from ``_SKILL_SPECS``. A spec with a
+    ``result_mime`` advertises it in ``output_modes`` (the A2A-native way to tell
+    consumers the skill emits that structured type)."""
     from a2a.types import AgentSkill
 
-    return [
-        AgentSkill(
-            id="portfolio_sitrep",
-            name="Portfolio SitRep",
-            description="Sweep every managed protoMaker project and return a roll-up: a portfolio total then per-project flowing / stalled / blocked.",
-            tags=["pm", "status"],
-            examples=["portfolio_sitrep"],
-        ),
-        AgentSkill(
-            id="board_sweep",
-            name="Board Sweep",
-            description="Sweep the portfolio, then take the smallest unblocking action per project and report what was done.",
-            tags=["pm", "unblock"],
-            examples=["board_sweep", "board_sweep protocli"],
-        ),
-        AgentSkill(
-            id="project_decompose",
-            name="Project Decompose",
-            description="Decompose a project into epics -> milestones -> features (research -> PRD -> milestones -> features), pausing at the human approval gate.",
-            tags=["pm", "planning"],
-            examples=["project_decompose <project>"],
-        ),
-        AgentSkill(
-            id="unblock_feature",
-            name="Unblock Feature",
-            description="Investigate a blocked/stalled feature and take the smallest unblocking action, or escalate with a crisp ask.",
-            tags=["pm", "unblock"],
-            examples=["unblock_feature <featureId>"],
-        ),
-        AgentSkill(
-            id="chat",
-            name="Chat",
-            description="General-purpose chat / Q&A about the portfolio.",
-            tags=["general"],
-            examples=["what's the portfolio status?"],
-        ),
-    ]
+    skills = []
+    for s in _SKILL_SPECS:
+        kwargs = dict(
+            id=s["id"],
+            name=s["name"],
+            description=s["description"],
+            tags=s.get("tags", []),
+            examples=s.get("examples", []),
+        )
+        if s.get("result_mime"):
+            kwargs["output_modes"] = [s["result_mime"]]
+        skills.append(AgentSkill(**kwargs))
+    return skills
+
+
+def structured_skill_schema(skill_id: str) -> dict | None:
+    """For a skill that declares structured output, return
+    ``{"schema": <JSON Schema>, "mime": <result_mime>}``; else ``None`` (free
+    text). The executor's structured finalizer (#476) reads this to run the
+    forced-tool-call against the schema and emit the validated object as a
+    ``result_mime`` DataPart. The schema isn't on the card (``AgentSkill`` has no
+    schema field) — it lives in ``_SKILL_SPECS``."""
+    for s in _SKILL_SPECS:
+        if s["id"] == skill_id and s.get("output_schema") and s.get("result_mime"):
+            return {"schema": s["output_schema"], "mime": s["result_mime"]}
+    return None
 
 
 def _package_version() -> str:
@@ -2778,9 +2822,21 @@ def _main():
     asyncio.run(initialize_a2a_stores(task_store, push_config_store))
     log.info("[a2a] durable stores ready (tasks=%s, push=%s)", task_db, push_db)
 
+    async def _structured_finalizer(skill_id: str, final_text: str):
+        """Enforce a declared skill's output_schema on the lead's free-text
+        answer + emit it as a DataPart (#476). None ⇒ text-only. Closes over the
+        skill registry so the executor needn't import server (no circular dep)."""
+        spec = structured_skill_schema(skill_id)
+        if not spec:
+            return None
+        from graph.structured_skill import finalize_structured
+        return await finalize_structured(
+            skill_id, spec["schema"], spec["mime"], final_text, _graph_config
+        )
+
     _a2a_push_client = httpx.AsyncClient(timeout=30)
     a2a_request_handler = DefaultRequestHandler(
-        agent_executor=ProtoAgentExecutor(_chat_langgraph_stream),
+        agent_executor=ProtoAgentExecutor(_chat_langgraph_stream, structured_finalizer=_structured_finalizer),
         task_store=task_store,
         agent_card=a2a_card,
         push_config_store=push_config_store,

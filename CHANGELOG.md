@@ -1,17 +1,22 @@
-# Changelog
-
-All notable changes to protoAgent are documented here.
-
-The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
-and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
-
-> **Add your entries under [Unreleased]** in your PR. When a release is cut,
-> `prepare-release.yml` rolls them into a dated, versioned section via
-> `scripts/changelog.py`. See [Releasing](docs/guides/releasing.md).
-
 ## [Unreleased]
 
 ### Added
+- **Structured-skill executor finalizer (#476).** Inherits the protoAgent side
+  of schema-enforced skill outputs. When a turn carries a `skillHint` for a
+  skill that declares an `output_schema`, the `ProtoAgentExecutor` runs a
+  forced-tool-call finalizer (`graph/structured_skill.py`) — `bind_tools(
+  [submit_skill_tool(id, schema)], tool_choice=…)` → `validate_skill_args` →
+  one repair → `emit_skill_result` — and appends the validated object as a typed
+  DataPart alongside the text (degrades to text-only on failure). Shared
+  `protolabs_a2a` v0.2.0 helpers do the LLM-free wire layer; enforcement is
+  runtime-local per ADR-0006. Roxy's PM skills stay free-text until they declare
+  a schema in `_SKILL_SPECS`.
+- **Structured-skill declaration scaffolding (#476).** A skill spec
+  (`_SKILL_SPECS`) may declare an `output_schema` (JSON Schema) + `result_mime`;
+  `_agent_skills()` then advertises the MIME in that skill's card `output_modes`,
+  and `structured_skill_schema(id)` hands the schema to the finalizer. Roxy's
+  five PM skills (portfolio_sitrep / board_sweep / project_decompose /
+  unblock_feature / chat) moved into `_SKILL_SPECS` (free-text for now).
 - **Deep-research workflow with adversarial review** (ADR 0011): a bundled
   `deep-research` recipe (`run_workflow`/`/deep-research`) that orchestrates a
   six-stage DAG — `research ∥ dissent → gap_fill → antagonist ∥ verify →
@@ -24,6 +29,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a high `Confidence` when the opposition was answered.
 
 ### Changed
+- **`protolabs-a2a` bumped to v0.2.0 (#480)** for the structured-skill
+  conventions (`submit_skill_tool` / `validate_skill_args` / `emit_skill_result`).
 - **Researcher subagent + web-research skill upgraded** to a proper deep-research
   pipeline (lessons from rabbit-hole.io): scope a question into orthogonal
   **dimensions** (scaled quick/standard/deep), gather with **source
@@ -32,6 +39,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rounds), synthesize with **numbered inline citations** (every material claim
   cited, both sides on disagreement), and **persist** one durable finding to the
   KB. The researcher gains `memory_ingest` for that persistence.
+
+### Fixed
+- **A2A request-level metadata was being dropped (trace + skill dispatch).**
+  `_extract_caller_trace` read only `context.message.metadata`, missing
+  `SendMessageRequest`-level `context.metadata` — where clients (the hub) put
+  `a2a.trace` and `skillHint`. New `_request_metadata()` merges request-level
+  (preferred) over message-level, fixing Langfuse cross-trace propagation and
+  enabling structured-skill dispatch.
 
 ### Docs
 - Reconcile drift after the recent releases: fix the deploy guide's stale
