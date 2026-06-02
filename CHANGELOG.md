@@ -11,6 +11,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Deep-research workflow with adversarial review** (ADR 0011): a bundled
+  `deep-research` recipe (`run_workflow`/`/deep-research`) that orchestrates a
+  six-stage DAG — `research ∥ dissent → gap_fill → antagonist ∥ verify →
+  synthesize` — to fix the one-sided, self-graded ceiling of a single researcher.
+  Three new subagent roles back it: an **`antagonist`** (steelmans the opposing
+  case, attacks weak claims, hunts disconfirming evidence), an independent
+  **`verifier`** (labels material claims supported/unsupported/uncertain), and a
+  **`synthesizer`** that writes a balanced report — folding the opposition into a
+  "Counterpoints & caveats" section, dropping unverified claims, and only earning
+  a high `Confidence` when the opposition was answered.
+
+### Changed
+- **Researcher subagent + web-research skill upgraded** to a proper deep-research
+  pipeline (lessons from rabbit-hole.io): scope a question into orthogonal
+  **dimensions** (scaled quick/standard/deep), gather with **source
+  diversification** (KB reuse + general + community/code) and per-dimension
+  compression, run a **conservative gap-check loop** (1-3 genuine gaps, ~3
+  rounds), synthesize with **numbered inline citations** (every material claim
+  cited, both sides on disagreement), and **persist** one durable finding to the
+  KB. The researcher gains `memory_ingest` for that persistence.
+
 ### Docs
 - Reconcile drift after the recent releases: fix the deploy guide's stale
   "every merge auto-cuts a patch" note (releases are manual now), document the

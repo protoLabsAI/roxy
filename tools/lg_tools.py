@@ -75,6 +75,34 @@ def ask_human(question: str) -> str:
 
 
 @tool
+def request_user_input(title: str, steps: list[dict], description: str = "") -> str:
+    """Ask the operator for **structured** input via a form dialog, then continue
+    with their response. Use when you need specific values, choices, credentials,
+    or config — anything better captured as form fields than free text. The task
+    pauses (surfaced as ``input-required``) until they submit; their response (a
+    JSON object keyed by field name) is returned from this call.
+
+    ``steps`` is a list of form steps — multiple steps render as a wizard. Each
+    step is ``{"schema": <JSON Schema draft-07 of the fields>, "uiSchema"?: <layout
+    hints>, "title"?: str, "description"?: str}``. Phrase the ask clearly and only
+    request fields you actually need. For a single free-text or yes/no question,
+    use ``ask_human`` instead.
+    """
+    import json
+    from langgraph.types import interrupt
+
+    response = interrupt({
+        "kind": "form",
+        "title": title,
+        "description": description,
+        "steps": steps,
+    })
+    # The resume value is the submitted form object; return it as JSON so the
+    # model reads structured fields. (A plain string resume is passed through.)
+    return response if isinstance(response, str) else json.dumps(response)
+
+
+@tool
 @with_fallback()
 async def current_time(timezone: str = "UTC") -> str:
     """Return the current wall-clock time in the given IANA timezone.
@@ -566,7 +594,70 @@ def _build_scheduler_tools(scheduler) -> list:
 # ── registry ─────────────────────────────────────────────────────────────────
 
 
-def get_all_tools(knowledge_store=None, scheduler=None, inbox_store=None):
+def _build_beads_tools(beads_store) -> list:
+    """Bind the beads issue tracker to a ``BeadsStore`` (Sprint B) — the agent's
+    in-process planning/task surface. Returns a list."""
+
+    @tool
+    def beads_create(title: str, description: str = "", priority: int = 2, issue_type: str = "task") -> str:
+        """Track a task/issue on your beads board — your planning surface for
+        multi-step work. ``priority`` 0=highest…3=low; ``issue_type`` is one of
+        task|bug|feature|chore|epic. Returns the new issue id."""
+        try:
+            i = beads_store.create(title, description=description, priority=priority, issue_type=issue_type)
+        except ValueError as exc:
+            return f"Error: {exc}"
+        return f"Created {i['id']}: {i['title']} ({i['issue_type']}, p{i['priority']})"
+
+    @tool
+    def beads_list(include_closed: bool = False) -> str:
+        """List issues on your beads board (open ones by default). Use it to see
+        and track outstanding work."""
+        items = beads_store.list(include_closed=include_closed)
+        if not items:
+            return "No issues on the board."
+        return "\n".join(
+            f"[{i['status']}] {i['id']} (p{i['priority']}, {i['issue_type']}) {i['title']}"
+            for i in items
+        )
+
+    @tool
+    def beads_update(
+        issue_id: str, status: str = "", title: str = "",
+        description: str = "", priority: int = -1, issue_type: str = "",
+    ) -> str:
+        """Update an issue. ``status`` is open|in_progress|blocked|deferred|closed.
+        Leave a field empty (``priority`` -1) to keep it unchanged."""
+        fields: dict = {}
+        if status:
+            fields["status"] = status
+        if title:
+            fields["title"] = title
+        if description:
+            fields["description"] = description
+        if priority is not None and priority >= 0:
+            fields["priority"] = priority
+        if issue_type:
+            fields["issue_type"] = issue_type
+        try:
+            i = beads_store.update(issue_id, **fields)
+        except (KeyError, ValueError) as exc:
+            return f"Error: {exc}"
+        return f"Updated {i['id']}: [{i['status']}] {i['title']}"
+
+    @tool
+    def beads_close(issue_id: str, reason: str = "") -> str:
+        """Close an issue (done, or won't-do). Optional ``reason``."""
+        try:
+            i = beads_store.close(issue_id, reason=reason or None)
+        except (KeyError, ValueError) as exc:
+            return f"Error: {exc}"
+        return f"Closed {i['id']}: {i['title']}"
+
+    return [beads_create, beads_list, beads_update, beads_close]
+
+
+def get_all_tools(knowledge_store=None, scheduler=None, inbox_store=None, beads_store=None):
     """Return every LangChain tool the lead agent + subagents can use.
 
     Optional dependencies:
@@ -584,7 +675,7 @@ def get_all_tools(knowledge_store=None, scheduler=None, inbox_store=None):
     # LangGraph interrupt that only the lead turn's runner resumes. Subagents
     # (run outside that runner) must not get it, so it's gated by allowlist:
     # present in the full set for the lead agent, absent from subagent allowlists.
-    tools = [current_time, calculator, web_search, fetch_url, ask_human]
+    tools = [current_time, calculator, web_search, fetch_url, ask_human, request_user_input]
     # GitHub read tools (PRs/issues/commits) over the gh CLI. Always
     # included — they degrade to a readable error if gh/auth is missing.
     from tools.github_tools import get_github_tools
@@ -605,6 +696,8 @@ def get_all_tools(knowledge_store=None, scheduler=None, inbox_store=None):
         tools.extend(_build_scheduler_tools(scheduler))
     if inbox_store is not None:
         tools.extend(_build_inbox_tools(inbox_store))
+    if beads_store is not None:
+        tools.extend(_build_beads_tools(beads_store))
     return tools
 
 
@@ -616,7 +709,7 @@ SEARCH_TOOLS_NAME = "search_tools"
 # delegation/workflow tools + the search meta-tool itself — enough to operate
 # and to *discover* the rest. Everything else is deferred until searched.
 DEFERRED_BASE_TOOL_NAMES = frozenset({
-    "current_time", "calculator", "web_search", "fetch_url", "ask_human",
+    "current_time", "calculator", "web_search", "fetch_url", "ask_human", "request_user_input",
     "task", "task_batch", "run_workflow", "save_workflow",
     SEARCH_TOOLS_NAME,
 })
