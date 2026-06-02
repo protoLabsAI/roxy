@@ -133,7 +133,11 @@ def get_peer_tools() -> list:
             params["metadata"] = hint
 
         try:
-            async with httpx.AsyncClient(timeout=30) as client:
+            # A delegated skill answers synchronously on message/send and can run
+            # for a minute+ (e.g. Quinn's bug_triage ≈ 58s) — the peer holds the
+            # connection until done rather than returning a task to poll. Give the
+            # request room; the polling loop below covers peers that DO go async.
+            async with httpx.AsyncClient(timeout=httpx.Timeout(200.0, connect=10.0)) as client:
                 result = await _rpc(client, "message/send", params)
                 # Inline reply? (some peers answer synchronously)
                 text = _extract_text(result)
