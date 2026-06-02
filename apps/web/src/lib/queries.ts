@@ -13,6 +13,8 @@ export const queryKeys = {
   telemetry: ["telemetry"] as const,
   settings: ["settings", "schema"] as const,
   inbox: ["inbox"] as const,
+  schedules: ["schedules"] as const,
+  runtime: ["runtime"] as const,
 };
 
 // Goals the agent works toward (goal mode). Lives in the right sidebar and
@@ -82,4 +84,21 @@ export const inboxQuery = () =>
   queryOptions({
     queryKey: queryKeys.inbox,
     queryFn: () => api.inbox("later", false),
+  });
+
+// Scheduled jobs over the active SchedulerBackend. Invalidated on add/cancel.
+export const schedulesQuery = () =>
+  queryOptions({
+    queryKey: queryKeys.schedules,
+    queryFn: () => api.schedules(),
+  });
+
+// Runtime status (model, middleware, skills, MCP, plugins, setup/graph state).
+// Read non-suspense at the App shell (topbar health, never blanks the shell;
+// the retry doubles as the desktop sidecar boot-probe) and via useSuspenseQuery
+// in the System → Runtime panel — same cache key, deduped.
+export const runtimeStatusQuery = () =>
+  queryOptions({
+    queryKey: queryKeys.runtime,
+    queryFn: () => api.runtimeStatus(),
   });

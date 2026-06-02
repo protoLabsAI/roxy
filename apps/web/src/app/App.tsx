@@ -3,11 +3,9 @@ import {
   BarChart3,
   BookMarked,
   BookOpen,
-  Bot,
   Boxes,
   CalendarClock,
   CircleAlert,
-  Database,
   FileText,
   Gauge,
   Github,
@@ -17,16 +15,15 @@ import {
   PanelRight,
   Play,
   Plus,
-  RefreshCw,
   Save,
   Settings2,
-  Sparkles,
   Target,
   Undo2,
   Trash2,
   Workflow,
 } from "lucide-react";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useQuery } from "@tanstack/react-query";
+import { useEffect, useRef, useState } from "react";
 import type { CSSProperties, ReactNode } from "react";
 import { IntroSplash } from "./IntroSplash";
 
@@ -40,11 +37,15 @@ import { TelemetrySurface } from "../telemetry/TelemetrySurface";
 import { WorkflowsSurface } from "../workflows/WorkflowsSurface";
 import { api } from "../lib/api";
 import { onConnectionChange, onServerEvent } from "../lib/events";
-import type { NotesWorkspace, RuntimeStatus, ScheduledJob, Subagent } from "../lib/types";
+import type { NotesWorkspace } from "../lib/types";
 import { StatusPill } from "./StatusPill";
 import { GoalsPanel } from "./GoalsPanel";
 import { BeadsPanel } from "./BeadsPanel";
+import { SchedulePanel } from "../schedule/SchedulePanel";
+import { RunPanel } from "./RunPanel";
+import { RuntimePanel } from "./RuntimePanel";
 import { SetupWizard } from "../setup/SetupWizard";
+import { runtimeStatusQuery } from "../lib/queries";
 
 // Consolidated nav (heavy grouping): four rail surfaces, each grouped one
 // fanning out to sub-views via an in-surface segmented control.
@@ -59,25 +60,6 @@ type ActivityTab = "thread" | "inbox" | "schedule";
 // The agent's persistent working memory, grouped in the right sidebar:
 // its notebook, its task board, and its goals.
 type RightPanel = "notes" | "beads" | "goals";
-type SubagentMode = "single" | "batch";
-
-type BatchTask = {
-  id: string;
-  type: string;
-  description: string;
-  prompt: string;
-};
-
-const sessionId = "operator-default";
-
-function createBatchTask(type = "researcher"): BatchTask {
-  return {
-    id: `batch-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-    type,
-    description: "",
-    prompt: "",
-  };
-}
 
 function createNoteTab() {
   const now = Date.now();
@@ -116,15 +98,6 @@ function useLocalStorageState(key: string, fallback: string) {
   return [value, setValue] as const;
 }
 
-function formatBool(value: boolean) {
-  return value ? "on" : "off";
-}
-
-function statusTone(ok?: boolean) {
-  if (ok === undefined) return "muted";
-  return ok ? "success" : "error";
-}
-
 export function App() {
   const [surface, setSurface] = useState<Surface>("chat");
   const [studioTab, setStudioTab] = useState<StudioTab>("workflows");
@@ -144,30 +117,17 @@ export function App() {
   const [activityUnread, setActivityUnread] = useState(0);
   const [inboxUnread, setInboxUnread] = useState(0);
   const [projectPath, setProjectPath] = useLocalStorageState("protoagent.projectPath", "");
-  const [runtime, setRuntime] = useState<RuntimeStatus | null>(null);
-  const [subagents, setSubagents] = useState<Subagent[]>([]);
+  // Shell-level runtime read (ADR 0013): non-suspense useQuery so the topbar
+  // always renders; the retry doubles as the desktop sidecar boot-probe. The
+  // System → Runtime panel reads the same key via useSuspenseQuery.
+  const runtimeQ = useQuery({ ...runtimeStatusQuery(), retry: 30, retryDelay: 1000 });
+  const runtime = runtimeQ.data ?? null;
   const [workspace, setWorkspace] = useState<NotesWorkspace | null>(null);
-  const [status, setStatus] = useState("ready");
   const [error, setError] = useState("");
-
-  const [subagentType, setSubagentType] = useState("researcher");
-  const [subagentMode, setSubagentMode] = useState<SubagentMode>("single");
-  const [subagentDescription, setSubagentDescription] = useState("");
-  const [subagentPrompt, setSubagentPrompt] = useState("");
-  const [batchTasks, setBatchTasks] = useState<BatchTask[]>(() => [createBatchTask()]);
-  const [emitSkill, setEmitSkill] = useState(false);
-  const [subagentOutput, setSubagentOutput] = useState("");
-  const [subagentBusy, setSubagentBusy] = useState(false);
 
   const [notesBusy, setNotesBusy] = useState(false);
   const [notesDirty, setNotesDirty] = useState(false);
 
-  const [scheduleJobs, setScheduleJobs] = useState<ScheduledJob[]>([]);
-  const [scheduleBackend, setScheduleBackend] = useState("local");
-  const [schedulePrompt, setSchedulePrompt] = useState("");
-  const [scheduleWhen, setScheduleWhen] = useState("");
-  const [scheduleJobId, setScheduleJobId] = useState("");
-  const [scheduleBusy, setScheduleBusy] = useState(false);
 
 
   const activeTab = workspace?.tabs[workspace.activeTabId] || null;
@@ -175,110 +135,28 @@ export function App() {
     ((activeTab?.metadata as Record<string, unknown> | undefined)?.history as unknown[] | undefined)?.length,
   );
 
-  async function refreshRuntime() {
-    const [runtimePayload, subagentPayload] = await Promise.all([
-      api.runtimeStatus(),
-      api.subagents(),
-    ]);
-    setRuntime(runtimePayload);
-    setSubagents(subagentPayload.subagents);
-    if (!subagentPayload.subagents.some((item) => item.name === subagentType)) {
-      setSubagentType(subagentPayload.subagents[0]?.name || "researcher");
-    }
-    return runtimePayload;
-  }
-
-  async function refreshSchedules() {
-    try {
-      const payload = await api.schedules();
-      setScheduleJobs(payload.jobs);
-      setScheduleBackend(payload.backend);
-    } catch (exc) {
-      setError(exc instanceof Error ? exc.message : String(exc));
-    }
-  }
-
-  async function createSchedule() {
-    const prompt = schedulePrompt.trim();
-    const schedule = scheduleWhen.trim();
-    if (!prompt || !schedule || scheduleBusy) return;
-    setScheduleBusy(true);
-    setError("");
-    try {
-      await api.addSchedule({ prompt, schedule, job_id: scheduleJobId.trim() || undefined });
-      setSchedulePrompt("");
-      setScheduleWhen("");
-      setScheduleJobId("");
-      await refreshSchedules();
-    } catch (exc) {
-      setError(exc instanceof Error ? exc.message : String(exc));
-    } finally {
-      setScheduleBusy(false);
-    }
-  }
-
-  async function cancelScheduleJob(jobId: string) {
-    if (scheduleBusy) return;
-    setScheduleBusy(true);
-    try {
-      await api.cancelSchedule(jobId);
-      await refreshSchedules();
-    } catch (exc) {
-      setError(exc instanceof Error ? exc.message : String(exc));
-    } finally {
-      setScheduleBusy(false);
-    }
-  }
-
-  // Notes are agent-global (one persistent store). Beads + Goals own their data
-  // via TanStack Query inside their panels (ADR 0013), so this only loads notes.
+  // Notes are agent-global (one persistent store). Beads/Goals/runtime own their
+  // data via TanStack Query (ADR 0013); this only loads the notes workspace.
   async function refreshProjectState() {
-    const notesPayload = await api.getNotes();
-    setWorkspace(notesPayload.workspace);
-    setNotesDirty(false);
-  }
-
-  async function refreshAll() {
-    setStatus("refreshing");
-    setError("");
     try {
-      const runtimePayload = await refreshRuntime();
-      // Adopt the server's default project as the fs working dir if none is
-      // set (it seeds the setup wizard's allowed-dirs); notes/beads load
-      // globally regardless.
-      if (!projectPath.trim() && runtimePayload.project.path) {
-        setProjectPath(runtimePayload.project.path);
-      }
-      await refreshProjectState();
-      setStatus("ready");
+      const notesPayload = await api.getNotes();
+      setWorkspace(notesPayload.workspace);
+      setNotesDirty(false);
     } catch (exc) {
-      setStatus("error");
       setError(exc instanceof Error ? exc.message : String(exc));
     }
   }
 
+  // Load notes once on mount (runtime loads via its own query).
   useEffect(() => {
-    let cancelled = false;
-    (async () => {
-      // The desktop app launches the server as a bundled sidecar, which can
-      // take a few seconds to boot. Probe with backoff before the first load
-      // so the startup gap doesn't surface as an error. In browser mode the
-      // server is already up, so the first probe succeeds immediately.
-      for (let attempt = 0; attempt < 30 && !cancelled; attempt += 1) {
-        try {
-          await api.runtimeStatus();
-          break;
-        } catch {
-          if (attempt === 0) setStatus("starting server…");
-          await new Promise((resolve) => window.setTimeout(resolve, 1000));
-        }
-      }
-      if (!cancelled) void refreshAll();
-    })();
-    return () => {
-      cancelled = true;
-    };
+    void refreshProjectState();
   }, []);
+
+  // Adopt the server's default project as the fs working dir if none is set (it
+  // seeds the setup wizard's allowed-dirs) once runtime resolves.
+  useEffect(() => {
+    if (!projectPath.trim() && runtime?.project.path) setProjectPath(runtime.project.path);
+  }, [runtime, projectPath, setProjectPath]);
 
   useEffect(() => {
     if (!notesDirty || !workspace) return;
@@ -310,9 +188,6 @@ export function App() {
     return () => window.clearInterval(handle);
   }, [rightPanel, notesDirty, notesBusy]);
 
-  useEffect(() => {
-    if (surface === "activity" && activityTab === "schedule") void refreshSchedules();
-  }, [surface, activityTab]);
 
   // Goals now own their data via TanStack Query inside <GoalsPanel> (ADR 0013) —
   // no App-level fetch/poll here.
@@ -352,54 +227,6 @@ export function App() {
   useEffect(() => {
     if (viewingInbox()) setInboxUnread(0);
   }, [surface, activityTab]);
-
-  async function runSubagent() {
-    const prompt = subagentPrompt.trim();
-    const runnableBatchTasks = batchTasks.filter((task) => task.prompt.trim());
-    if (subagentBusy) return;
-    if (subagentMode === "single" && !prompt) return;
-    if (subagentMode === "batch" && runnableBatchTasks.length === 0) return;
-    setSubagentBusy(true);
-    setError("");
-    setSubagentOutput("");
-    try {
-      const response = subagentMode === "single"
-        ? await api.runSubagent({
-            session_id: sessionId,
-            type: subagentType,
-            description: subagentDescription.trim(),
-            prompt,
-            emit_skill: emitSkill,
-          })
-        : await api.runSubagentBatch({
-            session_id: sessionId,
-            tasks: runnableBatchTasks.map((task) => ({
-              type: task.type,
-              description: task.description.trim(),
-              prompt: task.prompt.trim(),
-              emit_skill: emitSkill,
-            })),
-          });
-      setSubagentOutput(response.output);
-    } catch (exc) {
-      setError(exc instanceof Error ? exc.message : String(exc));
-    } finally {
-      setSubagentBusy(false);
-    }
-  }
-
-  function updateBatchTask(id: string, patch: Partial<BatchTask>) {
-    setBatchTasks((tasks) => tasks.map((task) => (task.id === id ? { ...task, ...patch } : task)));
-  }
-
-  function addBatchTask() {
-    setBatchTasks((tasks) => [...tasks, createBatchTask(subagentType)]);
-  }
-
-  function removeBatchTask(id: string) {
-    setBatchTasks((tasks) => (tasks.length > 1 ? tasks.filter((task) => task.id !== id) : tasks));
-  }
-
 
   function updateWorkspace(nextWorkspace: NotesWorkspace) {
     setWorkspace(nextWorkspace);
@@ -547,11 +374,6 @@ export function App() {
     });
   }
 
-  const middleware = useMemo(() => {
-    if (!runtime) return [];
-    return Object.entries(runtime.middleware).sort(([a], [b]) => a.localeCompare(b));
-  }, [runtime]);
-
   // Drag the right panel's left edge to resize (clamped 280–720px, persisted).
   function startRightResize(e: React.MouseEvent) {
     e.preventDefault();
@@ -578,12 +400,20 @@ export function App() {
   const rightCol = rightCollapsed ? "0px" : `${rightWidth}px`;
 
   // One glanceable health light for the topbar (detail on hover; full status in
-  // System → Runtime). Worst-state wins.
+  // System → Runtime). Worst-state wins. Derived from the runtime query — while
+  // it's still loading (no data, e.g. the sidecar booting) we show "starting".
+  const statusLabel = runtimeQ.isError
+    ? "error"
+    : !runtime
+      ? "starting server…"
+      : runtimeQ.isFetching
+        ? "refreshing"
+        : "ready";
   const health: { tone: "ok" | "warning" | "error"; label: string } =
-    runtime && !runtime.setup_complete ? { tone: "warning", label: "setup pending" }
-    : runtime && !runtime.graph_loaded ? { tone: "error", label: "graph offline" }
-    : status === "error" ? { tone: "error", label: "error" }
-    : status === "streaming" || status === "refreshing" || status.includes("…") ? { tone: "warning", label: status }
+    !runtime && runtimeQ.isError ? { tone: "error", label: "error" }
+    : !runtime ? { tone: "warning", label: "starting…" }
+    : !runtime.setup_complete ? { tone: "warning", label: "setup pending" }
+    : !runtime.graph_loaded ? { tone: "error", label: "graph offline" }
     : { tone: "ok", label: "ready" };
 
   // Desktop (macOS) runs with an overlay/invisible title bar — no chrome, the
@@ -616,12 +446,15 @@ export function App() {
           <button
             type="button"
             className={`status-dot tone-${health.tone}`}
-            onClick={() => void refreshAll()}
+            onClick={() => {
+              void runtimeQ.refetch();
+              void refreshProjectState();
+            }}
             title={
               `Setup: ${runtime?.setup_complete ? "complete" : "pending"}\n` +
               `Graph: ${runtime?.graph_loaded ? "loaded" : "offline"}\n` +
               `Event stream: ${live ? "connected" : "offline"}\n` +
-              `Status: ${status}` +
+              `Status: ${statusLabel}` +
               (error ? `\nError: ${error}` : "") +
               `\n\nClick to refresh.`
             }
@@ -723,307 +556,16 @@ export function App() {
             <ChatSurface onError={setError} />
           ) : null}
 
-          {surface === "studio" && studioTab === "run" ? (
-            <section className="panel stage-panel">
-              <div className="panel-header">
-                <div>
-                  <h1>Run</h1>
-                  <p className="panel-kicker">one focused worker, now · {subagents.length} subagent type{subagents.length === 1 ? "" : "s"}</p>
-                </div>
-                <StatusPill label={subagentBusy ? "running" : "ready"} tone={subagentBusy ? "warning" : "muted"} />
-              </div>
-              <div className="stage-body">
-              <div className="subagent-mode segmented">
-                <button type="button" className={subagentMode === "single" ? "active" : ""} onClick={() => setSubagentMode("single")}>
-                  Single
-                </button>
-                <button type="button" className={subagentMode === "batch" ? "active" : ""} onClick={() => setSubagentMode("batch")}>
-                  Batch
-                </button>
-              </div>
-              <div className="subagent-grid">
-                <label className="field">
-                  <span>Type</span>
-                  <select value={subagentType} onChange={(event) => setSubagentType(event.target.value)}>
-                    {subagents.map((subagent) => (
-                      <option key={subagent.name} value={subagent.name}>
-                        {subagent.name}
-                      </option>
-                    ))}
-                  </select>
-                </label>
-                <label className="field">
-                  <span>Description</span>
-                  <input
-                    value={subagentDescription}
-                    onChange={(event) => setSubagentDescription(event.target.value)}
-                    placeholder="Short task label"
-                  />
-                </label>
-                <label className="checkbox-field">
-                  <input
-                    type="checkbox"
-                    checked={emitSkill}
-                    onChange={(event) => setEmitSkill(event.target.checked)}
-                  />
-                  <span>Emit skill</span>
-                </label>
-              </div>
-              {subagentMode === "single" ? (
-                <label className="field grow">
-                  <span>Prompt</span>
-                  <textarea
-                    value={subagentPrompt}
-                    onChange={(event) => setSubagentPrompt(event.target.value)}
-                    placeholder="Subagent instructions"
-                    rows={8}
-                  />
-                </label>
-              ) : (
-                <div className="batch-task-list">
-                  {batchTasks.map((task, index) => (
-                    <div className="batch-task-row" key={task.id}>
-                      <div className="batch-task-header">
-                        <span>Task {index + 1}</span>
-                        <button className="icon-button" type="button" onClick={() => removeBatchTask(task.id)} disabled={batchTasks.length === 1} title="Remove task">
-                          <Trash2 size={15} />
-                        </button>
-                      </div>
-                      <div className="batch-task-fields">
-                        <label className="field">
-                          <span>Type</span>
-                          <select value={task.type} onChange={(event) => updateBatchTask(task.id, { type: event.target.value })}>
-                            {subagents.map((subagent) => (
-                              <option key={subagent.name} value={subagent.name}>
-                                {subagent.name}
-                              </option>
-                            ))}
-                          </select>
-                        </label>
-                        <label className="field">
-                          <span>Description</span>
-                          <input value={task.description} onChange={(event) => updateBatchTask(task.id, { description: event.target.value })} placeholder="Task label" />
-                        </label>
-                      </div>
-                      <label className="field">
-                        <span>Prompt</span>
-                        <textarea value={task.prompt} onChange={(event) => updateBatchTask(task.id, { prompt: event.target.value })} rows={4} />
-                      </label>
-                    </div>
-                  ))}
-                </div>
-              )}
-              <div className="panel-actions">
-                {subagentMode === "batch" ? (
-                  <button className="secondary-button" type="button" onClick={addBatchTask}>
-                    <Plus size={15} />
-                    Add task
-                  </button>
-                ) : null}
-                <button
-                  className="primary-button"
-                  type="button"
-                  onClick={() => void runSubagent()}
-                  disabled={
-                    subagentBusy ||
-                    (subagentMode === "single" ? !subagentPrompt.trim() : !batchTasks.some((task) => task.prompt.trim()))
-                  }
-                >
-                  {subagentBusy ? <Loader2 className="spin" size={16} /> : <Play size={16} />}
-                  {subagentMode === "single" ? "Run" : "Run batch"}
-                </button>
-              </div>
-              {subagentOutput ? <pre className="output-block">{subagentOutput}</pre> : null}
-              </div>
-            </section>
-          ) : null}
+          {surface === "studio" && studioTab === "run" ? <RunPanel /> : null}
 
           {surface === "studio" && studioTab === "workflows" ? <WorkflowsSurface /> : null}
 
           {surface === "activity" && activityTab === "thread" ? <ActivitySurface onError={setError} /> : null}
           {surface === "activity" && activityTab === "inbox" ? <InboxPanel /> : null}
 
-          {surface === "activity" && activityTab === "schedule" ? (
-            <section className="panel stage-panel">
-              <div className="panel-header">
-                <div>
-                  <h1>Schedule</h1>
-                  <p className="panel-kicker">{scheduleJobs.length} job{scheduleJobs.length === 1 ? "" : "s"} · {scheduleBackend}</p>
-                </div>
-                <button className="icon-button" type="button" onClick={() => void refreshSchedules()} title="Refresh">
-                  {scheduleBusy ? <Loader2 className="spin" size={16} /> : <RefreshCw size={16} />}
-                </button>
-              </div>
+          {surface === "activity" && activityTab === "schedule" ? <SchedulePanel /> : null}
 
-              <div className="stage-body">
-              <div className="subagent-grid">
-                <label className="field">
-                  <span>When (cron or ISO datetime)</span>
-                  <input
-                    value={scheduleWhen}
-                    onChange={(event) => setScheduleWhen(event.target.value)}
-                    placeholder='e.g. "0 9 * * 1-5"  or  "2026-06-01T15:00:00Z"'
-                  />
-                </label>
-                <label className="field">
-                  <span>Job id (optional)</span>
-                  <input
-                    value={scheduleJobId}
-                    onChange={(event) => setScheduleJobId(event.target.value)}
-                    placeholder="auto"
-                  />
-                </label>
-                <button
-                  className="primary-button"
-                  type="button"
-                  onClick={() => void createSchedule()}
-                  disabled={scheduleBusy || !schedulePrompt.trim() || !scheduleWhen.trim()}
-                >
-                  <Plus size={16} />
-                  Schedule
-                </button>
-              </div>
-              <label className="field grow">
-                <span>Prompt (delivered to the agent when it fires)</span>
-                <textarea
-                  value={schedulePrompt}
-                  onChange={(event) => setSchedulePrompt(event.target.value)}
-                  placeholder="What the agent should do when this fires"
-                  rows={5}
-                />
-              </label>
-
-              <div className="subagent-list">
-                {scheduleJobs.length ? (
-                  scheduleJobs.map((job) => (
-                    <div className="subagent-row" key={job.id}>
-                      <div>
-                        <strong>{job.id}</strong>
-                        <span>
-                          {job.schedule}
-                          {job.next_fire ? ` · next ${job.next_fire}` : ""}
-                          {" · "}
-                          {job.prompt.length > 80 ? `${job.prompt.slice(0, 80)}…` : job.prompt}
-                        </span>
-                      </div>
-                      <button
-                        className="icon-button"
-                        type="button"
-                        onClick={() => void cancelScheduleJob(job.id)}
-                        disabled={scheduleBusy}
-                        title="Cancel job"
-                      >
-                        <Trash2 size={16} />
-                      </button>
-                    </div>
-                  ))
-                ) : (
-                  <div className="subagent-row">
-                    <div>
-                      <strong>No scheduled jobs</strong>
-                      <span>{scheduleBackend !== "local" && scheduleBackend !== "disabled" ? `jobs may be managed remotely by ${scheduleBackend}` : "create one above"}</span>
-                    </div>
-                  </div>
-                )}
-              </div>
-              </div>
-            </section>
-          ) : null}
-
-          {surface === "system" && systemTab === "runtime" ? (
-            <section className="panel stage-panel">
-              <div className="panel-header">
-                <div>
-                  <h1>Runtime</h1>
-                  <p className="panel-kicker">{runtime?.model?.name || "model not configured"}</p>
-                </div>
-                <StatusPill label={runtime?.scheduler.backend || "scheduler"} tone="muted" />
-              </div>
-              <div className="stage-body">
-              <div className="metric-grid">
-                <Metric icon={<Bot size={16} />} label="Agent" value={runtime?.identity?.name || "protoagent"} />
-                <Metric icon={<Settings2 size={16} />} label="Provider" value={runtime?.model?.provider || "none"} />
-                <Metric icon={<Database size={16} />} label="Knowledge" value={runtime?.knowledge.resolved_path || runtime?.knowledge.configured_path || "disabled"} />
-                <Metric icon={<Sparkles size={16} />} label="Goal mode" value={formatBool(Boolean(runtime?.goal.enabled))} />
-              </div>
-              <p className="panel-kicker">Middleware</p>
-              <div className="table-list">
-                {middleware.map(([name, enabled]) => (
-                  <div className="table-row" key={name}>
-                    <span>{name}</span>
-                    <StatusPill label={formatBool(enabled)} tone={enabled ? "success" : "muted"} />
-                  </div>
-                ))}
-              </div>
-
-              <p className="panel-kicker">Skills</p>
-              <div className="table-list">
-                <div className="table-row">
-                  <span>SKILL.md skills loaded</span>
-                  <StatusPill
-                    label={`${runtime?.skills?.count ?? 0}`}
-                    tone={(runtime?.skills?.count ?? 0) > 0 ? "success" : "muted"}
-                  />
-                </div>
-              </div>
-
-              <p className="panel-kicker">MCP servers</p>
-              <div className="table-list">
-                {runtime?.mcp?.servers?.length ? (
-                  runtime.mcp.servers.map((server) => (
-                    <div className="table-row" key={server.name}>
-                      <span>{server.name} · {server.transport}</span>
-                      <StatusPill label={`${server.tool_count} tool${server.tool_count === 1 ? "" : "s"}`} tone="success" />
-                    </div>
-                  ))
-                ) : (
-                  <div className="table-row">
-                    <span>no MCP servers</span>
-                    <StatusPill label={runtime?.mcp?.enabled ? "enabled" : "off"} tone="muted" />
-                  </div>
-                )}
-              </div>
-
-              <p className="panel-kicker">Plugins</p>
-              <div className="table-list">
-                {runtime?.plugins?.length ? (
-                  runtime.plugins.map((plugin) => (
-                    <div className="table-row" key={plugin.id}>
-                      <span>
-                        {plugin.name}
-                        {plugin.loaded && plugin.tools.length ? ` · ${plugin.tools.length} tool${plugin.tools.length === 1 ? "" : "s"}` : ""}
-                        {plugin.loaded && plugin.skills ? ` · ${plugin.skills} skill${plugin.skills === 1 ? "" : "s"}` : ""}
-                        {plugin.error ? ` · ${plugin.error}` : ""}
-                      </span>
-                      <StatusPill
-                        label={plugin.loaded ? "loaded" : plugin.error ? "error" : plugin.enabled ? "enabled" : "disabled"}
-                        tone={plugin.loaded ? "success" : plugin.error ? "error" : "muted"}
-                      />
-                    </div>
-                  ))
-                ) : (
-                  <div className="table-row">
-                    <span>no plugins</span>
-                    <StatusPill label="none" tone="muted" />
-                  </div>
-                )}
-              </div>
-
-              <p className="panel-kicker">Subagents</p>
-              <div className="subagent-list">
-                {subagents.map((subagent) => (
-                  <div className="subagent-row" key={subagent.name}>
-                    <div>
-                      <strong>{subagent.name}</strong>
-                      <span>{subagent.tools.join(", ") || "no tools"}</span>
-                    </div>
-                    <StatusPill label={`${subagent.max_turns} turns`} tone={subagent.enabled ? "success" : "muted"} />
-                  </div>
-                ))}
-              </div>
-              </div>
-            </section>
-          ) : null}
+          {surface === "system" && systemTab === "runtime" ? <RuntimePanel /> : null}
 
           {surface === "system" && systemTab === "telemetry" ? <TelemetrySurface /> : null}
           {surface === "knowledge" ? <PlaybooksSurface onError={setError} /> : null}
@@ -1173,7 +715,10 @@ export function App() {
         open={runtime?.setup_complete === false}
         projectPath={projectPath}
         onProjectPathChange={setProjectPath}
-        onFinished={() => void refreshAll()}
+        onFinished={() => {
+          void runtimeQ.refetch();
+          void refreshProjectState();
+        }}
       />
 
       <ConfirmDialog
@@ -1217,12 +762,3 @@ function RailButton({
   );
 }
 
-function Metric({ icon, label, value }: { icon: ReactNode; label: string; value: string }) {
-  return (
-    <div className="metric">
-      {icon}
-      <span>{label}</span>
-      <strong>{value}</strong>
-    </div>
-  );
-}
