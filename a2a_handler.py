@@ -1699,6 +1699,16 @@ def register_a2a_routes(
             msg_metadata = params.get("metadata") or {}
             caller_trace = msg_metadata.get("a2a.trace") or {}
 
+            # Surface the dispatched skill to the agent. Skill-based A2A callers
+            # (e.g. a Workstacean ceremony) name the skill in metadata.skillHint
+            # and send a generic/contentless body ("Execute skill: <name>\n<meta>").
+            # The agent loop only sees the text part, so without this the agent
+            # can't reliably tell which skill was invoked. Prepend a stable
+            # ``[skill: <name>]`` marker so the agent's skills can key on it.
+            skill_hint = (message.get("metadata") or {}).get("skillHint") or msg_metadata.get("skillHint")
+            if skill_hint and f"[skill: {skill_hint}]" not in text:
+                text = f"[skill: {skill_hint}]\n{text}"
+
             if method in ("message/stream", "message/sendStream"):
                 try:
                     _check_origin(request)
