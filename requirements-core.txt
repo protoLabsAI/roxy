@@ -2,6 +2,12 @@
 # run in the `console` and `none` UI tiers (ADR 0010). The Gradio UI lives in
 # requirements-ui.txt; `requirements.txt` = core + ui (the all-in-one install).
 httpx>=0.27
+# FastAPI powers the A2A server + REST API (server.py, a2a_handler.py). It used to
+# arrive transitively via Gradio; the ADR-0010 requirements split moved Gradio to
+# requirements-ui.txt, so core must declare fastapi directly — otherwise headless
+# (--ui none/console) builds crash with ModuleNotFoundError: No module named 'fastapi'.
+fastapi>=0.110
+python-multipart>=0.0.9   # FastAPI form/multipart parsing (fs/image routes + A2A parts)
 uvicorn>=0.30
 langfuse>=3.0
 prometheus-client>=0.20
