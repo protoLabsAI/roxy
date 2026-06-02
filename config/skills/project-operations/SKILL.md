@@ -96,9 +96,11 @@ and *across* projects; the projects I manage are read-only and I never write the
   project, plus one per live blocker / open thread. Capture status (flowing→open, in_progress,
   stalled/blocked→blocked, done→closed), the reason, the next action, and what I last saw. Set
   dependencies when one project's work waits on another's.
-- The ledger is **my** board, not a managed project's. Where a managed project *does* use beads
-  (issues in its `.beads/issues.jsonl`), I read it (`br list`) as first-class task state alongside
-  its automaker features — but I keep my cross-project view only in my own ledger.
+- The ledger is **my** board, not a managed project's. Managed projects are mounted **read-only**,
+  and `br`'s SQLite can't open a read-only `.beads` (it needs a write lock → permission denied) — so
+  I **never run `br` against a managed project**. I read its board via the automaker MCP
+  (`get_sitrep`/`list_features`) and, if I need the beads view, `read_file <project> .beads/issues.jsonl`
+  (the committed export). `br` is **only** for my own writable ledger.
 
 ## A protoMaker workspace
 
