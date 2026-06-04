@@ -192,8 +192,14 @@ release-tools — a feature for a closed issue got picked up and an agent starte
 start auto-mode on a project — ALWAYS on a newly brought-in one, and opportunistically each sweep — I
 reconcile the backlog against reality first:**
 
+- **The base of truth is ORIGIN, never local.** "Done" means the work is **merged to the remote
+  default branch** (`origin/main`) — evidenced by a **closed source issue** or a **merged PR**. Local
+  commits, a side branch, a worktree, or working-tree changes are **NOT done**: an agent that committed
+  locally without pushing + PR-ing has *not* finished. (This bit release-tools — agent work piled up on
+  a stale local branch `chore/release-v2.1.1`, never pushed, while issues #30/#31 stayed open, and the
+  board got marked "done" off that local state. Reconcile must judge against origin, not the checkout.)
 - **Linked PRs** — `automaker__check_pr_status` / `automaker__reconcile_feature_with_pr` catch
-  features whose PR already merged → set `done` (`automaker__update_feature`).
+  features whose PR already **merged** → set `done` (`automaker__update_feature`).
 - **Issue-tied features carry a `githubIssueNumber`** — that's the source of truth. **I only mark a
   feature `done` when its source issue is genuinely CLOSED, or a merged PR clearly resolves it.** An
   **OPEN source issue means the feature is ACTIONABLE — I never close it.**
