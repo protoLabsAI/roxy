@@ -1,0 +1,13 @@
+id: fleet-onboarding
+name: Fleet Onboarding
+version: 0.1.0
+description: >-
+  Roxy's onboarding power tools — the two non-shell actions the `onboard-project`
+  skill needs so onboarding runs fully unsupervised (no `run_command`, no HITL
+  shell gate): read a project's GitHub remote from `.git/config`, and register a
+  project with the Workstacean fleet via `POST /api/onboard`.
+enabled: false # enabled via `plugins: { enabled: [fleet-onboarding] }` in config
+# Declarative only (surfaced in the console for transparency).
+capabilities:
+  network: ["workstacean:/api/onboard"]
+  filesystem: read

@@ -1947,6 +1947,86 @@ _SKILL_SPECS: list[dict] = [
         "examples": ["unblock_feature <featureId>"],
     },
     {
+        "id": "audit_project",
+        "name": "Audit Project",
+        "description": "Audit a project (a local dir or GitHub repo), read-only: inspect code, config, tests and deploy setup and return a prioritized, evidence-backed backlog proposal (features / tech-debt / bugs). Assessment only — stops before onboarding.",
+        "tags": ["pm", "audit"],
+        "examples": ["audit_project <dir|owner/repo>", "audit the portfolio"],
+    },
+    {
+        # Structured: the #476 finalizer enforces output_schema and emits the
+        # validated onboarding plan as an onboarding-plan-v1 DataPart alongside
+        # the prose. The skillHint surfaces [skill: onboard_project], anchoring
+        # the lead to the onboard-project disk-skill playbook (not project_decompose).
+        "id": "onboard_project",
+        "name": "Onboard Project",
+        "description": "Onboard a project (a local dir or GitHub repo) into the protoMaker fleet: read its conformance gaps against the workspace-config + CI-lockdown standards, create the onboarding project with a two-epic board (fleet-conformance true-up + the audit's product backlog), and register it via /api/onboard. Branch protection is an operator step. Read-only; proposes first, executes on approval.",
+        "tags": ["pm", "onboarding", "planning"],
+        "examples": ["onboard_project <dir|owner/repo>", "onboard the portfolio"],
+        "result_mime": "application/vnd.protolabs.onboarding-plan-v1+json",
+        "output_schema": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "project": {"type": "string", "description": "project slug, e.g. portfolio"},
+                "target": {"type": "string", "description": "local path or owner/repo audited"},
+                "summary": {"type": "string", "description": "2-3 sentence read: what it is + stack"},
+                "conformance": {
+                    "type": "array",
+                    "description": "one row per workspace-config / CI-lockdown rule",
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "properties": {
+                            "rule": {"type": "string"},
+                            "status": {"type": "string", "enum": ["pass", "fail", "unknown"]},
+                            "trueUp": {"type": "string", "description": "action to close the gap; empty if pass"},
+                        },
+                        "required": ["rule", "status"],
+                    },
+                },
+                "board": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "description": "the two-epic onboarding board",
+                    "properties": {
+                        "fleetConformance": {
+                            "type": "array",
+                            "description": "true-up features; actor=operator for branch protection",
+                            "items": {
+                                "type": "object",
+                                "additionalProperties": False,
+                                "properties": {
+                                    "title": {"type": "string"},
+                                    "actor": {"type": "string", "enum": ["agent", "operator"]},
+                                },
+                                "required": ["title", "actor"],
+                            },
+                        },
+                        "productBacklog": {
+                            "type": "array",
+                            "description": "features / tech-debt / bugs from the audit",
+                            "items": {
+                                "type": "object",
+                                "additionalProperties": False,
+                                "properties": {
+                                    "title": {"type": "string"},
+                                    "priority": {"type": "string", "enum": ["P0", "P1", "P2"]},
+                                },
+                                "required": ["title", "priority"],
+                            },
+                        },
+                    },
+                    "required": ["fleetConformance", "productBacklog"],
+                },
+                "fleetRegister": {"type": "string", "description": "the exact POST /api/onboard call to run on approval"},
+                "operatorActions": {"type": "array", "items": {"type": "string"}, "description": "e.g. the apply-branch-protection command + ruleset prerequisite"},
+                "openQuestions": {"type": "array", "items": {"type": "string"}},
+            },
+            "required": ["project", "conformance", "board", "fleetRegister"],
+        },
+    },
+    {
         "id": "chat",
         "name": "Chat",
         "description": "General-purpose chat / Q&A about the portfolio.",

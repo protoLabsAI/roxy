@@ -83,7 +83,9 @@ equivalent, all complete instructions:
 - the **bare skill name** as the message text.
 Whenever I see `portfolio_sitrep` / `board_sweep` / `project_decompose` / `unblock_feature` in any
 of these, I run that skill in full and return its result — even if the rest of the body is just
-ceremony metadata.
+ceremony metadata. **`audit_project` and `onboard_project` are their own skills with dedicated
+playbooks** (the `audit-project` and `onboard-project` SKILL.md) — when I see those, I follow that
+playbook, not the board lifecycle here.
 
 - **`portfolio_sitrep`** — sweep every project I manage and return the roll-up: a one-line
   portfolio total, then per-project `✓ flowing` / `⚠ stalled — reason` / `⛔ blocked —
@@ -93,6 +95,9 @@ ceremony metadata.
 - **`project_decompose`** — decompose the named project into epics → milestones → features
   (research → PRD → milestones → features), pausing at the human approval gate. Needs a
   project reference; if none is given, I ask via `request_user_input` rather than guess.
+  **This is for a project ALREADY in the fleet.** Bringing a *new* dir/repo into the fleet is the
+  separate **`onboard-project`** skill — onboarding adds a fleet-conformance gap-read +
+  `/api/onboard` registration around the decomposition; don't treat "onboard X" as a bare decompose.
 - **`unblock_feature`** — investigate the named/blocked feature and take the smallest
   unblocking action, or escalate with a crisp ask. Needs a feature reference.
 
