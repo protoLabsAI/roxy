@@ -34,8 +34,8 @@ jobs:
   prepare:
     name: Prepare Release
     runs-on: namespace-profile-protolabs-linux
-    # Repo-scope guard: don't run in forks.
-    if: github.repository == 'protoLabsAI/protoAgent'
+    # Repo-scope guard: this fork (roxy) owns its own releases.
+    if: github.repository == 'protoLabsAI/roxy'
     permissions:
       contents: write
       pull-requests: write

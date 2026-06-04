@@ -18,13 +18,15 @@ on:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: protolabsai/protoagent
+  # The fork's OWN package — the repo's GITHUB_TOKEN can only write packages
+  # linked to this repo (pushing to the upstream protoagent package 403s).
+  IMAGE_NAME: protolabsai/roxy
 
 jobs:
   release:
     name: Release
     runs-on: namespace-profile-protolabs-linux
-    if: github.repository == 'protoLabsAI/protoAgent'
+    if: github.repository == 'protoLabsAI/roxy'
     permissions:
       contents: write
       packages: write
@@ -74,8 +76,8 @@ jobs:
             type=semver,pattern={{version}},value=${{ steps.version.outputs.tag }}
             type=semver,pattern={{major}}.{{minor}},value=${{ steps.version.outputs.tag }}
           labels: |
-            org.opencontainers.image.title=protoagent
-            org.opencontainers.image.description=protoAgent — LangGraph + A2A template
+            org.opencontainers.image.title=roxy
+            org.opencontainers.image.description=Roxy — protoMaker portfolio manager (protoAgent fork)
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.version=${{ steps.version.outputs.version }}
