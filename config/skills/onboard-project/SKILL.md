@@ -123,6 +123,18 @@ npx -y @protolabsai/release-tools apply-branch-protection --repo <owner/name> --
 (The CLI only patches an existing `Protect main` ruleset — if none exists, one is created in the
 repo's GitHub **Settings → Rules** first. I note that prerequisite.)
 
+### Agent isolation — `useWorktrees` (REQUIRED before any auto-mode)
+
+protoMaker agents must run in isolated git **worktrees** so each feature works on its own branch →
+push → PR → review → merge. If `.automaker/settings.json` `execution.useWorktrees` is unset/false,
+the agent runs **in-place on the integration branch**: it commits straight to local `main` — no
+feature branch, no push, **no PR** — and the work never reaches origin or Quinn (this bit
+release-tools; tracked as **protoMaker#4073**). So onboarding **requires `execution.useWorktrees:
+true`**: I read it off `.automaker/settings.json`, and if it's missing or `false` I flag a **blocking
+`agent-isolation` setup true-up** — the project is NOT ready for auto-mode until isolation is on (the
+operator/setup sets it; `automaker_update_settings` is not mine). I never launch auto-mode on a
+project whose `useWorktrees` isn't confirmed `true`.
+
 ## The flow
 
 I **propose first, then execute on approval** — I don't create boards or register anything until you

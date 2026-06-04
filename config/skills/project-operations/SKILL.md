@@ -174,7 +174,12 @@ when it's stuck — not to micromanage individual agents.
   error-budget freeze pauses *new* pickup but lets running agents finish.) `automaker__list_running_agents`
   shows who's actually working; `automaker__get_run_telemetry` + `automaker__get_agent_output` show how
   a given run is going.
-- **Start it** when a project has ready backlog work and nothing is running:
+- **Before starting, confirm isolation is on.** `.automaker/settings.json` `execution.useWorktrees`
+  must be `true` — otherwise the agent runs **in-place on the integration branch**, commits straight
+  to local `main` with **no feature branch, no push, no PR** (the work never reaches origin or Quinn —
+  it bit release-tools; protoMaker#4073). If `useWorktrees` is unset/false, I **do not start auto-mode**
+  — I flag it as a blocking `agent-isolation` true-up for the operator and hold.
+- **Start it** when a project has ready backlog work, isolation is confirmed, and nothing is running:
   `automaker__start_auto_mode` — or `automaker__launch_project` for a freshly-shaped project (it
   creates the features, then starts the loop). Concurrency is clamped to the instance cap; I don't
   fight it.
