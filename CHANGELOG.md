@@ -43,6 +43,15 @@
   KB. The researcher gains `memory_ingest` for that persistence.
 
 ### Fixed
+- **Config reload no longer freezes the server (protoAgent #497).** The graph
+  recompile ran synchronously on the event loop from the finish-setup / settings
+  routes, freezing the server for the rebuild (concurrent pollers got connection
+  refusals). The reload is now offloaded to a worker thread (`asyncio.to_thread`);
+  the follow-up scheduler restart marshals back onto the captured `_main_loop` via
+  `run_coroutine_threadsafe` (new `_run_on_server_loop`), avoiding the trap where
+  the old `get_running_loop()` path silently dropped the scheduler start. Adapted
+  from protoAgent PR #503 (roxy has no Discord-UI surface, so only the
+  scheduler/offload parts apply). Regression test added.
 - **A2A request-level metadata was being dropped (trace + skill dispatch).**
   `_extract_caller_trace` read only `context.message.metadata`, missing
   `SendMessageRequest`-level `context.metadata` — where clients (the hub) put
