@@ -1,11 +1,15 @@
 import {
+  AlertTriangle,
   Bot,
+  CalendarDays,
   Check,
   ChevronLeft,
   ChevronRight,
   Database,
+  ExternalLink,
   KeyRound,
   Loader2,
+  MessageCircle,
   Network,
   Search,
   ShieldCheck,
@@ -17,9 +21,14 @@ import type { ReactNode } from "react";
 import { api } from "../lib/api";
 import type { AgentConfig, ConfigPayload, SetupStatus } from "../lib/types";
 
-type Step = "welcome" | "identity" | "model" | "persona" | "tools" | "workspace" | "finish";
+type Step = "welcome" | "identity" | "model" | "persona" | "tools" | "workspace" | "discord" | "google" | "finish";
 
-const steps: Step[] = ["welcome", "identity", "model", "persona", "tools", "workspace", "finish"];
+const steps: Step[] = ["welcome", "identity", "model", "persona", "tools", "workspace", "discord", "google", "finish"];
+
+// Setup walkthroughs live in the template's (protoAgent) canonical docs — forks
+// don't ship their own docs site, so the in-app help links point there.
+const DISCORD_GUIDE_URL = "https://protolabsai.github.io/protoAgent/guides/discord#bot-setup";
+const GOOGLE_GUIDE_URL = "https://protolabsai.github.io/protoAgent/guides/google#oauth-client";
 
 type WizardState = {
   agentName: string;
@@ -38,6 +47,16 @@ type WizardState = {
   knowledgeTopK: number;
   allowedDirs: string;
   initBeads: boolean;
+  // Discord surface (optional, skippable). `discordAdminId` accepts one or more
+  // IDs (comma/newline) — the operator's own user ID(s) allowed to DM the bot.
+  discordEnabled: boolean;
+  discordToken: string;
+  discordAdminId: string;
+  // Google surface (optional). Collect the OAuth client here; authorizing
+  // ("Connect Google") happens in Settings after setup (it opens the browser).
+  googleClientId: string;
+  googleClientSecret: string;
+  googleTz: string;
 };
 
 function defaultState(): WizardState {
@@ -63,6 +82,12 @@ function defaultState(): WizardState {
     knowledgeTopK: 5,
     allowedDirs: "",
     initBeads: false,
+    discordEnabled: false,
+    discordToken: "",
+    discordAdminId: "",
+    googleClientId: "",
+    googleClientSecret: "",
+    googleTz: "",
   };
 }
 
@@ -90,6 +115,12 @@ function hydrateState(payload: ConfigPayload, status: SetupStatus | null): Wizar
     knowledgeTopK: Number(config.knowledge.top_k ?? 5),
     allowedDirs: (config.operator?.allowed_dirs || []).join("\n"),
     initBeads: false,
+    discordEnabled: Boolean(config.discord?.enabled),
+    discordToken: "",
+    discordAdminId: (config.discord?.admin_ids || []).join(", "),
+    googleClientId: config.google?.client_id || "",
+    googleClientSecret: "",
+    googleTz: config.google?.tz || "",
   };
 }
 
@@ -111,6 +142,11 @@ export function SetupWizard({
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [message, setMessage] = useState("");
+  // Result of the last "Test connection" probe (a real completion). null = not
+  // yet tested; invalidated whenever the key/base/model changes.
+  const [tested, setTested] = useState<null | { ok: boolean; error: string }>(null);
+  // Discord "Test connection" result (null = not tested; carries the bot name).
+  const [discordTested, setDiscordTested] = useState<null | { ok: boolean; error: string; bot: string | null }>(null);
 
   const index = steps.indexOf(step);
 
@@ -136,6 +172,16 @@ export function SetupWizard({
       alive = false;
     };
   }, [open]);
+
+  // A changed key/base/model invalidates a prior connection test.
+  useEffect(() => {
+    setTested(null);
+  }, [state.apiBase, state.apiKey, state.modelName]);
+
+  // A changed token invalidates a prior Discord test.
+  useEffect(() => {
+    setDiscordTested(null);
+  }, [state.discordToken]);
 
   const canGoNext = useMemo(() => {
     if (step === "model") return state.apiBase.trim() && state.modelName.trim();
@@ -170,6 +216,38 @@ export function SetupWizard({
       }
     } catch (exc) {
       setError(exc instanceof Error ? exc.message : String(exc));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  // The real auth check: a 1-token completion down the same path as chat, so a
+  // bad key / wrong model is caught here in the UI rather than as a failed turn.
+  async function testConnection() {
+    setBusy(true);
+    setError("");
+    setTested(null);
+    try {
+      const r = await api.testModel(state.apiBase.trim(), state.apiKey.trim(), state.modelName.trim());
+      setTested({ ok: r.ok, error: r.error || "" });
+    } catch (exc) {
+      setTested({ ok: false, error: exc instanceof Error ? exc.message : String(exc) });
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  // Verify the Discord bot token before finishing — fetches the bot identity so
+  // a bad token is caught in the UI (and the operator sees the bot's name).
+  async function testDiscord() {
+    setBusy(true);
+    setError("");
+    setDiscordTested(null);
+    try {
+      const r = await api.testDiscord(state.discordToken.trim());
+      setDiscordTested({ ok: r.ok, error: r.error || "", bot: r.bot_user });
+    } catch (exc) {
+      setDiscordTested({ ok: false, error: exc instanceof Error ? exc.message : String(exc), bot: null });
     } finally {
       setBusy(false);
     }
@@ -239,6 +317,26 @@ export function SetupWizard({
           },
           operator: {
             allowed_dirs: allowedDirs,
+          },
+          // Discord is enabled when a token is present (this run or already
+          // stored). bot_token is only sent when entered — blank preserves the
+          // existing secret, same as the model api_key.
+          discord: {
+            enabled: Boolean(state.discordToken.trim()) || state.discordEnabled,
+            ...(state.discordToken.trim() ? { bot_token: state.discordToken.trim() } : {}),
+            admin_ids: state.discordAdminId
+              .split(/[\n,]/)
+              .map((id) => id.trim())
+              .filter(Boolean),
+          },
+          // Google: store the OAuth client; enabling happens, but the managed MCP
+          // server only starts once "Connect Google" (Settings) mints a token.
+          // client_secret only sent when entered (blank preserves the stored one).
+          google: {
+            enabled: Boolean(state.googleClientId.trim()),
+            client_id: state.googleClientId.trim(),
+            ...(state.googleClientSecret.trim() ? { client_secret: state.googleClientSecret.trim() } : {}),
+            tz: state.googleTz.trim(),
           },
         },
         state.soul,
@@ -334,7 +432,26 @@ export function SetupWizard({
                   {busy ? <Loader2 className="spin" size={15} /> : <Search size={15} />}
                   Probe
                 </button>
+                <button
+                  className="secondary-button"
+                  type="button"
+                  onClick={() => void testConnection()}
+                  disabled={busy || !state.apiBase.trim() || !state.modelName.trim()}
+                >
+                  {busy ? <Loader2 className="spin" size={15} /> : <ShieldCheck size={15} />}
+                  Test connection
+                </button>
               </div>
+              {tested ? (
+                <div className={`setup-test ${tested.ok ? "ok" : "err"}`} role="status">
+                  {tested.ok ? <Check size={15} /> : <AlertTriangle size={15} />}
+                  <span>
+                    {tested.ok
+                      ? "Connection OK — the model responded."
+                      : `Connection failed — ${tested.error || "the model did not respond."}`}
+                  </span>
+                </div>
+              ) : null}
               <div className="setup-grid three">
                 <label className="field">
                   <span>Temperature</span>
@@ -430,6 +547,99 @@ export function SetupWizard({
               <label className="checkbox-field setup-checkbox">
                 <input type="checkbox" checked={state.initBeads} onChange={(event) => update({ initBeads: event.target.checked })} />
                 <span>Initialize beads</span>
+              </label>
+            </StepBody>
+          ) : null}
+
+          {step === "discord" ? (
+            <StepBody icon={<MessageCircle size={20} />} title="Discord" kicker="Optional">
+              <p className="field-hint" style={{ marginTop: 0 }}>
+                Connect a Discord bot so you can DM {state.agentName || "your agent"} from
+                Discord. Optional — skip it and set it up later in System → Settings.{" "}
+                <a href={DISCORD_GUIDE_URL} target="_blank" rel="noreferrer" className="setup-link">
+                  How to create a bot <ExternalLink size={12} />
+                </a>
+              </p>
+              <label className="field">
+                <span>Bot token</span>
+                <input
+                  type="password"
+                  value={state.discordToken}
+                  onChange={(event) => update({ discordToken: event.target.value })}
+                  autoComplete="off"
+                  placeholder="Leave blank to skip Discord"
+                />
+              </label>
+              <div className="setup-grid model-row">
+                <label className="field">
+                  <span>Your Discord user ID(s)</span>
+                  <input
+                    value={state.discordAdminId}
+                    onChange={(event) => update({ discordAdminId: event.target.value })}
+                    placeholder="e.g. 249386616806834177 — comma-separated; empty = anyone"
+                  />
+                </label>
+                <button
+                  className="secondary-button"
+                  type="button"
+                  onClick={() => void testDiscord()}
+                  disabled={busy || !state.discordToken.trim()}
+                >
+                  {busy ? <Loader2 className="spin" size={15} /> : <ShieldCheck size={15} />}
+                  Test connection
+                </button>
+              </div>
+              {discordTested ? (
+                <div className={`setup-test ${discordTested.ok ? "ok" : "err"}`} role="status">
+                  {discordTested.ok ? <Check size={15} /> : <AlertTriangle size={15} />}
+                  <span>
+                    {discordTested.ok
+                      ? `Connected as ${discordTested.bot || "your bot"}.`
+                      : `Connection failed — ${discordTested.error || "check the token."}`}
+                  </span>
+                </div>
+              ) : null}
+            </StepBody>
+          ) : null}
+
+          {step === "google" ? (
+            <StepBody icon={<CalendarDays size={20} />} title="Google" kicker="Optional">
+              <p className="field-hint" style={{ marginTop: 0 }}>
+                Give {state.agentName || "your agent"} read access to Gmail + Calendar. Paste your
+                Google Cloud <strong>Desktop app</strong> OAuth client below — after setup, click
+                <strong> Connect Google</strong> in System → Settings to authorize (it opens your
+                browser). Optional — skip to do it later.{" "}
+                <a href={GOOGLE_GUIDE_URL} target="_blank" rel="noreferrer" className="setup-link">
+                  Get an OAuth client <ExternalLink size={12} />
+                </a>
+              </p>
+              <div className="setup-grid two">
+                <label className="field">
+                  <span>OAuth client ID</span>
+                  <input
+                    value={state.googleClientId}
+                    onChange={(event) => update({ googleClientId: event.target.value })}
+                    placeholder="…apps.googleusercontent.com"
+                  />
+                </label>
+                <label className="field">
+                  <span>OAuth client secret</span>
+                  <input
+                    type="password"
+                    value={state.googleClientSecret}
+                    onChange={(event) => update({ googleClientSecret: event.target.value })}
+                    autoComplete="off"
+                    placeholder="Leave blank to skip Google"
+                  />
+                </label>
+              </div>
+              <label className="field">
+                <span>Timezone (IANA, optional)</span>
+                <input
+                  value={state.googleTz}
+                  onChange={(event) => update({ googleTz: event.target.value })}
+                  placeholder="e.g. America/Los_Angeles — sets the day bounds for “today”"
+                />
               </label>
             </StepBody>
           ) : null}

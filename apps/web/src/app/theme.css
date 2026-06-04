@@ -225,6 +225,79 @@ h2 {
   100% { opacity: 1; transform: none; }
 }
 
+/* Cold-start boot gate (sits below the 2.5s brand splash at z-90, above the
+   app). Holds "Starting <agent>…" over the app while the frozen desktop sidecar
+   warms up, instead of flashing "Load failed". */
+.boot-gate {
+  position: fixed;
+  inset: 0;
+  z-index: 80;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--bg);
+  padding: 24px;
+}
+
+.boot-gate-inner {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 16px;
+  max-width: 360px;
+  text-align: center;
+}
+
+.boot-gate-mark {
+  width: 56px;
+  height: 56px;
+  opacity: 0.9;
+  filter: drop-shadow(0 0 10px rgba(167, 139, 250, 0.25));
+}
+
+.boot-gate-spinner {
+  width: 26px;
+  height: 26px;
+  border-radius: 50%;
+  border: 2.5px solid var(--border, rgba(255, 255, 255, 0.12));
+  border-top-color: #818cf8;
+  animation: boot-spin 0.8s linear infinite;
+}
+
+@keyframes boot-spin {
+  to { transform: rotate(360deg); }
+}
+
+.boot-gate-title {
+  font-size: 1.05rem;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  color: var(--text, #e8e8ec);
+}
+
+.boot-gate-detail {
+  margin: 0;
+  font-size: 0.85rem;
+  line-height: 1.45;
+  color: var(--text-muted, #9a9aa6);
+}
+
+.boot-gate-retry {
+  margin-top: 4px;
+  padding: 7px 18px;
+  border-radius: 8px;
+  border: 1px solid var(--border, rgba(255, 255, 255, 0.14));
+  background: linear-gradient(135deg, #9b87f2 0%, #6366f1 100%);
+  color: #fff;
+  font-size: 0.85rem;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.boot-gate-retry:hover {
+  filter: brightness(1.06);
+}
+
 /* The splash → app hand-off cross-fade (default root view transition); a touch
    longer than the default for a cleaner settle. */
 ::view-transition-old(root),
@@ -2467,6 +2540,34 @@ textarea {
   color: #a9e8c9;
 }
 
+/* "Test connection" result line in the model step. */
+.setup-test {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 10px 18px 0;
+  padding: 8px 10px;
+  border-radius: var(--radius);
+  font-size: 0.85rem;
+  line-height: 1.4;
+}
+
+.setup-test.ok {
+  border: 1px solid rgba(65, 196, 141, 0.28);
+  background: rgba(65, 196, 141, 0.12);
+  color: #a9e8c9;
+}
+
+.setup-test.err {
+  border: 1px solid rgba(240, 116, 88, 0.3);
+  background: rgba(240, 116, 88, 0.12);
+  color: #f4b09f;
+}
+
+.setup-test svg {
+  flex-shrink: 0;
+}
+
 .setup-actions {
   display: flex;
   justify-content: space-between;
@@ -2645,6 +2746,30 @@ textarea {
 }
 .settings-group {
   margin-bottom: 40px;
+}
+/* Per-group action row (e.g. the Discord "Test connection" + help link). */
+.settings-group-actions {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  margin-top: 10px;
+}
+.settings-inline-status {
+  font-size: 0.8rem;
+  color: var(--fg-muted);
+}
+.settings-help-link,
+.setup-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 0.8rem;
+  color: #818cf8;
+  text-decoration: none;
+}
+.settings-help-link:hover,
+.setup-link:hover {
+  text-decoration: underline;
 }
 .settings-group-title {
   margin: 0 0 4px;
