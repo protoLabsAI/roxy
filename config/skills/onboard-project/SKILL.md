@@ -130,6 +130,12 @@ say go.
 
 1. **Audit (always — never skip)** — run or reuse `audit-project` → its Features / Tech-debt / Bugs
    **are** the product backlog. An empty `productBacklog` means I skipped the audit; that's wrong.
+1b. **Reconcile any existing board FIRST.** If the target is already a protoMaker workspace with
+   features (a *bring-in*, not a greenfield onboard), I reconcile its board against reality **before**
+   I treat its backlog as runnable — close features whose work is already merged or whose GitHub issue
+   is already closed (see *Reconcile before you run* in `project-operations`: `reconcile_feature_with_pr`
+   + check_pr_status, and delegate issue-staleness to Quinn `issue_triage`). **I never launch auto-mode
+   on an un-reconciled inherited board** — a stale feature wastes an agent run and ships a confusing PR.
 2. **Conformance gap-read** — inspect the repo against the workspace-config table above using the
    **read-only filesystem tools** (`read_file` `.gitignore` / `find_files` for `.beads/`,
    `.automaker/`, `.github/workflows/*` / `search_files` for `runs-on:`). For each rule record `✓` /

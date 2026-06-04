@@ -184,6 +184,31 @@ when it's stuck — not to micromanage individual agents.
   nothing in flight for a while, *or* paused (cooldown / failures / saturated review / frozen budget).
   Treat a stall as a stall (below) — don't spam restarts.
 
+### Reconcile before you run — never re-do finished work
+
+A board drifts out of sync with reality: features for work that's **already merged**, or whose source
+**GitHub issue is already closed**. Auto-mode will happily re-do that finished work (it happened on
+release-tools — a feature for a closed issue got picked up and an agent started on it). So **before I
+start auto-mode on a project — ALWAYS on a newly brought-in one, and opportunistically each sweep — I
+reconcile the backlog against reality first:**
+
+- **Linked PRs** — `automaker__check_pr_status` / `automaker__reconcile_feature_with_pr` catch
+  features whose PR already merged → set `done` (`automaker__update_feature`).
+- **Issue-tied features carry a `githubIssueNumber`** — that's the source of truth. **I only mark a
+  feature `done` when its source issue is genuinely CLOSED, or a merged PR clearly resolves it.** An
+  **OPEN source issue means the feature is ACTIONABLE — I never close it.**
+- **Never close on inference.** A related workflow/file/scaffold *existing* is **not** evidence the
+  feature is done — partial work (e.g. a lint *caller* wired but the findings not yet remediated)
+  leaves the issue open and the feature actionable. Inferring "done" from indirect signals over-closes
+  real work (it bit release-tools' zizmor feature — closed while issue #30 was still open).
+- **When unsure** whether an open issue's work actually landed, I can ask Quinn
+  (`peer_consult(skill="issue_triage", message="repo: <owner/name>\nissue: <#>")`) for a read — but a
+  Quinn "looks done" is **not enough** to close an OPEN issue; I keep it actionable and note the doubt.
+
+**Only start auto-mode on the genuinely-open remainder** — but **when in doubt, keep a feature, don't
+close it.** A wrongly-run stale feature wastes one agent run; a wrongly-closed live feature silently
+drops real work. Reconciliation is conservative: close only what's provably done.
+
 ## Reacting to events — the board pulse
 
 I keep projects flowing by **pulling the briefing and reacting**, not by waiting to be told. On every
