@@ -1,5 +1,31 @@
 ## [Unreleased]
 
+## [0.13.0] - 2026-06-04
+
+### Added
+- **Audit + onboard project skills — Roxy as a technical-leaning PM.** A read-only
+  `audit_project` skill inspects a directory or GitHub repo and returns a prioritized,
+  evidence-cited backlog proposal (features / tech-debt / bugs), stopping before
+  onboarding. An `onboard_project` skill trues a project up to the fleet standards: a
+  workspace-config conformance gap-read, a two-epic board (fleet-conformance true-up +
+  the audit's product backlog), and fleet registration. Both are A2A skills;
+  `onboard_project` is schema-enforced and emits a validated `onboarding-plan-v1`
+  DataPart. A new **`fleet-onboarding` plugin** (ADR 0001) adds two non-shell tools —
+  `repo_github_remote` (reads `.git/config`) + `fleet_register` (`POST /api/onboard`) —
+  so onboarding runs fully unsupervised without tripping the `run_command` HITL gate.
+  Branch protection stays an operator step.
+
+### Fixed
+- **CI publishes to the fork's own GHCR package.** `docker-publish` and `release` pushed
+  to the upstream `protolabsai/protoagent` package, which the fork token can't write
+  (`denied: write_package`); now `protolabsai/roxy`.
+- **Release pipeline enabled on the fork.** `prepare-release` + `release` were guarded
+  `if: github.repository == 'protoLabsAI/protoAgent'` (dormant on the fork) and
+  `release.yml` carried the same upstream image-name bug; fixed so tagged releases build
+  the semver image, cut a GitHub Release, and post Claude-rewritten notes to Discord.
+- **Stale A2A confidence test** repaired (the A2A-1.0 always-emit-`confidence-v1`
+  behavior is intentional; the test asserted the old shape).
+
 ## [0.12.0] - 2026-06-04
 
 ### Added
