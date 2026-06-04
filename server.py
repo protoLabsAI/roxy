@@ -98,12 +98,16 @@ _cache_warmer = None   # Optional CacheWarmer (off by default). Same start/stop
                        # lifecycle as _scheduler; keeps the prompt cache warm.
 _goal_controller = None  # Optional GoalController (goal mode). Parses /goal
                          # control messages and runs the goal-completion loop.
+_discord_task = None     # The inbound Discord gateway task (ADR 0015/0016).
+                         # Held so a config change (Settings/wizard) can stop +
+                         # restart it live, not just at process boot.
 _main_loop = None        # The server's event loop, captured at startup (#497).
                          # A config reload's heavy graph compile is offloaded to a
                          # worker thread so it no longer freezes the loop; the
-                         # scheduler restart that follows still runs ON the loop,
-                         # scheduled here via run_coroutine_threadsafe from the
-                         # worker thread (not get_running_loop, which would no-op).
+                         # scheduler/Discord restart that follows still has to run
+                         # ON the loop, so the worker thread schedules it here via
+                         # run_coroutine_threadsafe instead of get_running_loop()
+                         # (which would silently no-op in the thread — the trap).
 
 _event_bus = EventBus()  # Server→client SSE push channel (ADR 0003). Process-
                          # lifetime singleton; producers publish, /api/events
@@ -271,7 +275,8 @@ def _init_langgraph_agent(headless_setup: bool = False):
     global _inbox_store, _storm_guard, _beads_store
     _inbox_store = _build_inbox_store(_graph_config)
     from beads import BeadsStore
-    _beads_store = BeadsStore()  # in-process issue tracker (Sprint B), instance-scoped
+    if _beads_store is None:  # may have been created early (pre-setup) for the routes
+        _beads_store = BeadsStore()  # in-process issue tracker (Sprint B), instance-scoped
     if _storm_guard is None:
         from inbox import StormGuard
         _storm_guard = StormGuard()
@@ -644,8 +649,8 @@ def _run_on_server_loop(make_coro, what: str) -> None:
     Works whether we're called **on** the loop (a direct, on-loop reload) or
     **from a worker thread** (the reload offloaded off the loop, #497). In the
     thread case ``get_running_loop()`` raises, and the old code logged + dropped
-    the coroutine — silently killing the scheduler on every offloaded reload (the
-    trap). We instead schedule it on the captured ``_main_loop`` via
+    the coroutine — silently killing the scheduler/briefing on every offloaded
+    reload (the trap). We instead schedule it on the captured ``_main_loop`` via
     ``run_coroutine_threadsafe``. ``make_coro`` is a zero-arg factory so the
     coroutine is only created once we have a loop to run it on (no
     "coroutine was never awaited" leak when none is available).
@@ -869,6 +874,9 @@ def _reload_langgraph_agent() -> tuple[bool, str]:
         new_workflow_registry = None
         new_inbox_store = None
 
+    # Capture the outgoing config before the swap so we can tell whether the
+    # Discord surface needs a live reconnect (token/admin/enabled changed).
+    old_config = _graph_config
     # Commit: config → A2A bearer → graph. All three reference the
     # same ``new_config`` so they stay consistent.
     _graph_config = new_config
@@ -905,12 +913,92 @@ def _reload_langgraph_agent() -> tuple[bool, str]:
     if pending_start is not None:
         _start_scheduler_async(pending_start)
 
+    # Discord surface: reconnect live if its config changed (token / admin_ids /
+    # enabled), so a Settings save or wizard finish applies without a restart.
+    discord_changed = (
+        old_config is None
+        or old_config.discord_enabled != new_config.discord_enabled
+        or old_config.discord_bot_token != new_config.discord_bot_token
+        or list(old_config.discord_admin_ids) != list(new_config.discord_admin_ids)
+    )
+    if discord_changed:
+        _restart_discord_async()
+
     if new_graph is None:
         log.info("[reload] setup not complete — config reloaded, graph not compiled")
         return True, "config reloaded • setup not complete"
 
     log.info("LangGraph agent reloaded (model: %s)", _graph_config.model_name)
     return True, f"reloaded • model={_graph_config.model_name}"
+
+
+def _start_discord_surface() -> None:
+    """(Re)start the inbound Discord gateway from the live config (ADR 0016).
+
+    Start rule: the UI path starts only when ``discord.enabled`` is on AND a
+    token is configured; the env path (Docker ``DISCORD_BOT_TOKEN``, no UI token)
+    starts as before for back-compat. Injects token + admin_ids via
+    ``configure`` so the bundled desktop app uses its per-user secret, not an
+    ambient env var. Stores the task in ``_discord_task`` for live restart.
+    """
+    global _discord_task
+    import os as _os
+
+    from surfaces.discord import configure as _configure
+    from surfaces.discord import start_in_background as _start_discord
+
+    cfg_token = (_graph_config.discord_bot_token or "").strip() if _graph_config else ""
+    env_token = (_os.environ.get("DISCORD_BOT_TOKEN") or "").strip()
+    admin_ids = list(_graph_config.discord_admin_ids) if _graph_config else []
+    enabled = bool(_graph_config.discord_enabled) if _graph_config else False
+
+    _configure(cfg_token, admin_ids)
+
+    # UI token requires the enabled toggle; a bare env token (no UI token) starts
+    # for back-compat (Docker deploys that only set DISCORD_BOT_TOKEN).
+    should_start = (bool(cfg_token) and enabled) or (not cfg_token and bool(env_token))
+    if not should_start:
+        log.info("[discord] gateway not started (enabled=%s, token=%s)",
+                 enabled, "set" if (cfg_token or env_token) else "unset")
+        return
+
+    async def _discord_invoke(prompt: str, session_id: str) -> str:
+        result = await chat(prompt, session_id)
+        return "\n\n".join(
+            m["content"] for m in result
+            if m.get("role") == "assistant" and m.get("content")
+        )
+
+    # subscribe enables return-address delivery: reactive Activity-thread output
+    # (scheduler/inbox/proactive) is forwarded to the operator's captured DM.
+    _discord_task = _start_discord(
+        _discord_invoke, publish=_event_bus.publish, subscribe=_event_bus.subscribe
+    )
+
+
+def _restart_discord_async() -> None:
+    """Fire-and-forget: stop the running gateway, then start from new config.
+
+    Scheduled on the server loop via :func:`_run_on_server_loop`, so it works
+    from an offloaded (worker-thread) reload too — not just an on-loop one.
+    """
+    async def _swap() -> None:
+        global _discord_task
+        try:
+            from surfaces.discord import stop as _discord_stop
+
+            if _discord_task is not None:
+                _discord_task.cancel()
+                _discord_task = None
+            await _discord_stop()
+        except Exception:
+            log.exception("[discord] stop during restart failed")
+        try:
+            _start_discord_surface()
+        except Exception:
+            log.exception("[discord] restart failed")
+
+    _run_on_server_loop(_swap, "discord restart")
 
 
 def _sync_autostart_with_config(config: dict | None) -> str | None:
@@ -1064,10 +1152,27 @@ def _build_settings_callbacks() -> dict[str, Any]:
             split_secret_updates,
             strip_secrets_from_doc,
             validate_config_dict,
+            validate_model_connection,
             write_soul,
         )
 
         messages: list[str] = []
+
+        # 0. Verify the model can actually complete BEFORE we touch anything —
+        # otherwise the graph compiles fine but every chat 401s, with no UI
+        # signal (the bug that motivated this gate). A real 1-token completion
+        # exercises the same auth path as chat, so a bad key / wrong model /
+        # unreachable gateway is caught here and returned to the wizard verbatim
+        # (e.g. "expected to start with 'sk-'"). Setup stays incomplete, so the
+        # operator fixes it in the UI and retries — no file editing required.
+        if config is not None and isinstance(config.get("model"), dict):
+            m = config["model"]
+            test_base = m.get("api_base") or (_graph_config.api_base if _graph_config else "")
+            test_key = m.get("api_key") or (_graph_config.api_key if _graph_config else "")
+            test_model = m.get("name") or (_graph_config.model_name if _graph_config else "")
+            ok, verr = validate_model_connection(test_base, test_key, test_model)
+            if not ok:
+                return False, f"model connection failed — {verr}"
 
         # 1. Persist (secrets to the untracked overlay, never the tracked YAML)
         if config is not None:
@@ -2028,6 +2133,16 @@ def _a2a_terminal(outcome) -> None:
 def _main():
     global _active_port
 
+    # Frozen-binary entrypoint for the managed Google MCP server (ADR 0017): the
+    # bundled desktop app has no `python` on PATH, so the google MCP entry
+    # re-invokes this binary with --mcp-google instead of `-m
+    # mcp_servers.google.server`. Handle it before argparse/server startup.
+    if "--mcp-google" in sys.argv:
+        from mcp_servers.google.server import main as _google_mcp_main
+
+        _google_mcp_main()
+        return
+
     parser = argparse.ArgumentParser(description=f"{AGENT_NAME_ENV} — protoAgent server")
     parser.add_argument("--port", type=int, default=7870)
     parser.add_argument("--config", type=str, default=None)
@@ -2422,6 +2537,17 @@ def _main():
                 })
         return {"commands": commands}
 
+    # The in-process beads store is agent-global + graph-independent, but it's
+    # otherwise created in _init_langgraph_agent (which only runs once setup is
+    # complete). For a fresh, unconfigured agent (first launch, before the wizard)
+    # ensure it exists now — otherwise the beads routes bind the CLI fallback
+    # service that raises "project_path is required" (the agent-global adapter
+    # ignores project_path). Reused by _init_langgraph_agent later.
+    global _beads_store
+    if _beads_store is None:
+        from beads import BeadsStore
+        _beads_store = BeadsStore()
+
     register_operator_routes(
         fastapi_app,
         runtime_status=_operator_runtime_status,
@@ -2458,7 +2584,8 @@ def _main():
     @fastapi_app.on_event("startup")
     async def _scheduler_startup() -> None:
         # Capture the server's event loop so an offloaded reload (#497) can
-        # schedule the scheduler restart back onto it from a worker thread.
+        # schedule the scheduler/Discord restart back onto it from a worker
+        # thread (see _run_on_server_loop).
         global _main_loop
         import asyncio
 
@@ -2483,6 +2610,16 @@ def _main():
             import asyncio
             _checkpoint_prune_task = asyncio.create_task(_checkpoint_prune_loop())
 
+        # Inbound Discord gateway (ADR 0015/0016) — started from the live config
+        # (UI token in secrets, or the DISCORD_BOT_TOKEN env fallback). A Discord
+        # DM is conversational, so it invokes the agent as a chat surface with a
+        # per-conversation session_id (the LangGraph thread key), NOT the single
+        # system:activity inbox thread.
+        try:
+            _start_discord_surface()
+        except Exception:
+            log.exception("[discord] gateway startup failed")
+
     @fastapi_app.on_event("shutdown")
     async def _scheduler_shutdown() -> None:
         if _scheduler is not None:
@@ -2495,6 +2632,11 @@ def _main():
                 await _cache_warmer.stop()
             except Exception:
                 log.exception("[cache-warmer] shutdown failed")
+        try:
+            from surfaces.discord import stop as _stop_discord
+            await _stop_discord()
+        except Exception:
+            log.exception("[discord] shutdown failed")
         if _checkpoint_prune_task is not None:
             _checkpoint_prune_task.cancel()
 
@@ -2671,6 +2813,9 @@ def _main():
     class ModelsProbeRequest(PydanticBaseModel):
         api_base: str = ""
         api_key: str = ""
+        # Only used by the connection test (a real completion needs a model);
+        # the model-list probe ignores it. Blank falls back to the saved config.
+        model: str = ""
 
     @fastapi_app.post("/api/config/models")
     async def _api_list_models(req: ModelsProbeRequest | None = None):
@@ -2689,6 +2834,100 @@ def _main():
         key = body.api_key or (_graph_config.api_key if _graph_config else "")
         models, error = list_gateway_models(base, key)
         return {"models": models, "error": error}
+
+    @fastapi_app.post("/api/config/test-model")
+    async def _api_test_model(req: ModelsProbeRequest | None = None):
+        """Verify the model can actually complete (the true auth check).
+
+        Powers the wizard's + Settings' "Test connection" button. POST (body)
+        so the key never lands in a URL/log. A blank field falls back to the
+        saved config, so Settings can re-test the live agent with one click.
+        Offloaded to a thread — a real completion is a blocking network call,
+        and we never want the connection test to freeze the event loop.
+        """
+        from graph.config_io import validate_model_connection
+
+        body = req or ModelsProbeRequest()
+        base = body.api_base or (_graph_config.api_base if _graph_config else "")
+        key = body.api_key or (_graph_config.api_key if _graph_config else "")
+        model = body.model or (_graph_config.model_name if _graph_config else "")
+        ok, error = await asyncio.to_thread(validate_model_connection, base, key, model)
+        return {"ok": ok, "error": error}
+
+    class DiscordProbeRequest(PydanticBaseModel):
+        bot_token: str = ""
+
+    @fastapi_app.post("/api/config/test-discord")
+    async def _api_test_discord(req: DiscordProbeRequest | None = None):
+        """Verify a Discord bot token by fetching its identity (Test connection).
+
+        POST (body) so the token never lands in a URL/log. Blank falls back to
+        the saved token, so Settings can re-test the live config. Returns the bot
+        username so the UI can show "Connected as <bot>".
+        """
+        from surfaces.discord import validate_token
+
+        body = req or DiscordProbeRequest()
+        token = body.bot_token or (_graph_config.discord_bot_token if _graph_config else "")
+        ok, bot_user, error = await validate_token(token or "")
+        return {
+            "ok": ok,
+            "error": error,
+            "bot_user": (bot_user or {}).get("username") if ok else None,
+        }
+
+    def _google_env_from_config() -> None:
+        """Mirror the configured Google OAuth client + token path into the env so
+        ``mcp_servers.google.auth`` (which reads env) can run the consent/status
+        in-process for the connect + status endpoints."""
+        from graph.config_io import _live_config_dir
+
+        cid = (_graph_config.google_client_id if _graph_config else "") or ""
+        sec = (_graph_config.google_client_secret if _graph_config else "") or ""
+        if cid:
+            os.environ["GOOGLE_CLIENT_ID"] = cid
+        if sec:
+            os.environ["GOOGLE_CLIENT_SECRET"] = sec
+        os.environ["GOOGLE_TOKEN_PATH"] = str(_live_config_dir() / "google-token.json")
+
+    @fastapi_app.get("/api/config/google/status")
+    async def _api_google_status():
+        """Report (configured, connected, email) for the Google surface."""
+        try:
+            from mcp_servers.google.auth import connection_status
+        except Exception as e:  # noqa: BLE001 — google extra may be absent
+            return {"configured": False, "connected": False, "email": None,
+                    "error": f"google support unavailable: {e}"}
+        _google_env_from_config()
+        try:
+            return await asyncio.to_thread(connection_status)
+        except Exception as e:  # noqa: BLE001
+            return {"configured": False, "connected": False, "email": None, "error": str(e)}
+
+    @fastapi_app.post("/api/config/google/connect")
+    async def _api_google_connect():
+        """Run the OAuth consent (opens the operator's browser), cache the token,
+        enable the Google surface, and reload so the tools register. Long-lived:
+        it blocks until the operator approves in the browser (3-min cap)."""
+        try:
+            from mcp_servers.google.auth import run_consent
+        except Exception as e:  # noqa: BLE001
+            return {"ok": False, "error": f"google support unavailable: {e}"}
+        if not (_graph_config and _graph_config.google_client_id and _graph_config.google_client_secret):
+            return {"ok": False, "error": "Set the OAuth client ID + secret first, then connect."}
+        _google_env_from_config()
+        try:
+            email = await asyncio.wait_for(asyncio.to_thread(run_consent), timeout=180)
+        except asyncio.TimeoutError:
+            return {"ok": False, "error": "Timed out waiting for Google consent (3 min). Try again."}
+        except Exception as e:  # noqa: BLE001
+            return {"ok": False, "error": str(e)}
+        # Persist enabled + reload so the managed google MCP server starts and the
+        # tools register without a restart.
+        ok, msg = await asyncio.to_thread(
+            _apply_settings_changes, config={"google": {"enabled": True}}
+        )
+        return {"ok": True, "email": email, "reload": msg if ok else None}
 
     # --- Setup wizard state -------------------------------------------------
     @fastapi_app.get("/api/config/setup-status")

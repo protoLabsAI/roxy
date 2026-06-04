@@ -14,6 +14,10 @@ export default defineConfig({
   // VitePress treats dead links as fatal, so skip just the localhost ones.
   ignoreDeadLinks: "localhostLinks",
 
+  // docs/dev/ is the team's internal engineering area (handoffs + notes) — it
+  // lives in the repo (committed, shared) but is NOT part of the published site.
+  srcExclude: ["dev/**"],
+
   head: [["link", { rel: "icon", href: "/protoAgent/favicon.svg" }]],
 
   themeConfig: {
@@ -53,6 +57,8 @@ export default defineConfig({
             { text: "Plugins", link: "/guides/plugins" },
             { text: "Goal mode", link: "/guides/goal-mode" },
             { text: "Scheduler", link: "/guides/scheduler" },
+            { text: "Discord surface", link: "/guides/discord" },
+            { text: "Google (Gmail + Calendar)", link: "/guides/google" },
             { text: "Operator console (React/Tauri)", link: "/guides/react-tauri-ui" },
             { text: "Wire Langfuse + Prometheus", link: "/guides/observability" },
             { text: "Run multiple instances", link: "/guides/multi-instance" },
