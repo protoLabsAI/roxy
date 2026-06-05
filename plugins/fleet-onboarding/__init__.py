@@ -384,6 +384,80 @@ async def fleet_reconcile() -> str:
     return json.dumps({"fleet": fleet, "drift": drift, "projects": rows})
 
 
+@tool
+async def fleet_readiness() -> str:
+    """Auto-mode pre-flight for every project — is it SAFE to start? Deterministic, parallel.
+
+    Encodes the preconditions the delivery saga taught us, so I never start a
+    project that will local-merge, block on worktree creation, or churn. Per
+    project (concurrently) it checks: **isolation** on (`useWorktrees`), a **clean
+    base** (no dirty/untracked tree — protoMaker's worktree guard refuses a dirty
+    one), **ready backlog** to actually run, and **not blocked-heavy**. Branch
+    protection / required-checks is enforced by protoMaker at start (there's no
+    pre-check endpoint) and is flagged as such rather than asserted.
+
+    Returns JSON: {"ready": ["owner/name", ...], "not_ready": [{repo, blockers}],
+    "compliance_note": "...", "projects": [{repo, ready, worktrees, clean, backlog,
+    blocked, blocked_pct, dirty_files, blockers}]}.
+    """
+    base, key = _api_base_key()
+    if not base or not key:
+        return json.dumps({"error": "PROTOMAKER_API_BASE/AUTOMAKER_API_URL or AUTOMAKER_API_KEY not set"})
+    import asyncio
+
+    import httpx
+
+    headers = {"X-API-Key": key, "Content-Type": "application/json"}
+
+    async def _ready(client, proj, worktrees_global):
+        g = proj.get("github") or {}
+        repo = f"{g.get('owner')}/{g.get('repo')}" if g.get("owner") and g.get("repo") else None
+        path = proj.get("path")
+        row = {"repo": repo, "blockers": []}
+        try:
+            sj = (await client.post(f"{base}/api/sitrep", headers=headers, json={"projectPath": path})).json()
+            s = sj.get("board") or sj.get("sitrep") or sj
+            gj = (await client.post(f"{base}/api/git/enhanced-status", headers=headers, json={"projectPath": path})).json()
+            files = gj.get("files") or []
+        except Exception as e:  # noqa: BLE001
+            row.update({"error": str(e)[:80], "ready": False})
+            return row
+        total = s.get("total") or 0
+        backlog = s.get("backlog") or 0
+        blocked = s.get("blocked") or 0
+        pct = round(100 * blocked / total) if total else 0
+        clean = len(files) == 0
+        row.update({"worktrees": worktrees_global, "clean": clean, "backlog": backlog,
+                    "blocked": blocked, "blocked_pct": pct, "dirty_files": len(files)})
+        if not worktrees_global:
+            row["blockers"].append("useWorktrees OFF — agents would commit in-place, no PR")
+        if not clean:
+            row["blockers"].append(f"dirty base ({len(files)} changed/untracked) — worktree creation will fail")
+        if backlog == 0:
+            row["blockers"].append("no ready backlog")
+        if pct >= 25:
+            row["blockers"].append(f"blocked-heavy ({pct}%)")
+        row["ready"] = not row["blockers"]
+        return row
+
+    try:
+        async with httpx.AsyncClient(timeout=45) as client:
+            g = (await client.get(f"{base}/api/settings/global", headers=headers)).json()
+            settings = g.get("settings", g)
+            worktrees_global = bool(settings.get("useWorktrees"))
+            projs = settings.get("projects") or []
+            rows = await asyncio.gather(*[_ready(client, p, worktrees_global) for p in projs])
+    except Exception as e:  # noqa: BLE001
+        return json.dumps({"error": f"fleet readiness failed: {e}"})
+
+    return json.dumps({
+        "ready": [r["repo"] for r in rows if r.get("ready")],
+        "not_ready": [{"repo": r["repo"], "blockers": r["blockers"]} for r in rows if not r.get("ready")],
+        "compliance_note": "branch-protection / required-checks is enforced by protoMaker at auto-mode start (no pre-check endpoint)",
+        "projects": rows,
+    })
+
+
 def register(registry) -> None:
     """Entry point — register the fleet power tools."""
     registry.register_tool(repo_github_remote)
@@ -392,3 +466,4 @@ def register(registry) -> None:
     registry.register_tool(fleet_sitrep)
     registry.register_tool(repo_origin_state)
     registry.register_tool(fleet_reconcile)
+    registry.register_tool(fleet_readiness)

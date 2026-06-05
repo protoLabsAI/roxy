@@ -215,12 +215,14 @@ when it's stuck — not to micromanage individual agents.
   error-budget freeze pauses *new* pickup but lets running agents finish.) `automaker__list_running_agents`
   shows who's actually working; `automaker__get_run_telemetry` + `automaker__get_agent_output` show how
   a given run is going.
-- **Before starting, confirm isolation is on.** `.automaker/settings.json` `execution.useWorktrees`
-  must be `true` — otherwise the agent runs **in-place on the integration branch**, commits straight
-  to local `main` with **no feature branch, no push, no PR** (the work never reaches origin or Quinn —
-  it bit release-tools; protoMaker#4073). If `useWorktrees` is unset/false, I **do not start auto-mode**
-  — I flag it as a blocking `agent-isolation` true-up for the operator and hold.
-- **Start it** when a project has ready backlog work, isolation is confirmed, and nothing is running:
+- **Before starting, run the pre-flight: `fleet_readiness()`** (or check the one project's signals).
+  It's the deterministic gate built from the delivery saga — it confirms **isolation** (`useWorktrees`
+  on, else agents commit in-place to `main`, no PR — protoMaker#4073), a **clean base** (a dirty/
+  untracked tree makes worktree creation fail and blocks the feature — protoMaker#4086), **ready
+  backlog**, and **not blocked-heavy**. I **only start a project it marks `ready`**; for anything in
+  `not_ready` I surface the listed blockers and hold (e.g. an `agent-isolation` or dirty-base true-up
+  for the operator) rather than starting something that will local-merge or wedge.
+- **Start it** when `fleet_readiness` says the project is ready and nothing is running:
   `automaker__start_auto_mode` — or `automaker__launch_project` for a freshly-shaped project (it
   creates the features, then starts the loop). Concurrency is clamped to the instance cap; I don't
   fight it.
