@@ -192,6 +192,12 @@ class ProtoAgentExecutor(AgentExecutor):
         await updater.start_work()
 
         text = context.get_user_input()
+        # Domain separation (roxy Phase 1): if the caller pinned this turn to a
+        # project, prepend a prominent scope banner so every tool binds to that
+        # project's path and a multi-project board can't bleed across turns.
+        scope = _extract_project_scope(context)
+        if scope:
+            text = _project_scope_banner(scope) + "\n\n" + (text or "")
         caller_trace = _extract_caller_trace(context)
 
         started = time.monotonic()
@@ -366,6 +372,44 @@ def _extract_skill_hint(context: RequestContext) -> str:
     '' when absent."""
     hint = _request_metadata(context).get("skillHint")
     return hint if isinstance(hint, str) else ""
+
+
+def _extract_project_scope(context: RequestContext) -> dict:
+    """The per-request **project scope** (domain separation, roxy Phase 1).
+
+    Callers (Ava/ceremonies) pin a turn to ONE project by setting, in request
+    metadata, ``projectPath`` (preferred — the absolute workspace path) and/or a
+    human label in ``project`` / ``projectSlug`` / ``projectRepo``. With a scope
+    set, the executor fences the turn to that project so a board with N projects
+    can't bleed across (the wrong-project failure the fleet eval surfaced).
+    Returns ``{}`` when no scope was sent (a normal fleet-wide turn)."""
+    md = _request_metadata(context)
+    path = md.get("projectPath") or md.get("project_path")
+    name = (md.get("project") or md.get("projectSlug")
+            or md.get("projectRepo") or md.get("project_slug"))
+    scope: dict = {}
+    if isinstance(path, str) and path.strip():
+        scope["path"] = path.strip()
+    if isinstance(name, str) and name.strip():
+        scope["name"] = name.strip()
+    return scope
+
+
+def _project_scope_banner(scope: dict) -> str:
+    """A prominent active-project directive prepended to the turn input so the
+    scope is structural, not a thing the model has to infer (roxy Phase 1)."""
+    label = scope.get("name") or scope.get("path") or "?"
+    path = scope.get("path")
+    head = f"[project: {label}" + (f" | path: {path}" if path else "") + "]"
+    body = (
+        "ACTIVE PROJECT SCOPE — this turn operates on the project above ONLY. Every "
+        "board / automaker / filesystem tool call MUST target this project"
+        + (f' (projectPath=\"{path}\")' if path else "")
+        + ". Do NOT query, sweep, reconcile, or report on any other project this turn. "
+        "If a path was not given, resolve it once via fleet_registry and use only that. "
+        "Reach for fleet-wide tools only if explicitly asked for the whole fleet."
+    )
+    return f"{head}\n{body}"
 
 
 def _tool_call_part(event_type: str, payload: Any) -> Part | None:
