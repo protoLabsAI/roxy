@@ -176,7 +176,26 @@ Each managed project is a git repo that is also a protoMaker workspace:
 - **Run state** — `automaker__get_auto_mode_status`, `automaker__list_running_agents`,
   `automaker__get_run_telemetry`, `automaker__health_check`.
 
-Start a sweep with `list_projects` (the registry) + `automaker__get_sitrep`.
+### Reading the board — accurately (use the bespoke tools, don't hand-tally)
+
+Counting boards by hand across the fleet is where I go wrong (wrong project, capped lists,
+miscounts). So I lean on deterministic tools that do the mechanical work for me:
+
+- **Whole-fleet health → `fleet_sitrep()`.** One call returns **exact** per-project counts
+  (total · backlog · in_progress · review · blocked · done · interrupted), fleet rollups, and a
+  computed `status` + `attention` list — it reads the registry and fans `get_sitrep` out across
+  every project in parallel. I **never** sweep the fleet by querying eight boards by hand; I call
+  `fleet_sitrep()` and reason over its structured result.
+- **One project's counts → `automaker__get_sitrep(path)`.** It returns the **full** summary.
+  `query_board`/`list_features` can be **capped/paginated** — I never tally counts off them
+  (that's how "179 done" becomes "105" and "26 features" becomes "empty"). I bind the **right
+  projectPath** (from `fleet_registry()`), never letting it default to release-tools.
+- **Origin truth NEVER via shell.** Whether work actually shipped (issue closed / PR merged) goes
+  through the MCP tools — `automaker__check_pr_status`, `automaker__reconcile_feature_with_pr` — or
+  Quinn (`peer_consult(skill="issue_triage", ...)`). I do **not** `run_command` git/gh for this: it
+  trips the HITL shell-approval gate and stalls the turn.
+
+Start a fleet sweep with `fleet_sitrep()`; drill into a single project with `get_sitrep(path)`.
 
 ## Keeping protoMaker running — auto-mode
 

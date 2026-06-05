@@ -173,8 +173,96 @@ async def fleet_registry() -> str:
     return json.dumps({"count": len(projects), "projects": projects, "coords": coords, "source": f"{base}/api/settings/global"})
 
 
+_SITREP_KEYMAP = {"inProgress": "in_progress"}
+_STATUS_KEYS = ("total", "backlog", "in_progress", "review", "blocked", "done", "interrupted")
+
+
+def _classify(entry: dict) -> str:
+    """Deterministic per-project health label (no LLM judgement)."""
+    if entry.get("error"):
+        return "unreachable"
+    total = entry.get("total") or 0
+    if total == 0:
+        return "empty"
+    if (entry.get("blocked") or 0) and entry.get("blocked_pct", 0) >= 25:
+        return "blocked-heavy"
+    if (entry.get("in_progress") or 0) or (entry.get("review") or 0):
+        return "active"
+    if entry.get("backlog") or 0:
+        return "ready"
+    return "done"
+
+
+@tool
+async def fleet_sitrep() -> str:
+    """Exact health of the ENTIRE fleet in one deterministic, parallel call — no hand-tallying.
+
+    Reads the protoMaker registry, then fans `get_sitrep` out across every project
+    CONCURRENTLY (asyncio) and returns the **full** board counts per project — never
+    a capped list, never the wrong project. Each project is classified
+    (`active`/`ready`/`blocked-heavy`/`empty`/`done`/`unreachable`) and flagged for
+    attention in code, so fleet health doesn't depend on the model counting rows.
+
+    Returns JSON: {"count": N, "fleet": {<rolled-up status totals>}, "attention":
+    ["owner/name", ...], "projects": [{"repo","path","total","backlog",
+    "in_progress","review","blocked","done","interrupted","blocked_pct","status"}]}
+    sorted by blocked count desc. Use this for any fleet sweep / "how's everything".
+    """
+    import asyncio
+
+    import httpx
+
+    base = (os.environ.get("PROTOMAKER_API_BASE") or os.environ.get("AUTOMAKER_API_URL") or "").rstrip("/")
+    key = os.environ.get("AUTOMAKER_API_KEY") or ""
+    if not base:
+        return json.dumps({"error": "neither PROTOMAKER_API_BASE nor AUTOMAKER_API_URL is set"})
+    if not key:
+        return json.dumps({"error": "AUTOMAKER_API_KEY not set"})
+    headers = {"X-API-Key": key, "Content-Type": "application/json"}
+
+    async def _one(client: "httpx.AsyncClient", proj: dict) -> dict:
+        g = proj.get("github") or {}
+        repo = f"{g.get('owner')}/{g.get('repo')}" if g.get("owner") and g.get("repo") else None
+        entry = {"repo": repo, "path": proj.get("path")}
+        try:
+            r = await client.post(f"{base}/api/sitrep", headers=headers, json={"projectPath": proj.get("path")})
+            body = r.json()
+            s = body.get("board") or body.get("sitrep") or body
+            for k, v in s.items():
+                if isinstance(v, int):
+                    entry[_SITREP_KEYMAP.get(k, k)] = v
+        except Exception as e:  # noqa: BLE001
+            entry["error"] = str(e)[:80]
+        return entry
+
+    try:
+        async with httpx.AsyncClient(timeout=20) as client:
+            g = await client.get(f"{base}/api/settings/global", headers=headers)
+            settings = g.json().get("settings", g.json())
+            projs = settings.get("projects") or []
+            results = await asyncio.gather(*[_one(client, p) for p in projs])
+    except Exception as e:  # noqa: BLE001
+        return json.dumps({"error": f"fleet sitrep failed: {e}"})
+
+    fleet: dict[str, int] = {}
+    attention: list[str] = []
+    for e in results:
+        total = e.get("total") or 0
+        e["blocked_pct"] = round(100 * (e.get("blocked") or 0) / total) if total else 0
+        e["status"] = _classify(e)
+        if e["status"] in ("blocked-heavy", "unreachable") and e.get("repo"):
+            attention.append(e["repo"])
+        for k in _STATUS_KEYS:
+            if k in e:
+                fleet[k] = fleet.get(k, 0) + e[k]
+
+    results.sort(key=lambda e: -(e.get("blocked") or 0))
+    return json.dumps({"count": len(results), "fleet": fleet, "attention": attention, "projects": results})
+
+
 def register(registry) -> None:
     """Entry point — register the fleet power tools."""
     registry.register_tool(repo_github_remote)
     registry.register_tool(fleet_register)
     registry.register_tool(fleet_registry)
+    registry.register_tool(fleet_sitrep)
