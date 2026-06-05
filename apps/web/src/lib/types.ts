@@ -82,7 +82,7 @@ export type SettingsField = {
   maximum?: number;
 };
 
-export type SettingsGroup = { section: string; fields: SettingsField[] };
+export type SettingsGroup = { section: string; category?: string; fields: SettingsField[] };
 
 export type WorkflowSummary = {
   name: string;
@@ -109,8 +109,21 @@ export type InboxItem = {
 
 export type ActivityMessage = { role: "user" | "assistant"; content: string };
 
+// One provenance feed entry (ADR 0022): an agent-initiated turn + what triggered it.
+export type ActivityEntry = {
+  id: number;
+  created_at: string;
+  origin: string;        // scheduler | inbox | webhook | a2a | operator
+  trigger: string;       // job id / inbox source (human label), may be ""
+  priority: string;      // inbox tier when applicable, else ""
+  state: string;
+  text: string;
+  task_id: string;
+};
+
 export type ActivityHistory = {
   context_id: string;
+  entries: ActivityEntry[];
   messages: ActivityMessage[];
 };
 
@@ -356,5 +369,19 @@ export type Playbook = {
   source: string;        // "disk" (pinned SKILL.md) | "emitted" (agent-learned)
   confidence: number;
   last_used: string | null;
+  created_at: string | null;
+};
+
+// One row from the knowledge store (knowledge/store.py chunks table), as the
+// searchable Knowledge → Store view consumes it (ADR 0020).
+export type KnowledgeChunk = {
+  id: number;
+  heading: string;
+  content: string;
+  preview: string;
+  domain: string;
+  source: string | null;
+  source_type: string | null;
+  finding_type: string | null;
   created_at: string | null;
 };

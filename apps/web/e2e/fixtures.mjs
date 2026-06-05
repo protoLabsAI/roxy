@@ -53,6 +53,10 @@ export const SUBAGENTS = [
 
 export const ACTIVITY_HISTORY = {
   context_id: "system:activity",
+  entries: [
+    { id: 1, created_at: "2026-06-05T09:00:00+00:00", origin: "scheduler", trigger: "daily-brief", priority: "", state: "completed", text: "3 PRs merged overnight, CI green.", task_id: "t1" },
+    { id: 2, created_at: "2026-06-05T09:05:00+00:00", origin: "inbox", trigger: "ci", priority: "now", state: "completed", text: "Build failed on main — investigating.", task_id: "t2" },
+  ],
   messages: [
     { role: "user", content: "morning standup" },
     { role: "assistant", content: "3 PRs merged overnight, CI green." },
@@ -145,6 +149,7 @@ export const NOTES_WORKSPACE = {
 export const SETTINGS_SCHEMA = [
   {
     section: "Model",
+    category: "Agent",
     fields: [
       { key: "model.name", label: "Primary model", type: "select", section: "Model", restart: false, description: "", options: ["protolabs/reasoning", "protolabs/fast"], value: "protolabs/reasoning", default: "protolabs/reasoning" },
       { key: "model.temperature", label: "Temperature", type: "number", section: "Model", restart: false, description: "", options: [], value: 0.2, default: 0.2, minimum: 0, maximum: 2 },
@@ -153,6 +158,7 @@ export const SETTINGS_SCHEMA = [
   },
   {
     section: "Routing",
+    category: "Agent",
     fields: [
       { key: "routing.aux_model", label: "Auxiliary (fast) model", type: "string", section: "Routing", restart: false, description: "Cheap alias for aux calls.", options: [], value: "protolabs/fast", default: "" },
       { key: "routing.fallback_models", label: "Fallback models", type: "string_list", section: "Routing", restart: false, description: "", options: [], value: [], default: [] },
@@ -160,12 +166,14 @@ export const SETTINGS_SCHEMA = [
   },
   {
     section: "Compaction",
+    category: "Behavior",
     fields: [
       { key: "compaction.enabled", label: "Enable compaction", type: "bool", section: "Compaction", restart: false, description: "", options: [], value: true, default: true },
     ],
   },
   {
     section: "Runtime",
+    category: "System",
     fields: [
       { key: "runtime.autostart_on_boot", label: "Autostart on boot", type: "bool", section: "Runtime", restart: true, description: "Install/remove the boot LaunchAgent.", options: [], value: false, default: false },
     ],
@@ -405,5 +413,21 @@ export const PLAYBOOKS = [
     id: 2, name: "pr-triage-flow", description: "Learned: how to triage a PR review backlog.",
     tools_used: ["github_get_pr", "github_list_issues"], source: "emitted", confidence: 0.62,
     last_used: "2026-05-31T12:00:00+00:00", created_at: "2026-05-30T00:00:00+00:00",
+  },
+];
+
+// Knowledge → Store (ADR 0020): chunks from the knowledge base (findings, notes).
+export const KNOWLEDGE_CHUNKS = [
+  {
+    id: 11, heading: "Release cadence", content: "Releases are cut manually via workflow_dispatch.",
+    preview: "Release cadence: Releases are cut manually via workflow_dispatch.",
+    domain: "process", source: "daily-log", source_type: "log", finding_type: "fact",
+    created_at: "2026-06-03T12:00:00+00:00",
+  },
+  {
+    id: 12, heading: "", content: "The gateway alias for the live model is protolabs/reasoning.",
+    preview: "The gateway alias for the live model is protolabs/reasoning.",
+    domain: "general", source: null, source_type: null, finding_type: null,
+    created_at: "2026-06-02T09:00:00+00:00",
   },
 ];

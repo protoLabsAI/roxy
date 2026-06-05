@@ -26,7 +26,10 @@ jobs:
   release:
     name: Release
     runs-on: namespace-profile-protolabs-linux
-    if: github.repository == 'protoLabsAI/roxy'
+    # Opt-in guard (fork-friendly): set the `RELEASE_ENABLED` repo variable to
+    # `true` to enable releases. Forks enable without editing this workflow.
+    # roxy: RELEASE_ENABLED=true is set on protoLabsAI/roxy.
+    if: vars.RELEASE_ENABLED == 'true'
     permissions:
       contents: write
       packages: write

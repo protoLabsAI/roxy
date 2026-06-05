@@ -34,8 +34,11 @@ jobs:
   prepare:
     name: Prepare Release
     runs-on: namespace-profile-protolabs-linux
-    # Repo-scope guard: this fork (roxy) owns its own releases.
-    if: github.repository == 'protoLabsAI/roxy'
+    # Opt-in guard (fork-friendly): set the `RELEASE_ENABLED` repo variable to
+    # `true` to enable the release pipeline. Forks enable it without editing this
+    # workflow — so upstream changes to the file don't conflict on re-sync.
+    # roxy: RELEASE_ENABLED=true is set on protoLabsAI/roxy.
+    if: vars.RELEASE_ENABLED == 'true'
     permissions:
       contents: write
       pull-requests: write

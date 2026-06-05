@@ -81,12 +81,18 @@ _telemetry_store = None  # TelemetryStore (per-turn cost/latency rollups, ADR 00
 _inbox_store = None    # InboxStore — durable inbound inbox (ADR 0003), or None.
 _beads_store = None    # BeadsStore — in-process issue tracker (Sprint B), or None.
 _storm_guard = None    # StormGuard for the now→Activity fire path (ADR 0003).
+_activity_log = None   # ActivityLog — provenance feed (ADR 0022), or None.
 _mcp_clients = []        # Live MultiServerMCPClient handles (kept alive for reconnect).
 _mcp_tools = []          # MCP-server tools appended to the active graph.
 _mcp_meta = []           # Per-server {name, transport, tool_count} for runtime status.
 _plugin_tools = []       # Tools contributed by enabled plugins.
 _plugin_skill_dirs = []  # SKILL.md dirs bundled by enabled plugins.
-_plugin_meta = []        # Per-plugin {id, name, enabled, loaded, tools, skills} for status.
+_plugin_routers = []     # FastAPI routers contributed by plugins (ADR 0018) —
+                         # mounted ONCE at init; not hot-reloaded.
+_plugin_surfaces = []    # Lifecycle surfaces (start/stop) from plugins (ADR 0018)
+                         # — started in the startup hook, stopped on shutdown.
+_plugin_surface_handles = []  # Started surfaces ({name, stop, handle}) for shutdown.
+_plugin_meta = []        # Per-plugin {id, name, enabled, loaded, tools, skills, ...} for status.
 _active_port = 7870    # populated by _main() — the port this process is actually bound to.
                        # Read by the autostart installer so the LaunchAgent reboots
                        # on the same port the operator launched with, not the default.
@@ -98,9 +104,6 @@ _cache_warmer = None   # Optional CacheWarmer (off by default). Same start/stop
                        # lifecycle as _scheduler; keeps the prompt cache warm.
 _goal_controller = None  # Optional GoalController (goal mode). Parses /goal
                          # control messages and runs the goal-completion loop.
-_discord_task = None     # The inbound Discord gateway task (ADR 0015/0016).
-                         # Held so a config change (Settings/wizard) can stop +
-                         # restart it live, not just at process boot.
 _main_loop = None        # The server's event loop, captured at startup (#497).
                          # A config reload's heavy graph compile is offloaded to a
                          # worker thread so it no longer freezes the loop; the
@@ -188,6 +191,7 @@ def _init_langgraph_agent(headless_setup: bool = False):
     global _workflow_registry
     global _mcp_clients, _mcp_tools, _mcp_meta
     global _plugin_tools, _plugin_skill_dirs, _plugin_meta
+    global _plugin_routers, _plugin_surfaces
 
     from graph.config import LangGraphConfig
     from graph.config_io import (
@@ -203,6 +207,10 @@ def _init_langgraph_agent(headless_setup: bool = False):
     # it at per-user app-data), so load through it rather than a fixed path.
     ensure_live_config()
     _graph_config = LangGraphConfig.from_yaml(CONFIG_YAML_PATH)
+    # Fork tool denylist (config ``tools.disabled``) — applied before any
+    # get_all_tools() call so dropped tools never reach the graph.
+    from tools.lg_tools import set_disabled_tools
+    set_disabled_tools(_graph_config.tools_disabled)
     # Egress allowlist (ADR 0008): deny-by-default outbound hosts for fetch_url.
     import egress
     egress.set_allowed_hosts(_graph_config.egress_allowed_hosts)
@@ -229,8 +237,21 @@ def _init_langgraph_agent(headless_setup: bool = False):
         else:
             _graph = None
             _knowledge_store = None
+            # Load plugins for their ROUTES + SURFACES even without a compiled
+            # graph. The Connect Discord / Connect Google / Test-connection routes
+            # are how the setup wizard *configures* the agent, so they must be
+            # mounted during first-run setup — not only after a restart. (Without
+            # this the first-run wizard's Connect/Test buttons 404 until the app is
+            # relaunched.) register() needs no graph; the tools/subagents that feed
+            # the graph are (re)loaded when setup completes and the graph builds.
+            _pre = _build_plugins(_graph_config)
+            _plugin_routers, _plugin_surfaces, _plugin_meta = (
+                _pre.routers, _pre.surfaces, _pre.meta,
+            )
+            _register_plugin_subagents(_pre.subagents)
             log.info(
-                "Setup wizard has not been completed — graph not compiled. "
+                "Setup wizard has not been completed — graph not compiled "
+                "(plugin routes/surfaces still mounted). "
                 "Open the UI to finish setup (or run headless: --ui none / --setup).",
             )
             return
@@ -252,18 +273,31 @@ def _init_langgraph_agent(headless_setup: bool = False):
     global _scheduler
     _scheduler = _build_scheduler(_graph_config)
 
-    # MCP — external Model Context Protocol servers; their tools become agent
-    # tools (namespaced <server>__<tool>). Off unless mcp.enabled.
-    _mcp_clients, _mcp_tools, _mcp_meta = _build_mcp(_graph_config)
-
-    # Plugins — drop-in packages (tools + bundled skills). Loaded after the
-    # core + MCP tools so plugin tools that would shadow them are skipped.
+    # Plugins — drop-in packages (tools + bundled skills + surfaces/routes +
+    # managed MCP servers). Loaded BEFORE MCP so a plugin's managed MCP server
+    # (register_mcp_server, e.g. Google) is injected into the MCP discovery
+    # below. Collision check uses core tools only — MCP tools are namespaced
+    # (<server>__<tool>) so they can't be shadowed by a plugin tool anyway.
     _plugins = _build_plugins(
         _graph_config,
-        existing_tools=get_all_tools(_knowledge_store, scheduler=_scheduler) + _mcp_tools,
+        existing_tools=get_all_tools(_knowledge_store, scheduler=_scheduler),
     )
     _plugin_tools, _plugin_skill_dirs, _plugin_meta = (
         _plugins.tools, _plugins.skill_dirs, _plugins.meta,
+    )
+    # Surfaces / routes / subagents (ADR 0018). Routers + surfaces are captured
+    # here and consumed once by _main (mount) + the startup hook (start) — they
+    # don't hot-reload. Subagents register into SUBAGENT_REGISTRY before the graph
+    # build below so the first compile (and every reload) can delegate to them.
+    # (`global _plugin_routers, _plugin_surfaces` is declared at the top of the fn.)
+    _plugin_routers, _plugin_surfaces = _plugins.routers, _plugins.surfaces
+    _register_plugin_subagents(_plugins.subagents)
+
+    # MCP — external Model Context Protocol servers; their tools become agent
+    # tools (namespaced <server>__<tool>). Off unless mcp.enabled OR a plugin
+    # contributes a managed server (ADR 0019).
+    _mcp_clients, _mcp_tools, _mcp_meta = _build_mcp(
+        _graph_config, plugin_servers=[s["factory"] for s in _plugins.mcp_servers]
     )
 
     # Skills — human-authored SKILL.md folders (bundle + live + plugin-bundled)
@@ -272,8 +306,10 @@ def _init_langgraph_agent(headless_setup: bool = False):
 
     _workflow_registry = _build_workflow_registry(_graph_config)
 
-    global _inbox_store, _storm_guard, _beads_store
+    global _inbox_store, _storm_guard, _beads_store, _activity_log
     _inbox_store = _build_inbox_store(_graph_config)
+    if _activity_log is None:
+        _activity_log = _build_activity_log(_graph_config)
     from beads import BeadsStore
     if _beads_store is None:  # may have been created early (pre-setup) for the routes
         _beads_store = BeadsStore()  # in-process issue tracker (Sprint B), instance-scoped
@@ -325,6 +361,22 @@ def _build_knowledge_store(config):
         return None
     try:
         from knowledge import KnowledgeStore
+        # Semantic recall (ADR 0021): when knowledge.embeddings is on, use the
+        # HybridKnowledgeStore (FTS5 + vector, fused with RRF) with an embed_fn
+        # wired to the gateway. Any failure degrades to keyword-only FTS5 — never
+        # KB-less — and the store's circuit breaker handles runtime outages.
+        if getattr(config, "knowledge_embeddings", False):
+            try:
+                from graph.llm import create_embed_fn
+                from knowledge.hybrid_store import HybridKnowledgeStore
+
+                embed_fn = create_embed_fn(config)
+                if embed_fn is not None:
+                    log.info("[server] knowledge: hybrid store (FTS5 + embeddings via %s)", config.embed_model)
+                    return HybridKnowledgeStore(db_path=config.knowledge_db_path, embed_fn=embed_fn)
+                log.warning("[server] knowledge.embeddings on but no embed_model — FTS5 only")
+            except Exception as exc:  # noqa: BLE001 — degrade to FTS5, never fail
+                log.warning("[server] hybrid store init failed: %s; FTS5 only", exc)
         return KnowledgeStore(db_path=config.knowledge_db_path)
     except Exception as exc:
         log.warning("[server] knowledge store init failed: %s; running KB-less", exc)
@@ -369,8 +421,12 @@ def _build_skills_index(config, extra_skill_dirs=None):
         return None
 
 
-def _build_mcp(config):
+def _build_mcp(config, plugin_servers=None):
     """Discover tools from configured MCP servers. Returns (clients, tools, meta).
+
+    ``plugin_servers`` are managed-MCP-server factories contributed by plugins
+    (``register_mcp_server``, ADR 0019) — e.g. the Google surface's OAuth-gated
+    server — injected alongside the configured ``mcp.servers``.
 
     Best-effort and per-server isolated (see tools/mcp_tools.build_mcp_tools):
     a bad/unreachable server is logged and skipped, never fatal. Returns empty
@@ -379,13 +435,41 @@ def _build_mcp(config):
     try:
         from tools.mcp_tools import build_mcp_tools
 
-        clients, tools, meta = build_mcp_tools(config)
+        clients, tools, meta = build_mcp_tools(config, plugin_servers=plugin_servers)
         if tools:
             log.info("[mcp] %d tool(s) from %d server(s)", len(tools), len(meta))
         return clients, tools, meta
     except Exception as exc:  # noqa: BLE001 — MCP is optional, never fatal
         log.warning("[mcp] init failed: %s; running without MCP tools", exc)
         return [], [], []
+
+
+_plugin_subagent_names: set[str] = set()
+
+
+def _register_plugin_subagents(subagents) -> None:
+    """Add plugin-contributed SubagentConfigs to SUBAGENT_REGISTRY (ADR 0018).
+
+    Idempotent by name (re-registering a plugin's own subagent on a later call is
+    fine) but won't let a plugin shadow a built-in subagent (logged + skipped).
+    """
+    if not subagents:
+        return
+    try:
+        from graph.subagents.config import SUBAGENT_REGISTRY
+    except Exception:  # noqa: BLE001
+        log.warning("[plugins] subagent registry unavailable; skipping plugin subagents")
+        return
+    for cfg in subagents:
+        name = getattr(cfg, "name", None)
+        if not name:
+            continue
+        if name in SUBAGENT_REGISTRY and name not in _plugin_subagent_names:
+            log.warning("[plugins] subagent %r collides with a built-in — skipped", name)
+            continue
+        SUBAGENT_REGISTRY[name] = cfg
+        _plugin_subagent_names.add(name)
+        log.info("[plugins] registered subagent: %s", name)
 
 
 def _build_plugins(config, existing_tools=None):
@@ -561,6 +645,29 @@ def _build_inbox_store(config):
         return InboxStore(path)
     except Exception:
         log.exception("[inbox] failed to build store at %s; inbox disabled", path)
+        return None
+
+
+def _build_activity_log(config):
+    """Provenance feed store (ADR 0022). Path resolves like the inbox store
+    (/sandbox → ~/.protoagent fallback), namespaced by agent name."""
+    from activity import ActivityLog
+
+    name = re.sub(r"[^a-zA-Z0-9._-]", "_", agent_name()) or "agent"
+    configured = scope_leaf(Path("/sandbox/activity") / f"{name}.db")
+    try:
+        configured.parent.mkdir(parents=True, exist_ok=True)
+        if not os.access(configured.parent, os.W_OK):
+            raise OSError
+        path = str(configured)
+    except OSError:
+        fallback = scope_leaf(Path.home() / ".protoagent" / "activity" / f"{name}.db")
+        fallback.parent.mkdir(parents=True, exist_ok=True)
+        path = str(fallback)
+    try:
+        return ActivityLog(path)
+    except Exception:
+        log.exception("[activity] failed to build log at %s; feed disabled", path)
         return None
 
 
@@ -807,6 +914,11 @@ def _reload_langgraph_agent() -> tuple[bool, str]:
         log.exception("[reload] config load failed")
         return False, f"config load failed: {e}"
 
+    # Fork tool denylist — apply the new config's denylist before the rebuild's
+    # get_all_tools() calls (live-reloadable like the rest of the config).
+    from tools.lg_tools import set_disabled_tools
+    set_disabled_tools(new_config.tools_disabled)
+
     # Build the graph FIRST (when setup is complete) — only commit
     # runtime state after the rebuild succeeds. Doing the swap first
     # would leave the process serving the prior compiled _graph under
@@ -847,10 +959,14 @@ def _reload_langgraph_agent() -> tuple[bool, str]:
     if is_setup_complete():
         try:
             new_store = _build_knowledge_store(new_config)
-            new_mcp_clients, new_mcp_tools, new_mcp_meta = _build_mcp(new_config)
+            # Plugins before MCP — a plugin's managed MCP server (e.g. Google)
+            # is injected into the MCP discovery below (matches _main ordering).
             new_plugins = _build_plugins(
                 new_config,
-                existing_tools=get_all_tools(new_store, scheduler=next_scheduler) + new_mcp_tools,
+                existing_tools=get_all_tools(new_store, scheduler=next_scheduler),
+            )
+            new_mcp_clients, new_mcp_tools, new_mcp_meta = _build_mcp(
+                new_config, plugin_servers=[s["factory"] for s in new_plugins.mcp_servers]
             )
             new_plugin_tools = new_plugins.tools
             new_plugin_skill_dirs = new_plugins.skill_dirs
@@ -913,16 +1029,10 @@ def _reload_langgraph_agent() -> tuple[bool, str]:
     if pending_start is not None:
         _start_scheduler_async(pending_start)
 
-    # Discord surface: reconnect live if its config changed (token / admin_ids /
-    # enabled), so a Settings save or wizard finish applies without a restart.
-    discord_changed = (
-        old_config is None
-        or old_config.discord_enabled != new_config.discord_enabled
-        or old_config.discord_bot_token != new_config.discord_bot_token
-        or list(old_config.discord_admin_ids) != list(new_config.discord_admin_ids)
-    )
-    if discord_changed:
-        _restart_discord_async()
+    # Plugin surfaces with a reload hook (ADR 0018/0019) reconnect on a config
+    # change without a restart — this is how the Discord plugin live-reconnects
+    # when its token/admin/enabled changes (was a bespoke discord_changed block).
+    _reload_plugin_surfaces(new_config)
 
     if new_graph is None:
         log.info("[reload] setup not complete — config reloaded, graph not compiled")
@@ -932,73 +1042,54 @@ def _reload_langgraph_agent() -> tuple[bool, str]:
     return True, f"reloaded • model={_graph_config.model_name}"
 
 
-def _start_discord_surface() -> None:
-    """(Re)start the inbound Discord gateway from the live config (ADR 0016).
-
-    Start rule: the UI path starts only when ``discord.enabled`` is on AND a
-    token is configured; the env path (Docker ``DISCORD_BOT_TOKEN``, no UI token)
-    starts as before for back-compat. Injects token + admin_ids via
-    ``configure`` so the bundled desktop app uses its per-user secret, not an
-    ambient env var. Stores the task in ``_discord_task`` for live restart.
-    """
-    global _discord_task
-    import os as _os
-
-    from surfaces.discord import configure as _configure
-    from surfaces.discord import start_in_background as _start_discord
-
-    cfg_token = (_graph_config.discord_bot_token or "").strip() if _graph_config else ""
-    env_token = (_os.environ.get("DISCORD_BOT_TOKEN") or "").strip()
-    admin_ids = list(_graph_config.discord_admin_ids) if _graph_config else []
-    enabled = bool(_graph_config.discord_enabled) if _graph_config else False
-
-    _configure(cfg_token, admin_ids)
-
-    # UI token requires the enabled toggle; a bare env token (no UI token) starts
-    # for back-compat (Docker deploys that only set DISCORD_BOT_TOKEN).
-    should_start = (bool(cfg_token) and enabled) or (not cfg_token and bool(env_token))
-    if not should_start:
-        log.info("[discord] gateway not started (enabled=%s, token=%s)",
-                 enabled, "set" if (cfg_token or env_token) else "unset")
-        return
-
-    async def _discord_invoke(prompt: str, session_id: str) -> str:
-        result = await chat(prompt, session_id)
-        return "\n\n".join(
-            m["content"] for m in result
-            if m.get("role") == "assistant" and m.get("content")
-        )
-
-    # subscribe enables return-address delivery: reactive Activity-thread output
-    # (scheduler/inbox/proactive) is forwarded to the operator's captured DM.
-    _discord_task = _start_discord(
-        _discord_invoke, publish=_event_bus.publish, subscribe=_event_bus.subscribe
+async def _plugin_agent_invoke(prompt: str, session_id: str) -> str:
+    """Agent invoke exposed to plugin surfaces via the plugin host (ADR 0018) — a
+    chat turn joined to its assistant text (mirrors the Discord surface invoker)."""
+    result = await chat(prompt, session_id)
+    return "\n\n".join(
+        m["content"] for m in result
+        if m.get("role") == "assistant" and m.get("content")
     )
 
 
-def _restart_discord_async() -> None:
-    """Fire-and-forget: stop the running gateway, then start from new config.
+def _populate_plugin_host() -> None:
+    """Wire the plugin host (ADR 0018) — agent invoke + event bus — so a plugin
+    surface/route can reach them. Called once in _main, before startup."""
+    try:
+        from graph.plugins.host import HOST
 
-    Scheduled on the server loop via :func:`_run_on_server_loop`, so it works
-    from an offloaded (worker-thread) reload too — not just an on-loop one.
+        HOST.invoke = _plugin_agent_invoke
+        HOST.publish = _event_bus.publish
+        HOST.subscribe = _event_bus.subscribe
+        HOST.config = lambda: _graph_config
+        HOST.apply_settings = lambda patch: _apply_settings_changes(config=patch)
+    except Exception:  # noqa: BLE001
+        log.exception("[plugins] failed to populate plugin host")
+
+
+def _reload_plugin_surfaces(new_config) -> None:
+    """Notify started plugin surfaces of a config change (ADR 0018/0019).
+
+    Each surface that registered a ``reload`` callback gets it called with the new
+    ``LangGraphConfig`` on the server loop, so a migrated Discord/Google-style
+    surface can reconnect on a Settings save without a restart. Best-effort.
     """
-    async def _swap() -> None:
-        global _discord_task
-        try:
-            from surfaces.discord import stop as _discord_stop
+    for h in _plugin_surface_handles:
+        reload_cb = h.get("reload")
+        if not callable(reload_cb):
+            continue
 
-            if _discord_task is not None:
-                _discord_task.cancel()
-                _discord_task = None
-            await _discord_stop()
-        except Exception:
-            log.exception("[discord] stop during restart failed")
-        try:
-            _start_discord_surface()
-        except Exception:
-            log.exception("[discord] restart failed")
+        def _make(cb=reload_cb, name=h.get("name")):
+            async def _run():
+                try:
+                    res = cb(new_config)
+                    if asyncio.iscoroutine(res):
+                        await res
+                except Exception:
+                    log.exception("[plugins] surface %s reload failed", name)
+            return _run()
 
-    _run_on_server_loop(_swap, "discord restart")
+        _run_on_server_loop(_make, f"surface reload ({h.get('name')})")
 
 
 def _sync_autostart_with_config(config: dict | None) -> str | None:
@@ -1570,6 +1661,51 @@ async def _run_parsed_workflow(name: str, inputs: dict, *, on_step=None) -> str:
     return out
 
 
+# --- Subagent slash commands (ADR 0020) --------------------------------------
+# A chat message like ``/researcher find me X`` runs the named subagent instead
+# of a normal model turn — the slash-command analogue of the ``task`` tool, so
+# "run a worker" is a composer gesture, not a separate surface. Free text after
+# the name is the subagent's prompt. A workflow of the same name wins (the turn
+# dispatch checks workflows first). Short-circuits the turn like /goal does.
+
+
+def _parse_subagent_command(message: str):
+    """Return ``(subagent_type, prompt)`` if ``message`` is ``/<known-subagent>
+    …`` (and not a workflow of the same name), else ``None``."""
+    name, rest = _parse_slash_command(message)
+    if not name:
+        return None
+    # Workflow wins on a name collision (dispatch checks workflows first).
+    if _workflow_registry is not None and _workflow_registry.get(name) is not None:
+        return None
+    try:
+        from graph.subagents.config import SUBAGENT_REGISTRY
+    except Exception:
+        return None
+    if name not in SUBAGENT_REGISTRY:
+        return None
+    return name, rest.strip()
+
+
+async def _run_parsed_subagent(subagent_type: str, prompt: str) -> str:
+    """Run one subagent from a chat slash command, formatted as the reply."""
+    from graph.agent import run_manual_subagent
+
+    try:
+        raw = await run_manual_subagent(
+            _graph_config,
+            knowledge_store=_knowledge_store,
+            scheduler=_scheduler,
+            description=f"/{subagent_type} chat command",
+            prompt=prompt,
+            subagent_type=subagent_type,
+        )
+    except ValueError as exc:
+        return f"⚠️ {exc}"
+    # Strip the worker's scratch_pad/output tags so chat shows clean text.
+    return extract_output(raw) or raw or "(subagent produced no output)"
+
+
 async def _chat_langgraph_stream(
     message: str,
     session_id: str,
@@ -1663,6 +1799,22 @@ async def _chat_langgraph_stream(
                 wf_out = await runner
                 yield ("tool_end", {"id": f"workflow:{wf_name}", "name": f"workflow:{wf_name}", "output": wf_out[:300]})
                 yield ("done", wf_out)
+                return
+
+            # Subagent slash command (/<subagent> <prompt>) short-circuits the
+            # turn: run the one worker and return its output (ADR 0020 — run from
+            # chat). Renders a single tool card. A workflow of the same name wins.
+            parsed_sub = _parse_subagent_command(message)
+            if parsed_sub is not None:
+                sub_type, sub_prompt = parsed_sub
+                if not sub_prompt:
+                    yield ("done", f"Usage: `/{sub_type} <prompt>` — describe the task for the {sub_type} subagent.")
+                    return
+                sub_tool_id = f"subagent:{sub_type}"
+                yield ("tool_start", {"id": sub_tool_id, "name": sub_tool_id, "input": sub_prompt})
+                sub_out = await _run_parsed_subagent(sub_type, sub_prompt)
+                yield ("tool_end", {"id": sub_tool_id, "name": sub_tool_id, "output": sub_out[:300]})
+                yield ("done", sub_out)
                 return
 
             # thread_id keys this session's history in the checkpointer (bound
@@ -2204,9 +2356,26 @@ def _a2a_terminal(outcome) -> None:
     text = extract_output(outcome.text) or outcome.text
     if not text.strip():
         return
+    origin = getattr(outcome, "origin", "") or "operator"
+    trigger = getattr(outcome, "trigger", "") or ""
+    priority = getattr(outcome, "priority", "") or ""
+    # Provenance feed (ADR 0022): durably log the turn + what triggered it.
+    if _activity_log is not None:
+        _activity_log.add(
+            context_id=ACTIVITY_CONTEXT,
+            origin=origin,
+            trigger=trigger,
+            priority=priority,
+            state=getattr(outcome, "state", "completed"),
+            text=text,
+            task_id=getattr(outcome, "task_id", "") or "",
+        )
     _event_bus.publish(
         "activity.message",
-        {"role": "assistant", "text": text, "context_id": ACTIVITY_CONTEXT},
+        {
+            "role": "assistant", "text": text, "context_id": ACTIVITY_CONTEXT,
+            "origin": origin, "trigger": trigger, "priority": priority,
+        },
     )
 
 
@@ -2217,14 +2386,17 @@ def _a2a_terminal(outcome) -> None:
 def _main():
     global _active_port
 
-    # Frozen-binary entrypoint for the managed Google MCP server (ADR 0017): the
-    # bundled desktop app has no `python` on PATH, so the google MCP entry
-    # re-invokes this binary with --mcp-google instead of `-m
-    # mcp_servers.google.server`. Handle it before argparse/server startup.
-    if "--mcp-google" in sys.argv:
-        from mcp_servers.google.server import main as _google_mcp_main
+    # Frozen-binary entrypoint for a plugin's managed MCP server (ADR 0019): the
+    # bundled desktop app has no `python` on PATH, so a plugin's managed-server
+    # factory re-invokes this binary with `--mcp-plugin <id>` instead of `-m
+    # <module>`. We import that plugin's module and call its `mcp_main()`. Handle
+    # it before argparse/server startup. (The Google plugin is the first user.)
+    if "--mcp-plugin" in sys.argv:
+        i = sys.argv.index("--mcp-plugin")
+        plugin_id = sys.argv[i + 1] if i + 1 < len(sys.argv) else ""
+        from graph.plugins.loader import run_plugin_mcp_main
 
-        _google_mcp_main()
+        run_plugin_mcp_main(plugin_id)
         return
 
     parser = argparse.ArgumentParser(description=f"{AGENT_NAME_ENV} — protoAgent server")
@@ -2479,24 +2651,12 @@ def _main():
             raise RuntimeError("workflows are not available")
         return {"deleted": _workflow_registry.delete(name)}
 
-    def _publish_activity_terminal(record) -> None:
-        """Terminal hook (ADR 0003): when a turn in the Activity thread completes,
-        push the assistant's visible output to the event bus so connected
-        consoles append it live. No-op for every other context."""
-        if getattr(record, "context_id", "") != ACTIVITY_CONTEXT:
-            return
-        raw = getattr(record, "accumulated_text", "") or ""
-        text = extract_output(raw) or raw
-        if not text.strip():
-            return
-        _event_bus.publish(
-            "activity.message",
-            {"role": "assistant", "text": text, "context_id": ACTIVITY_CONTEXT},
-        )
-
     async def _operator_activity_list() -> dict:
-        """Return the Activity thread's message history from the checkpointer
-        (ADR 0003). The console loads this when opening the Activity surface."""
+        """Return the Activity provenance feed (ADR 0022) — newest-first entries
+        with origin/trigger/priority — plus the thread's message history from the
+        checkpointer (for the continue view). The console renders the feed and
+        opens the thread on demand."""
+        entries = _activity_log.recent(limit=100) if _activity_log is not None else []
         messages: list[dict] = []
         if _checkpointer is not None:
             thread_id = f"a2a:{ACTIVITY_CONTEXT}"
@@ -2518,7 +2678,7 @@ def _main():
                     if visible.strip():
                         messages.append({"role": "assistant", "content": visible})
                 # tool/system messages are omitted from the surface view
-        return {"context_id": ACTIVITY_CONTEXT, "messages": messages}
+        return {"context_id": ACTIVITY_CONTEXT, "entries": entries, "messages": messages}
 
     def _inbox_authorized(token: str | None) -> bool:
         """Validate the inbound bearer token (ADR 0003). Mirrors the A2A posture:
@@ -2538,7 +2698,10 @@ def _main():
         if _storm_guard is not None and not _storm_guard.allow(time.monotonic()):
             log.warning("[inbox] storm guard suppressed now-fire for item %s", item.get("id"))
             return False
-        headers = {"Content-Type": "application/json"}
+        # A2A 1.0 (a2a-sdk ≥1.1): the version header + proto method name are
+        # mandatory — the 0.3 `message/send` 404s with -32601. Mirrors the
+        # scheduler's fire (scheduler/local.py).
+        headers = {"Content-Type": "application/json", "A2A-Version": "1.0"}
         bearer = ((_graph_config.auth_token if _graph_config else "") or os.environ.get("A2A_AUTH_TOKEN", "")).strip()
         if bearer:
             headers["Authorization"] = f"Bearer {bearer}"
@@ -2547,17 +2710,29 @@ def _main():
             headers["X-API-Key"] = api_key
         mid = str(uuid4())
         body = {
-            "jsonrpc": "2.0", "id": mid, "method": "message/send",
+            "jsonrpc": "2.0", "id": mid, "method": "SendMessage",
             "params": {
-                "contextId": ACTIVITY_CONTEXT,
-                "message": {"role": "user", "parts": [{"kind": "text", "text": item["text"]}], "messageId": mid},
-                "metadata": {"origin": "inbox", "inbox_id": item.get("id"), "inbox_source": item.get("source", "")},
+                # contextId is a field of Message in 1.0 (params-level => -32602).
+                "message": {
+                    "role": "ROLE_USER",
+                    "parts": [{"text": item["text"]}],
+                    "messageId": mid,
+                    "contextId": ACTIVITY_CONTEXT,
+                },
+                "metadata": {"origin": "inbox", "inbox_id": item.get("id"), "inbox_source": item.get("source", ""), "priority": item.get("priority", "now")},
             },
         }
         try:
             async with httpx.AsyncClient(timeout=30) as client:
                 r = await client.post(f"http://127.0.0.1:{_active_port}/a2a", headers=headers, json=body)
-            return r.status_code < 400
+            # A JSON-RPC error rides a 200, so status alone isn't enough.
+            if r.status_code >= 400:
+                return False
+            err = r.json().get("error") if r.headers.get("content-type", "").startswith("application/json") else None
+            if err:
+                log.warning("[inbox] now-fire rejected for item %s: %s", item.get("id"), err)
+                return False
+            return True
         except Exception:
             log.exception("[inbox] now-fire failed for item %s", item.get("id"))
             return False
@@ -2609,8 +2784,10 @@ def _main():
                 "usage": "/goal <condition>   ·   /goal  (status)   ·   /goal clear",
             })
         # Each registered workflow is runnable as /<name> (ADR 0002).
+        wf_names: set[str] = set()
         if _workflow_registry is not None:
             for wf in _workflow_registry.list():
+                wf_names.add(wf["name"])
                 declared = wf.get("inputs", []) or []
                 req = "".join(f" <{i['name']}>" for i in declared if i.get("required"))
                 opt = "".join(f" [{i['name']}]" for i in declared if not i.get("required"))
@@ -2619,6 +2796,20 @@ def _main():
                     "description": wf.get("description") or f"Run the {wf['name']} workflow.",
                     "usage": f"/{wf['name']}{req}{opt}",
                 })
+        # Each registered subagent is runnable as /<name> <prompt> (ADR 0020),
+        # unless a workflow already claims the name (workflow wins in dispatch).
+        try:
+            from graph.subagents.config import SUBAGENT_REGISTRY
+        except Exception:
+            SUBAGENT_REGISTRY = {}
+        for name, cfg in SUBAGENT_REGISTRY.items():
+            if name in wf_names:
+                continue
+            commands.append({
+                "name": name,
+                "description": getattr(cfg, "description", "") or f"Run the {name} subagent.",
+                "usage": f"/{name} <prompt>",
+            })
         return {"commands": commands}
 
     # The in-process beads store is agent-global + graph-independent, but it's
@@ -2658,6 +2849,19 @@ def _main():
         inbox_deliver=_operator_inbox_deliver,
     )
 
+    # Wire the plugin host (agent invoke + event bus) before any surface starts.
+    _populate_plugin_host()
+
+    # Plugin-contributed routes (ADR 0018) — mounted after the core routes,
+    # under each plugin's namespaced prefix (default /plugins/<id>). Once, here;
+    # routes don't hot-reload. Best-effort so one bad router can't break boot.
+    for r in _plugin_routers:
+        try:
+            fastapi_app.include_router(r["router"], prefix=r["prefix"])
+            log.info("[plugins] mounted router from %s at %s", r["plugin_id"], r["prefix"] or "/")
+        except Exception:
+            log.exception("[plugins] failed to mount router from %s", r.get("plugin_id"))
+
     # --- Scheduler lifecycle ------------------------------------------------
     # The local scheduler needs an asyncio polling task; the Workstacean
     # adapter is a no-op start/stop. Both implement the same contract so
@@ -2694,18 +2898,38 @@ def _main():
             import asyncio
             _checkpoint_prune_task = asyncio.create_task(_checkpoint_prune_loop())
 
-        # Inbound Discord gateway (ADR 0015/0016) — started from the live config
-        # (UI token in secrets, or the DISCORD_BOT_TOKEN env fallback). A Discord
-        # DM is conversational, so it invokes the agent as a chat surface with a
-        # per-conversation session_id (the LangGraph thread key), NOT the single
-        # system:activity inbox thread.
-        try:
-            _start_discord_surface()
-        except Exception:
-            log.exception("[discord] gateway startup failed")
+        # (The inbound Discord gateway now starts as the discord plugin's surface,
+        # below — ADR 0018/0019.)
+
+        # Plugin-contributed surfaces (ADR 0018) — start each on the loop. `start`
+        # may be sync or async and may return a handle (kept for shutdown).
+        # Best-effort: a failing surface logs, never breaks boot.
+        global _plugin_surface_handles
+        for s in _plugin_surfaces:
+            try:
+                res = s["start"]()
+                if asyncio.iscoroutine(res):
+                    res = await res
+                _plugin_surface_handles.append(
+                    {"name": s["name"], "stop": s.get("stop"), "reload": s.get("reload"), "handle": res}
+                )
+                log.info("[plugins] started surface: %s", s["name"])
+            except Exception:
+                log.exception("[plugins] surface %s failed to start", s.get("name"))
 
     @fastapi_app.on_event("shutdown")
     async def _scheduler_shutdown() -> None:
+        # Stop plugin surfaces first (ADR 0018) — best-effort.
+        for h in _plugin_surface_handles:
+            stop = h.get("stop")
+            if not callable(stop):
+                continue
+            try:
+                res = stop()
+                if asyncio.iscoroutine(res):
+                    await res
+            except Exception:
+                log.exception("[plugins] surface %s failed to stop", h.get("name"))
         if _scheduler is not None:
             try:
                 await _scheduler.stop()
@@ -2813,6 +3037,47 @@ def _main():
         except Exception as exc:  # noqa: BLE001
             log.exception("[playbooks] delete failed")
             return {"enabled": True, "deleted": False, "error": str(exc)}
+
+    # --- Knowledge store (ADR 0020) ----------------------------------------
+    # Searchable view of the agent's knowledge base (knowledge/store.py, FTS5):
+    # findings, daily-log entries, harvested sessions, operator notes — the same
+    # store KnowledgeMiddleware queries before each turn. An empty ``q`` returns
+    # the most-recent chunks (a browsable default); a non-empty ``q`` runs FTS5
+    # search. Read-only; never 500s the console.
+    def _knowledge_row(d: dict) -> dict:
+        """Normalize a search()/list_chunks() row to the console's shape."""
+        heading = d.get("heading") or ""
+        content = d.get("content") or ""
+        preview = d.get("preview") or ((heading + ": " if heading else "") + content)[:240]
+        return {
+            "id": d.get("id"),
+            "heading": heading,
+            "content": content,
+            "preview": preview,
+            "domain": d.get("domain") or "general",
+            "source": d.get("source"),
+            "source_type": d.get("source_type"),
+            "finding_type": d.get("finding_type"),
+            "created_at": d.get("created_at"),
+        }
+
+    @fastapi_app.get("/api/knowledge/search")
+    async def _api_knowledge_search(q: str = "", k: int = 30, domain: str | None = None):
+        if _knowledge_store is None:
+            return {"enabled": False, "query": q, "results": [], "stats": {}}
+        results: list[dict] = []
+        try:
+            if q and q.strip():
+                results = [_knowledge_row(r) for r in _knowledge_store.search(q, k=k, domain=domain or None)]
+            else:
+                results = [_knowledge_row(c.as_dict()) for c in _knowledge_store.list_chunks(domain=domain or None, limit=k)]
+        except Exception:  # noqa: BLE001 — never 500 the console
+            log.exception("[knowledge] search failed")
+        try:
+            stats = _knowledge_store.stats()
+        except Exception:  # noqa: BLE001
+            stats = {}
+        return {"enabled": True, "query": q, "results": results, "stats": stats}
 
     # --- Telemetry (ADR 0006 Slice 2) --------------------------------------
     # Per-turn cost/latency rollups from the local store. Powers the operator
@@ -2938,80 +3203,10 @@ def _main():
         ok, error = await asyncio.to_thread(validate_model_connection, base, key, model)
         return {"ok": ok, "error": error}
 
-    class DiscordProbeRequest(PydanticBaseModel):
-        bot_token: str = ""
-
-    @fastapi_app.post("/api/config/test-discord")
-    async def _api_test_discord(req: DiscordProbeRequest | None = None):
-        """Verify a Discord bot token by fetching its identity (Test connection).
-
-        POST (body) so the token never lands in a URL/log. Blank falls back to
-        the saved token, so Settings can re-test the live config. Returns the bot
-        username so the UI can show "Connected as <bot>".
-        """
-        from surfaces.discord import validate_token
-
-        body = req or DiscordProbeRequest()
-        token = body.bot_token or (_graph_config.discord_bot_token if _graph_config else "")
-        ok, bot_user, error = await validate_token(token or "")
-        return {
-            "ok": ok,
-            "error": error,
-            "bot_user": (bot_user or {}).get("username") if ok else None,
-        }
-
-    def _google_env_from_config() -> None:
-        """Mirror the configured Google OAuth client + token path into the env so
-        ``mcp_servers.google.auth`` (which reads env) can run the consent/status
-        in-process for the connect + status endpoints."""
-        from graph.config_io import _live_config_dir
-
-        cid = (_graph_config.google_client_id if _graph_config else "") or ""
-        sec = (_graph_config.google_client_secret if _graph_config else "") or ""
-        if cid:
-            os.environ["GOOGLE_CLIENT_ID"] = cid
-        if sec:
-            os.environ["GOOGLE_CLIENT_SECRET"] = sec
-        os.environ["GOOGLE_TOKEN_PATH"] = str(_live_config_dir() / "google-token.json")
-
-    @fastapi_app.get("/api/config/google/status")
-    async def _api_google_status():
-        """Report (configured, connected, email) for the Google surface."""
-        try:
-            from mcp_servers.google.auth import connection_status
-        except Exception as e:  # noqa: BLE001 — google extra may be absent
-            return {"configured": False, "connected": False, "email": None,
-                    "error": f"google support unavailable: {e}"}
-        _google_env_from_config()
-        try:
-            return await asyncio.to_thread(connection_status)
-        except Exception as e:  # noqa: BLE001
-            return {"configured": False, "connected": False, "email": None, "error": str(e)}
-
-    @fastapi_app.post("/api/config/google/connect")
-    async def _api_google_connect():
-        """Run the OAuth consent (opens the operator's browser), cache the token,
-        enable the Google surface, and reload so the tools register. Long-lived:
-        it blocks until the operator approves in the browser (3-min cap)."""
-        try:
-            from mcp_servers.google.auth import run_consent
-        except Exception as e:  # noqa: BLE001
-            return {"ok": False, "error": f"google support unavailable: {e}"}
-        if not (_graph_config and _graph_config.google_client_id and _graph_config.google_client_secret):
-            return {"ok": False, "error": "Set the OAuth client ID + secret first, then connect."}
-        _google_env_from_config()
-        try:
-            email = await asyncio.wait_for(asyncio.to_thread(run_consent), timeout=180)
-        except asyncio.TimeoutError:
-            return {"ok": False, "error": "Timed out waiting for Google consent (3 min). Try again."}
-        except Exception as e:  # noqa: BLE001
-            return {"ok": False, "error": str(e)}
-        # Persist enabled + reload so the managed google MCP server starts and the
-        # tools register without a restart.
-        ok, msg = await asyncio.to_thread(
-            _apply_settings_changes, config={"google": {"enabled": True}}
-        )
-        return {"ok": True, "email": email, "reload": msg if ok else None}
+    # `/api/config/test-discord` (discord plugin) and `/api/config/google/status`
+    # + `/connect` (google plugin) are now mounted by their plugin routers (ADR
+    # 0018/0019), at the same paths — the console Test/Connect buttons are
+    # unchanged.
 
     # --- Setup wizard state -------------------------------------------------
     @fastapi_app.get("/api/config/setup-status")

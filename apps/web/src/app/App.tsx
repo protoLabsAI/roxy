@@ -2,6 +2,7 @@ import {
   Activity,
   BarChart3,
   BookMarked,
+  Database,
   BookOpen,
   Boxes,
   CalendarClock,
@@ -13,14 +14,12 @@ import {
   Loader2,
   MessageSquare,
   PanelRight,
-  Play,
   Plus,
   Save,
   Settings2,
   Target,
   Undo2,
   Trash2,
-  Workflow,
 } from "lucide-react";
 import { useQuery } from "@tanstack/react-query";
 import { useEffect, useRef, useState } from "react";
@@ -32,6 +31,7 @@ import { ActivitySurface } from "../activity/ActivitySurface";
 import { ConfirmDialog } from "./ConfirmDialog";
 import { InboxPanel } from "../inbox/InboxPanel";
 import { ChatSurface } from "../chat/ChatSurface";
+import { KnowledgeStore } from "../knowledge/KnowledgeStore";
 import { PlaybooksSurface } from "../playbooks/PlaybooksSurface";
 import { SettingsSurface } from "../settings/SettingsSurface";
 import { TelemetrySurface } from "../telemetry/TelemetrySurface";
@@ -43,21 +43,23 @@ import { StatusPill } from "./StatusPill";
 import { GoalsPanel } from "./GoalsPanel";
 import { BeadsPanel } from "./BeadsPanel";
 import { SchedulePanel } from "../schedule/SchedulePanel";
-import { RunPanel } from "./RunPanel";
 import { RuntimePanel } from "./RuntimePanel";
 import { SetupWizard } from "../setup/SetupWizard";
 import { runtimeStatusQuery } from "../lib/queries";
 
 // Consolidated nav (heavy grouping): four rail surfaces, each grouped one
 // fanning out to sub-views via an in-surface segmented control.
-type Surface = "chat" | "activity" | "studio" | "knowledge" | "system";
-// Studio = the "make the agent do work" surface, ordered by altitude
-// (ADR 0009): goals (autonomy) → workflows (orchestration) → run (execution).
-type StudioTab = "workflows" | "run";
-type SystemTab = "runtime" | "telemetry" | "settings";
+type Surface = "chat" | "activity" | "studio" | "knowledge" | "system" | "settings";
+// Studio = the workflow authoring/inspection surface. Per ADR 0020 execution is
+// a chat gesture (run subagents/workflows via /<name>), not a surface — so the
+// old "Run" tab is gone and Studio is just Workflows.
+type SystemTab = "runtime" | "telemetry";
 // Activity = the "triggers / events" surface (ADR 0009): what happened (thread),
 // inbound (inbox), and timed (schedule — cron is a trigger, not a work-type).
 type ActivityTab = "thread" | "inbox" | "schedule";
+// Knowledge = what the agent knows (ADR 0020): the searchable knowledge Store
+// (factual memory) + Playbooks (procedural memory). Store leads.
+type KnowledgeTab = "store" | "playbooks";
 // The agent's persistent working memory, grouped in the right sidebar:
 // its notebook, its task board, and its goals.
 type RightPanel = "notes" | "beads" | "goals";
@@ -101,9 +103,9 @@ function useLocalStorageState(key: string, fallback: string) {
 
 export function App() {
   const [surface, setSurface] = useState<Surface>("chat");
-  const [studioTab, setStudioTab] = useState<StudioTab>("workflows");
   const [systemTab, setSystemTab] = useState<SystemTab>("runtime");
   const [activityTab, setActivityTab] = useState<ActivityTab>("thread");
+  const [knowledgeTab, setKnowledgeTab] = useState<KnowledgeTab>("store");
   const [rightPanel, setRightPanel] = useState<RightPanel>("notes");
   // Collapsible/resizable right panel (persisted). Flag is "1"/"" string; width
   // is a px string clamped on read.
@@ -549,6 +551,12 @@ export function App() {
             icon={<Gauge size={18} />}
             onClick={() => setSurface("system")}
           />
+          <RailButton
+            active={surface === "settings"}
+            label="Settings"
+            icon={<Settings2 size={18} />}
+            onClick={() => setSurface("settings")}
+          />
         </aside>
 
         <main className="stage">
@@ -574,15 +582,14 @@ export function App() {
               </button>
             </div>
           ) : null}
-          {surface === "studio" ? (
-            // Orchestration → execution (ADR 0009). Goals (the autonomy layer)
-            // moved to the right sidebar alongside the agent's notes + beads.
+          {surface === "knowledge" ? (
+            // Store (factual memory) + Playbooks (procedural memory) — ADR 0020.
             <div className="stage-subnav">
-              <button className={studioTab === "workflows" ? "active" : ""} onClick={() => setStudioTab("workflows")}>
-                <Workflow size={15} /> Workflows
+              <button className={knowledgeTab === "store" ? "active" : ""} onClick={() => setKnowledgeTab("store")}>
+                <Database size={15} /> Store
               </button>
-              <button className={studioTab === "run" ? "active" : ""} onClick={() => setStudioTab("run")}>
-                <Play size={15} /> Run
+              <button className={knowledgeTab === "playbooks" ? "active" : ""} onClick={() => setKnowledgeTab("playbooks")}>
+                <BookMarked size={15} /> Playbooks
               </button>
             </div>
           ) : null}
@@ -594,9 +601,6 @@ export function App() {
               <button className={systemTab === "telemetry" ? "active" : ""} onClick={() => setSystemTab("telemetry")}>
                 <BarChart3 size={15} /> Telemetry
               </button>
-              <button className={systemTab === "settings" ? "active" : ""} onClick={() => setSystemTab("settings")}>
-                <Settings2 size={15} /> Settings
-              </button>
             </div>
           ) : null}
 
@@ -604,9 +608,7 @@ export function App() {
             <ChatSurface onError={setError} />
           ) : null}
 
-          {surface === "studio" && studioTab === "run" ? <RunPanel /> : null}
-
-          {surface === "studio" && studioTab === "workflows" ? <WorkflowsSurface /> : null}
+          {surface === "studio" ? <WorkflowsSurface /> : null}
 
           {surface === "activity" && activityTab === "thread" ? <ActivitySurface onError={setError} /> : null}
           {surface === "activity" && activityTab === "inbox" ? <InboxPanel /> : null}
@@ -616,8 +618,9 @@ export function App() {
           {surface === "system" && systemTab === "runtime" ? <RuntimePanel /> : null}
 
           {surface === "system" && systemTab === "telemetry" ? <TelemetrySurface /> : null}
-          {surface === "knowledge" ? <PlaybooksSurface onError={setError} /> : null}
-          {surface === "system" && systemTab === "settings" ? <SettingsSurface /> : null}
+          {surface === "knowledge" && knowledgeTab === "store" ? <KnowledgeStore onError={setError} /> : null}
+          {surface === "knowledge" && knowledgeTab === "playbooks" ? <PlaybooksSurface onError={setError} /> : null}
+          {surface === "settings" ? <SettingsSurface /> : null}
         </main>
 
         <aside className="right-panel">

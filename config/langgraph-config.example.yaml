@@ -75,7 +75,14 @@ middleware:
 
 knowledge:
   db_path: /sandbox/knowledge/agent.db
+  # Semantic recall: hybrid FTS5 + vector search (RRF-fused) via embed_model.
+  # Off by default (keyword-only) — turn on once your gateway serves an
+  # embedding model. Degrades to keyword search on embedding outage.
+  embeddings: false
   embed_model: nomic-embed-text
+  # Extract durable facts from a conversation on retirement (aux model) and
+  # consolidate them into the store. Rides the harvest pass (ADR 0021).
+  facts: true
   top_k: 5
 
 # Session memory loading — prior summaries injected into system prompt
@@ -157,6 +164,19 @@ execute_code:
   enabled: false
   timeout: 30
   tools: []
+
+# Tools — fork customization without editing tools/lg_tools.py.
+#   disabled: drop named core tools from the agent (a fork "keeps what it wants"
+#     by listing the rest here; plugins still ADD tools). Live-reloadable.
+#   deferred: withhold tool schemas until the agent searches for them (cuts the
+#     per-turn footprint past ~15 tools). OFF by default.
+tools:
+  disabled: []
+  # - calculator
+  # - daily_log
+  # deferred:
+  #   enabled: false
+  #   keep: []
 
 # React operator console — the beads/notes APIs accept a project path from
 # the (free-text) UI, so the server, not the client, decides which
