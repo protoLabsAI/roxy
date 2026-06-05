@@ -1,6 +1,93 @@
 ## [Unreleased]
 
+## [0.15.0] - 2026-06-05
+
+### Changed
+- **Internal: `_main()`'s inline route handlers moved into `operator_api/*`**
+  (ADR 0023, phase 3 — composition root down to app assembly). Each route group
+  is now a `register_*_routes(app)` function matching the existing
+  `register_operator_routes`, so the handler bodies (which only touch `STATE`)
+  are testable without booting the server:
+  `operator_api/telemetry_routes.py` (`/api/telemetry/*`),
+  `knowledge_routes.py` (`/api/knowledge/search` + `/api/playbooks`),
+  `config_routes.py` (`/api/config*` + `/api/settings*`), and
+  `chat_routes.py` (`/api/chat`, `/api/goal/*`, `/healthz`, OpenAI-compat
+  `/v1/*`). The 21 React-console handler closures also moved out — into
+  `operator_api/console_handlers.py` — finishing the half-done `operator_api/`
+  extraction. Net: **`server.py` went from 3,353 lines to a ~700-line `server/`
+  package composition root** (`_main` is ~430 lines of pure app assembly).
+  Phase 3 is complete; ADR 0023 is fully shipped.
+- **Internal: agent init / builders / reload / settings moved to
+  `server/agent_init.py`** (ADR 0023, phase 2 — final backend extraction).
+  `_init_langgraph_agent`, the ten `_build_*` component builders
+  (knowledge / skills / MCP / plugins / checkpointer / inbox / activity /
+  telemetry / workflow / scheduler), the checkpoint-prune + thread-retire loops,
+  plugin-host wiring, `_reload_langgraph_agent`, and the operator-console
+  settings callbacks (27 functions) now live in their own module.
+  `server/__init__.py` re-exports every name and drops ~1,135 lines — the
+  composition root is now ~1,355 lines (was 3,353 before phase 1). Pure move
+  (1000 tests + a live smoke green: boot exercising every builder, a chat turn,
+  and a config-driven hot reload).
+- **Internal: the chat backend moved to `server/chat.py`** (ADR 0023, phase 2).
+  The LangGraph turn loop — `chat` (Gradio + OpenAI-compat), the streaming
+  `_chat_langgraph_stream` (A2A handler), the shared `_run_turn_stream` event
+  loop, tool-preview/interrupt shaping, and slash-command parsing/execution —
+  now lives in its own module. It imports only neutral modules (no `server`
+  symbols), so there's no import cycle; `server/__init__.py` re-exports every
+  name. Pure move (1000 tests + a live smoke green: non-streaming + streaming
+  turns). `server/__init__.py` drops ~645 lines.
+- **Internal: the A2A surface moved to `server/a2a.py`** (ADR 0023, phase 2).
+  Agent-card building, skill declarations (`_SKILL_SPECS` + `_agent_skills` +
+  `structured_skill_schema`), the per-turn telemetry writer, and the executor
+  terminal hook now live in their own module; `server/__init__.py` re-exports
+  every name so `server.<symbol>` is unchanged. Pure move (1000 tests + a live
+  A2A 1.0 round-trip green). Fork-relevant only if you *monkeypatch*
+  `server._SKILL_SPECS` at runtime — patch `server.a2a._SKILL_SPECS` instead
+  (editing the source list works as before).
+- **`server.py` is now a `server/` package** (ADR 0023, phase 2 prep). The
+  monolith moved to `server/__init__.py` (the composition root) with a
+  `server/__main__.py` entry, so the backends can be extracted into
+  `server/a2a.py`, `server/chat.py`, `server/agent_init.py` next. **Launch it as
+  a module: `python -m server`** (was `python server.py`) — the container
+  entrypoint, eval sweep, and desktop-sidecar build were updated to match.
+  Pure move + the `__file__`→`_bundle_root()` path-anchor fix (the package adds
+  one directory level); `import server` / `from server import X` are unchanged
+  (1000 tests + a full live smoke green: boot, chat turn, A2A 1.0 round-trip).
+- **Internal: `server.py`'s 26 ambient module-globals → an `AppState` container**
+  (ADR 0023, phase 1). Runtime state (graph, stores, registries, scheduler,
+  MCP/plugin state) now lives in `runtime/state.py` as a named, injectable
+  singleton (`STATE`) instead of bare module globals — the foundation for
+  splitting the 3,353-line monolith into focused modules. Zero functional change
+  (1000 tests + a full live smoke green); fork-relevant if you patched
+  `server._<global>` (now `server.STATE.<field>`).
+
+### Changed
+- **Semantic recall is on by default.** `knowledge.embeddings` now defaults to
+  `true` and `embed_model` to `qwen3-embedding` (what the protoLabs gateway
+  serves). The store fuses FTS5 + vector search so it finds paraphrases keyword
+  search misses; the circuit breaker degrades to keyword-only if the gateway
+  can't embed, so it's safe for forks (set `embed_model` to your gateway's, or
+  `knowledge.embeddings: false`).
+
+## [0.14.0] - 2026-06-05
+
+### Fixed
+- **Semantic-recall embeddings were non-functional against a real gateway**
+  (found by a full knowledge-store smoke test). `create_embed_fn` built
+  `OpenAIEmbeddings` with its default client-side tiktoken tokenization, which
+  posts `input` as int arrays — a LiteLLM/vLLM gateway rejects that with a 422
+  ("input should be a valid string"). Now passes `check_embedding_ctx_length=
+  False` so the raw string is sent. Also: the default `embed_model`
+  (`nomic-embed-text`) isn't what every gateway serves (the protoLabs gateway
+  serves `qwen3-embedding`) — documented that `embed_model` is gateway-specific.
+  Verified live: hybrid search now returns a fact via a paraphrased query that
+  keyword search misses.
+
 ### Added
+- **Docs: "Memory & the knowledge store"** (`docs/explanation/`) — the store, the
+  three memory types (semantic facts / episodic summaries / procedural
+  playbooks), write paths + the reasoning guardrail, retrieval, and how to turn
+  on semantic recall (with the gateway-model caveat).
 - **Activity is a provenance feed, not a second chat** (ADR 0022). Every
   reactive turn is tagged with *what triggered it* (scheduled job / webhook /
   inbox source / sister-agent / your reply) — the backend tracked this `origin`

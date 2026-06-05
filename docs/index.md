@@ -1,9 +1,9 @@
 ---
 layout: home
 hero:
-  name: protoAgent
-  text: LangGraph + A2A template for protoLabs agents
-  tagline: Clone. Run. Walk the wizard. Chat. Fork when you're ready to ship.
+  name: Roxy
+  text: ProtoMaker portfolio manager
+  tagline: Monitors and unblocks a portfolio of ProtoMaker workspaces — watches boards, flags stalls, takes the smallest unblocking action. Read-only on code.
   actions:
     - theme: brand
       text: Spin up your first agent
