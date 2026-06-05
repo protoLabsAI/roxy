@@ -93,7 +93,12 @@ FIELDS: list[Field] = [
     # ── Knowledge / memory ───────────────────────────────────────────────────
     Field("knowledge.top_k", "knowledge_top_k", "Knowledge recall top-k", "number", "Knowledge",
           minimum=1),
-    Field("knowledge.embed_model", "embed_model", "Embedding model", "string", "Knowledge"),
+    Field("knowledge.embeddings", "knowledge_embeddings", "Semantic recall (embeddings)", "bool", "Knowledge",
+          "Hybrid FTS5 + vector search via the embedding model (RRF-fused). Off = "
+          "keyword-only. Needs the gateway to serve the embedding model; falls back "
+          "to keyword search on outage.", restart=True),
+    Field("knowledge.embed_model", "embed_model", "Embedding model", "string", "Knowledge",
+          "Gateway alias used when semantic recall is on."),
     Field("skills.top_k", "skills_top_k", "Skill recall top-k", "number", "Knowledge", minimum=1),
     Field("checkpoint.db_path", "checkpoint_db_path", "Conversation history DB", "string", "Knowledge",
           "SQLite path for per-session chat history (survives restarts). Blank = in-memory.",
@@ -107,6 +112,9 @@ FIELDS: list[Field] = [
           restart=True),
     Field("checkpoint.harvest_enabled", "checkpoint_harvest_enabled", "History: harvest to knowledge", "bool",
           "Knowledge", "Summarize a session into the searchable knowledge base before pruning/deleting it."),
+    Field("knowledge.facts", "knowledge_facts", "Extract semantic facts", "bool", "Knowledge",
+          "On session retirement, also distil durable facts (aux model) and "
+          "consolidate them into the store. Rides the harvest pass."),
 
     # ── Middleware toggles ───────────────────────────────────────────────────
     Field("middleware.knowledge", "knowledge_middleware", "Knowledge middleware", "bool", "Middleware"),
@@ -123,28 +131,12 @@ FIELDS: list[Field] = [
     Field("auth.token", "auth_token", "A2A auth token", "secret", "Identity",
           "Bearer token for the A2A endpoint. Stored in secrets.yaml; applies live."),
 
-    # ── Discord (ADR 0015 + 0016) ────────────────────────────────────────────
-    Field("discord.enabled", "discord_enabled", "Enable Discord", "bool", "Discord",
-          "Inbound DM gateway. Needs the bot token below; reconnects live on save."),
-    Field("discord.bot_token", "discord_bot_token", "Bot token", "secret", "Discord",
-          "Discord bot token (Developer Portal → your app → Bot → Reset Token). Stored "
-          "in secrets.yaml. Use “Test connection” to verify before saving."),
-    Field("discord.admin_ids", "discord_admin_ids", "Admin user IDs", "string_list", "Discord",
-          "Discord user IDs allowed to DM the bot (one per line). Empty = anyone."),
+    # Discord's Settings group is now declared by the discord plugin's manifest
+    # (ADR 0019) and rendered via the plugin-fields path in build_schema.
 
-    # ── Google (ADR 0017) ────────────────────────────────────────────────────
-    # The OAuth client lives here; "Connect Google" (a button, not a field) runs
-    # the consent flow and caches the token. Editing client id/secret is rare —
-    # most operators use the wizard/Settings "Connect Google" button.
-    Field("google.enabled", "google_enabled", "Enable Google", "bool", "Google",
-          "Gmail + Calendar tools. Needs the OAuth client below + a completed "
-          "“Connect Google”. Reconnects the tools live on save."),
-    Field("google.client_id", "google_client_id", "OAuth client ID", "string", "Google",
-          "From your Google Cloud “Desktop app” OAuth client."),
-    Field("google.client_secret", "google_client_secret", "OAuth client secret", "secret", "Google",
-          "From the same OAuth client. Stored in secrets.yaml."),
-    Field("google.tz", "google_tz", "Timezone (IANA)", "string", "Google",
-          "e.g. America/Los_Angeles — sets the day bounds for “today”. Blank = UTC."),
+    # Google's Settings group is now declared by the google plugin's manifest
+    # (ADR 0019) and rendered via the plugin-fields path in build_schema. The
+    # "Connect Google" button (consent flow) is a console affordance, not a field.
 
     # ── Runtime (restart) ────────────────────────────────────────────────────
     Field("runtime.autostart_on_boot", "autostart_on_boot", "Autostart on boot", "bool", "Runtime",
@@ -155,8 +147,58 @@ _BY_KEY = {f.key: f for f in FIELDS}
 _SECRET_KEYS = {f.key for f in FIELDS if f.type == "secret"}
 
 
+def _plugin_field_specs():
+    """Plugin-declared settings fields (ADR 0019) as (schema, full_key, key, spec)
+    — ``full_key`` is the dotted YAML path ``<section>.<key>`` the save writes to.
+    Best-effort; empty when no plugin declares settings."""
+    try:
+        from graph.plugins.pconfig import live_plugin_config_schemas
+
+        out = []
+        for sch in live_plugin_config_schemas():
+            for spec in sch.settings:
+                key = spec.get("key")
+                if key:
+                    out.append((sch, f"{sch.section}.{key}", key, spec))
+        return out
+    except Exception:  # noqa: BLE001 — plugin discovery is best-effort
+        return []
+
+
+def _plugin_group(sch, spec) -> str:
+    return spec.get("group") or sch.section.replace("_", " ").title()
+
+
+# Settings categories (ADR 0020) — fold the flat sections into a small,
+# navigable taxonomy so the surface isn't one long scroll. Order here is the
+# order the console renders the category sub-nav. Unknown sections (notably
+# plugin-contributed ones, ADR 0019) default to "Integrations".
+_CATEGORY_ORDER = ["Agent", "Behavior", "Memory", "Integrations", "System"]
+_SECTION_CATEGORY = {
+    "Identity": "Agent",
+    "Model": "Agent",
+    "Routing": "Agent",
+    "Compaction": "Behavior",
+    "Caching": "Behavior",
+    "Goal mode": "Behavior",
+    "Tools": "Behavior",
+    "Knowledge": "Memory",
+    "Middleware": "System",
+    "Runtime": "System",
+    # Discord / Google / other plugin sections → "Integrations" (the default).
+}
+
+
+def _category_for(section: str) -> str:
+    return _SECTION_CATEGORY.get(section, "Integrations")
+
+
 def build_schema(config, *, model_options: list[str] | None = None) -> list[dict[str, Any]]:
     """Return the settings schema grouped by section, with current values.
+
+    Each group carries a ``category`` (ADR 0020) so the console can present a
+    category sub-nav instead of a flat scroll. Groups are ordered by category
+    (``_CATEGORY_ORDER``), then by their first appearance in ``FIELDS``.
 
     Secrets report ``value: ""`` plus ``is_set`` rather than echoing the secret.
     """
@@ -184,15 +226,67 @@ def build_schema(config, *, model_options: list[str] | None = None) -> list[dict
         if f.maximum is not None:
             entry["maximum"] = f.maximum
         groups.setdefault(f.section, {"section": f.section, "fields": []})["fields"].append(entry)
-    return list(groups.values())
+
+    # Plugin-declared settings fields (ADR 0019) — value from config.plugin_config,
+    # rendered + saved through the same generic Settings surface (key = dotted
+    # YAML path, so apply_updates_to_yaml + secret routing handle it for free).
+    plugin_cfg = getattr(config, "plugin_config", {}) or {}
+    for sch, full_key, key, spec in _plugin_field_specs():
+        section_cfg = plugin_cfg.get(sch.section) or sch.defaults
+        current = section_cfg.get(key)
+        ftype = spec.get("type", "string")
+        group = _plugin_group(sch, spec)
+        entry = {
+            "key": full_key,
+            "label": spec.get("label", key),
+            "type": ftype,
+            "section": group,
+            "description": spec.get("description", ""),
+            "restart": bool(spec.get("restart", False)),
+            "options": list(spec.get("options", []) or []),
+            "default": _jsonable(sch.defaults.get(key)),
+        }
+        if ftype == "secret":
+            entry["value"] = ""
+            entry["is_set"] = bool(current)
+        else:
+            entry["value"] = _jsonable(current)
+        if spec.get("minimum") is not None:
+            entry["minimum"] = spec["minimum"]
+        if spec.get("maximum") is not None:
+            entry["maximum"] = spec["maximum"]
+        groups.setdefault(group, {"section": group, "fields": []})["fields"].append(entry)
+
+    out = list(groups.values())
+    # Insertion order = first appearance in FIELDS (core), then plugins.
+    section_pos = {g["section"]: i for i, g in enumerate(out)}
+    for g in out:
+        g["category"] = _category_for(g["section"])
+
+    def _sort_key(g: dict) -> tuple[int, int]:
+        cat = g["category"]
+        cat_rank = _CATEGORY_ORDER.index(cat) if cat in _CATEGORY_ORDER else len(_CATEGORY_ORDER)
+        return (cat_rank, section_pos[g["section"]])
+
+    out.sort(key=_sort_key)
+    return out
 
 
 def validate_flat(updates: dict[str, Any]) -> tuple[bool, str | None]:
     """Light per-field validation against the registry before persisting."""
+    plugin_keys = {full: spec for _, full, _, spec in _plugin_field_specs()}
     for key, val in updates.items():
         f = _BY_KEY.get(key)
         if f is None:
-            return False, f"unknown setting: {key}"
+            spec = plugin_keys.get(key)
+            if spec is None:
+                return False, f"unknown setting: {key}"
+            t = spec.get("type", "string")
+            if t == "bool" and not isinstance(val, bool):
+                return False, f"{key} must be a boolean"
+            if t == "number" and (not isinstance(val, (int, float)) or isinstance(val, bool)):
+                return False, f"{key} must be a number"
+            continue
         if f.type == "bool" and not isinstance(val, bool):
             return False, f"{key} must be a boolean"
         if f.type == "number":

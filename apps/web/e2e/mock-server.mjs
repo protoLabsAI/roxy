@@ -25,6 +25,7 @@ import {
   settingsRestartRequired,
   SLASH_COMMANDS,
   PLAYBOOKS,
+  KNOWLEDGE_CHUNKS,
   SUBAGENTS,
   TELEMETRY_INSIGHTS,
   TELEMETRY_SUMMARY,
@@ -113,6 +114,11 @@ function handleApiGet(pathname) {
       return { enabled: true, insights: TELEMETRY_INSIGHTS };
     case "/api/playbooks":
       return { enabled: true, playbooks: PLAYBOOKS };
+    case "/api/knowledge/search":
+      return {
+        enabled: true, query: "", results: KNOWLEDGE_CHUNKS,
+        stats: { total: KNOWLEDGE_CHUNKS.length },
+      };
     default:
       return null;
   }
@@ -191,7 +197,7 @@ const server = createServer(async (req, res) => {
     // Push an activity.message periodically so both the unread badge (while off
     // the surface) and live append (while on it) are deterministically testable.
     const t = setInterval(() => {
-      res.write('event: activity.message\ndata: {"text":"live activity ping"}\n\n');
+      res.write('event: activity.message\ndata: {"text":"live activity ping","origin":"scheduler","trigger":"heartbeat"}\n\n');
       res.write('event: inbox.item\ndata: {"id":99,"priority":"next","source":"mock","text":"live inbox ping"}\n\n');
     }, 500);
     req.on("close", () => clearInterval(t));

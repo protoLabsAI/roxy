@@ -87,9 +87,25 @@ SECRETS_YAML_PATH = _LIVE_CONFIG_DIR / "secrets.yaml"
 SECRET_PATHS: tuple[tuple[str, str], ...] = (
     ("model", "api_key"),
     ("auth", "token"),
-    ("discord", "bot_token"),
-    ("google", "client_secret"),
+    # The discord (`discord.bot_token`) and google (`google.client_secret`)
+    # secrets are now declared by their plugin manifests and added dynamically
+    # via secret_paths() (ADR 0019).
 )
+
+
+def secret_paths() -> tuple[tuple[str, str], ...]:
+    """Base ``SECRET_PATHS`` plus the (section, key) pairs each enabled plugin
+    declares as secrets (ADR 0019). Used by the split/strip logic so a plugin
+    secret is routed to ``secrets.yaml`` exactly like the model API key."""
+    try:
+        from graph.plugins.pconfig import live_plugin_config_schemas
+
+        extra = tuple(
+            (sch.section, key) for sch in live_plugin_config_schemas() for key in sch.secrets
+        )
+    except Exception:  # noqa: BLE001 — plugin discovery is best-effort
+        extra = ()
+    return SECRET_PATHS + extra
 
 # Setup wizard state.
 # Presence of this (empty) marker file = wizard has been run and the
@@ -188,7 +204,7 @@ def config_to_dict(config: LangGraphConfig) -> dict[str, Any]:
     semantics in ``split_secret_updates``, a save that echoes the blank back
     leaves the stored secret intact.
     """
-    return {
+    d: dict[str, Any] = {
         "model": {
             "provider": config.model_provider,
             "name": config.model_name,
@@ -239,17 +255,8 @@ def config_to_dict(config: LangGraphConfig) -> dict[str, Any]:
         "auth": {
             "token": "",
         },
-        "discord": {
-            "enabled": config.discord_enabled,
-            "bot_token": "",  # redacted — secret, mirrors api_key / auth.token
-            "admin_ids": list(config.discord_admin_ids),
-        },
-        "google": {
-            "enabled": config.google_enabled,
-            "client_id": config.google_client_id,
-            "client_secret": "",  # redacted — secret
-            "tz": config.google_tz,
-        },
+        # `discord` and `google` are now plugin sections (ADR 0019) — surfaced
+        # via the plugin_config loop below, not hardcoded blocks.
         "runtime": {
             "autostart_on_boot": config.autostart_on_boot,
         },
@@ -257,6 +264,24 @@ def config_to_dict(config: LangGraphConfig) -> dict[str, Any]:
             "allowed_dirs": list(config.operator_allowed_dirs),
         },
     }
+    # Plugin-declared sections (ADR 0019) — reflect the PASSED config's resolved
+    # plugin_config (not a re-discovery), with declared secrets redacted
+    # (blank-means-unchanged, like api_key). A default config has none.
+    plugin_cfg = getattr(config, "plugin_config", {}) or {}
+    if plugin_cfg:
+        try:
+            from graph.plugins.pconfig import live_plugin_config_schemas
+
+            secrets_by_section = {s.section: set(s.secrets) for s in live_plugin_config_schemas()}
+        except Exception:  # noqa: BLE001
+            secrets_by_section = {}
+        for section, vals in plugin_cfg.items():
+            redacted = dict(vals)
+            for skey in secrets_by_section.get(section, set()):
+                if skey in redacted:
+                    redacted[skey] = ""
+            d[section] = redacted
+    return d
 
 
 def apply_updates_to_yaml(doc: Any, updates: dict[str, Any]) -> Any:
@@ -302,7 +327,7 @@ def split_secret_updates(config: dict[str, Any]) -> tuple[dict[str, Any], dict[s
 
     main = copy.deepcopy(config)
     secrets: dict[str, Any] = {}
-    for section, key in SECRET_PATHS:
+    for section, key in secret_paths():
         sect = main.get(section)
         if not isinstance(sect, dict) or key not in sect:
             continue
@@ -323,7 +348,7 @@ def strip_secrets_from_doc(doc: Any) -> Any:
     YAML still carries an ``api_key`` (or a hand-edit reintroduces one), every
     save scrubs it so the tracked file converges to secret-free.
     """
-    for section, key in SECRET_PATHS:
+    for section, key in secret_paths():
         sect = doc.get(section) if hasattr(doc, "get") else None
         if isinstance(sect, dict) and key in sect:
             del sect[key]
@@ -578,6 +603,18 @@ def validate_model_connection(
         detail = ""
     if not detail:
         detail = (resp.text or "")[:300]
+    # Sanitize: gateways (e.g. LiteLLM) dump the masked key, a token *hash*, and
+    # internal table names into auth errors — never echo those into the setup UI.
+    # Keep the leading human-readable cause, drop everything from the first
+    # secret-ish marker on, and cap the length.
+    import re as _re
+    detail = _re.split(
+        r"\s*(?:Received API Key|Key Hash|Unable to find token|Token=)",
+        detail, maxsplit=1,
+    )[0].strip().rstrip(".,")
+    detail = detail[:200]
+    if resp.status_code in (401, 403) and not detail:
+        detail = "authentication failed — check the API key"
     return False, f"HTTP {resp.status_code}: {detail}" if detail else f"HTTP {resp.status_code}"
 
 

@@ -1,5 +1,337 @@
 ## [Unreleased]
 
+### Added
+- **Activity is a provenance feed, not a second chat** (ADR 0022). Every
+  reactive turn is tagged with *what triggered it* (scheduled job / webhook /
+  inbox source / sister-agent / your reply) — the backend tracked this `origin`
+  on the A2A metadata but dropped it before the UI, so Activity just showed
+  `agent: <text>`. Now `origin`/`trigger`/`priority` ride `TurnOutcome`, land in
+  a small `activity` log, and the console renders a timeline where each entry
+  shows its trigger badge + time + priority, openable to continue. Answers "why
+  did the agent just do that?" at a glance.
+
+### Fixed
+- **Inbox `now`-fire was silently broken since the A2A 1.0 migration.** The
+  inbox→Activity fire self-POSTed with the retired 0.3 wire shape (`message/send`,
+  `role: "user"`, params-level `contextId`, no `A2A-Version` header), which
+  a2a-sdk 1.1 rejects with `-32601`/`-32602` — and the fire reported success
+  because a JSON-RPC error rides an HTTP 200. So `now`-priority inbox items never
+  reached the agent. Migrated to the 1.0 shape (matching the scheduler's fire)
+  and the success check now inspects the JSON-RPC error. Found by the Activity
+  audit; verified live (a `now` item now fires and lands in the feed).
+
+### Added
+- **`fact_recall` eval** — locks the new semantic-fact bucket: a `domain="fact"`
+  chunk (what the harvest extractor produces) is passively recalled by the
+  KnowledgeMiddleware and surfaced in the answer. Tracked alongside the existing
+  recall cases (ADR 0012). The hybrid-vs-keyword recall comparison runs via
+  `evals.sweep` with `knowledge.embeddings` on (once the gateway serves an
+  embedding model).
+
+### Fixed
+- **`<prior_sessions>` can no longer leak reasoning; one loader, not two** (ADR
+  0021). The persisted session files (injected each turn as `<prior_sessions>`
+  for cross-session recency) stored raw assistant content — so the model's
+  `<scratch_pad>` could ride into later prompts. Now stripped at the write
+  source *and* at read (defensive for files written by older builds). The two
+  copy-pasted loaders in `MemoryMiddleware` and `KnowledgeMiddleware` are
+  collapsed into a single `load_prior_sessions` (the duplication the code itself
+  lamented). `<prior_sessions>` is kept — it's the only *immediate* cross-session
+  recency the checkpointer/harvest don't provide.
+
+### Added
+- **Semantic fact extraction — the memory upgrade** (ADR 0021). The session-end
+  pass (`conversation_harvest`) now does both halves: the episodic summary *and*
+  a semantic pass that distils **durable facts** (aux model — user preferences,
+  decisions, stable facts about their projects), consolidates them (skips
+  near-duplicates already in the store), and persists them as `domain="fact"`.
+  Importance-gated in the prompt — a chatty turn with nothing durable yields
+  nothing. Replaces the removed raw per-turn dump with *extract, don't dump;
+  background, not hot-path*. Gated by `knowledge.facts` (default on; rides the
+  harvest). New `graph/memory_facts.py`.
+- **Knowledge chunks carry a `namespace` dimension.** Facts (and any chunk) can
+  be scoped to a per-project/owner namespace, so multi-project scoping (ADR 0007)
+  is a later *filter*, not a schema migration. Additive nullable column with an
+  online migration for existing DBs; `add_chunk`/`add_finding`/`list_chunks` take
+  `namespace`, plus a precise `delete_by_id` (backs fact consolidation).
+- **Semantic recall: the dormant embeddings layer is now wired** (ADR 0021). The
+  `HybridKnowledgeStore` (FTS5 + vector search, RRF-fused, with an embedding
+  circuit breaker) and the `embed_model` config existed but were connected to
+  nothing — knowledge recall was keyword-only. A new `knowledge.embeddings` flag
+  (default **off**) flips `_build_knowledge_store` to the hybrid store with an
+  `embed_fn` wired to the gateway (`graph.llm.create_embed_fn`, same OpenAI-compat
+  endpoint + WAF-safe UA as the chat model). Off → keyword-only (unchanged); on →
+  hybrid semantic + keyword. Any failure degrades to FTS5, never KB-less, and the
+  breaker handles runtime embedding outages. Exposed in Settings → Memory.
+
+### Fixed
+- **Knowledge store no longer fills with raw reasoning** (ADR 0021). The memory
+  middleware dumped *every* assistant turn into the knowledge base — raw,
+  truncated at 2000 chars, with the model's internal `<scratch_pad>` reasoning
+  intact — which the retrieval layer then recycled into later prompts. That
+  per-turn dump is removed (conversation knowledge is captured by the summarized,
+  scratch_pad-stripped `conversation_harvest` on thread retirement instead). A
+  guardrail at the store's single write chokepoint (`KnowledgeStore.add_chunk`)
+  now strips `<scratch_pad>`/`<think>` from *every* writer defensively — internal
+  reasoning can never reach the store again. Regression tests added.
+- **Settings is its own rail surface; category sub-nav no longer overlaps the
+  fields.** The category sub-nav (added with the Settings regroup) landed in the
+  `.stage-panel` grid's `1fr` content row, so it stretched over the fields. Gave
+  the Settings panel its own `auto auto 1fr` grid (header · sub-nav · scrolling
+  body) and promoted **Settings out of System into a top-level rail item** (its
+  own view), so it no longer competes with System's sub-nav. System is now
+  Runtime · Telemetry.
+
+### Added
+- **Knowledge surface = searchable Store + Playbooks** (ADR 0020). The Knowledge
+  rail was mislabeled — it showed only Playbooks while the actual knowledge base
+  (the `knowledge/store.py` FTS5 chunks: findings, daily-log, harvested sessions,
+  operator notes that feed `<learned_skills>`) was unbrowsable. Knowledge now has
+  two sub-tabs: **Store** (a searchable view, default) and **Playbooks**. New
+  read-only `GET /api/knowledge/search?q=…` endpoint (empty `q` → most-recent
+  chunks; non-empty → FTS5 search) backs the Store view. Also a debugging window
+  into "why did it recall that?".
+- **Subagents are runnable as chat slash commands** (ADR 0020). A message like
+  `/researcher find the latest on X` runs the named subagent and returns its
+  output — the composer analogue of the `task` tool, so "run a worker" is a
+  gesture, not a separate surface. Every registered subagent (built-in + plugin)
+  is offered in the `/` autocomplete alongside `/goal` and the workflow
+  commands. A workflow of the same name wins; a bare `/<subagent>` shows a usage
+  hint; an unknown `/name` falls through to a normal turn. First step toward
+  collapsing Studio to Workflows-only (the Run tab becomes redundant).
+
+### Changed
+- **Settings regrouped into 5 categories** (ADR 0020). The Settings surface was a
+  flat ~12-section scroll mixing model config, cache TTLs, middleware toggles, and
+  plugin integrations. Sections now fold into a category sub-nav — **Agent**
+  (Identity · Model · Routing), **Behavior** (Compaction · Caching · Goal mode ·
+  Tools), **Memory** (Knowledge), **Integrations** (Discord · Google · plugins),
+  **System** (Middleware · Runtime). The schema (`build_schema`) tags each group
+  with a `category` and orders them; plugin-contributed sections default to
+  Integrations. Pure reorganization — no field added or removed.
+- **Studio is now Workflows-only; the Run tab is gone** (ADR 0020). The Studio →
+  Run panel was a forms-based way to launch a subagent manually — redundant now
+  that subagents (and workflows) run as chat slash commands. Studio's rail lands
+  directly on Workflows (authoring/inspection); to *run* a worker, type
+  `/<subagent>` in chat. Removes `RunPanel` + the Studio sub-nav.
+- **Console loading screen: better-styled logo (matches ORBIS).** The launch
+  brand splash (`IntroSplash`) and cold-start `BootGate` rendered the bot mark
+  as a static `<img>` in the brand-default violet `#7c3aed` — muddy on the dark
+  background. Ported ORBIS's inline `ProtoLabsIcon` component (variants
+  `flat`/`outline`/`white`, plus a `decorative` a11y prop) and switched both
+  screens to the `outline` variant in the lavender chrome accent `#9b87f2`, so
+  the mark is a crisp inline SVG that pops against the chrome. Wordmark + glow
+  unchanged. (Topbar `brand-mark` + favicon still use the static asset — a
+  follow-up if we want full consistency.)
+
+## [0.13.2] - 2026-06-04
+
+### Fixed
+- **Eval `ask()` capped every turn at 30s — slow cases ReadTimeout'd.** A2A 1.0's
+  non-streaming `SendMessage` *blocks* until the task is terminal (the 0.3
+  `message/send` returned immediately and the client polled), but `ask()` still
+  built its httpx client with a fixed `timeout=30` — so any turn longer than 30s
+  (`web_search`, subagent delegation) raised `ReadTimeout` even when the case
+  budgeted 90–300s. The POST now uses the call's `timeout_s`, and a client-side
+  timeout returns a clean `state="timeout"` instead of a raw exception. Verified
+  live: `research_delegation` now passes at ~92s (was a 30s timeout). Regression
+  test pins the constructed timeout.
+- **Eval harness spoke the retired A2A 0.3 wire shape — every case failed.** The
+  A2A 1.0 migration (ADR 0014) moved the server to `a2a-sdk` (≥1.1), which serves
+  proto method names (`SendMessage`/`GetTask`/`SendStreamingMessage`/`CancelTask`),
+  requires an `A2A-Version: 1.0` request header (a missing header is read as 0.3,
+  so the 1.0 methods 404 with `-32601`), and emits untyped parts (`{"text": …}`,
+  no `kind`) with `TASK_STATE_*` states. `evals/client.py` + `evals/runner.py`
+  were left on the 0.3 shape (`message/send`, `role: "user"`, `{"kind": "text"}`,
+  no version header), so `python -m evals.runner` failed *every* case with
+  "method not found". Migrated the eval client/runner to the 1.0 wire shape
+  (header + proto method names + `ROLE_USER` + untyped parts + `TASK_STATE_*`
+  normalization + the streaming `statusUpdate`/`artifactUpdate` oneof frames +
+  `contextId` moved inside the message, where 1.0's `SendMessageRequest` expects
+  it — at params level it's a `-32602`, which would have broken goal-mode cases).
+  Regression test (`tests/test_eval_client_a2a_1_0.py`) drives the real client
+  against an in-process `a2a-sdk` app and pins that the legacy shape is rejected.
+- **Plugins: multi-module support.** The plugin loader now imports a plugin's
+  `__init__.py` as a package — registered in `sys.modules` before exec with a
+  sanitized module name — so a plugin can have sibling modules and use relative
+  imports (`from .tools import …`). Previously a hyphenated plugin id produced an
+  illegal module name and the relative import failed at load. Regression test added.
+- **Discord "Test connection" ignored the entered token** (always reported "bot
+  token is empty", even for a valid token). The discord plugin route's request
+  model was a *function-local* Pydantic class, but the plugin module uses
+  `from __future__ import annotations` (PEP 563) — so the annotation is a string
+  FastAPI resolves via `get_type_hints()` against *module globals*, where the
+  local class doesn't exist; FastAPI couldn't build the body model and silently
+  dropped the body. Moved `DiscordProbe` to module level. (Lesson for plugin
+  routes: with PEP 563, body models must be module-level.) Regression test added.
+
+## [0.13.1] - 2026-06-04
+
+### Fixed
+- **First-run setup left plugin routes unmounted until restart.** Plugin routers
+  (e.g. `POST /api/config/test-discord`, `GET /api/config/google/status`,
+  `POST /api/config/google/connect`) mount once at process init — but on a fresh
+  pre-setup boot the graph-build path returned early *before* loading plugins, so
+  nothing mounted, and completing setup via the wizard reloaded the graph without
+  mounting them. Result: a brand-new agent's **Connect Discord / Connect Google /
+  Test-connection buttons 404'd during first-run setup** until the app was
+  relaunched. Plugins are now loaded for their routes + surfaces even without a
+  compiled graph (they need no graph; they're how the wizard *configures* the
+  agent), so the routes are live from boot. Found by driving a fresh agent through
+  setup against a live server.
+- **Model-connection error leaked a token hash into the setup UI.** A bad-but-
+  well-formed API key made the gateway (LiteLLM) return a 401 whose body included
+  the masked key, an internal **token hash**, and table names — surfaced verbatim
+  in the wizard's "Test connection" error. The validator now keeps the actionable
+  cause (e.g. "Authentication Error, Invalid proxy server token passed") and
+  strips everything from the first secret-ish marker on, so no token/hash/internal
+  detail reaches the UI.
+
+## [0.13.0] - 2026-06-04
+
+### Docs
+- **agent-card.md corrected against the live card.** Introspected a running
+  `/.well-known/agent-card.json` (and the `protolabs_a2a` package): the reference
+  now shows the real A2A 1.0 proto shape — `supportedInterfaces` (not a top-level
+  `url`), the correct `provider` (`protoLabs AI` / `https://protolabs.ai`), the
+  nested `securitySchemes` (`apiKeySecurityScheme` / `httpAuthSecurityScheme`) +
+  `securityRequirements`, and all four declared extensions (`cost-v1`,
+  `confidence-v1`, `worldstate-delta-v1`, `tool-call-v1`). Dropped the stale
+  hand-written literal (flat `securitySchemes`, `stateTransitionHistory`).
+- **Docs audit & refresh (24 files).** Swept the docs against current code after
+  the Discord/Google→plugins migration and the desktop fixes. Highlights:
+  Discord/Google now documented as **first-party plugins** (config lives in
+  plugin-declared `discord:` / `google:` sections, not typed fields; disable via
+  `plugins.disabled`); `register_mcp_server` + the `--mcp-plugin <id>` frozen
+  entrypoint + `host.config()`/`host.apply_settings()` added to the plugins guide;
+  the plugin contribution count corrected (five → six) across guide + architecture
+  + README. Reference fixes: `configuration.md` gained `tools.disabled`,
+  `plugins.disabled`, the plugin-config model, `routing.aux_model`, and the
+  `checkpoint` / `workflows` sections, and the **filesystem** defaults corrected
+  (now on-by-default + `run_requires_approval`); `environment-variables.md` dropped
+  the non-existent `GRADIO_SERVER_*` vars and the wrong "not set by the template"
+  claims, and documents the Discord/Google env fallbacks + `PROTOAGENT_*` paths;
+  `starter-tools.md` recounted + added `request_user_input`/beads and the
+  discord-as-plugin note; `agent-card.md` renamed `_build_agent_card` →
+  `_build_agent_card_proto` and reflects the four default extensions. Fixed broken
+  fork/deploy instructions (the removed `github.repository` guard → `RELEASE_ENABLED`
+  variable; dropped the `sed`-rename anti-guidance) and tutorial drift
+  (`WORKER_CONFIG`→`RESEARCHER_CONFIG`, `SYSTEM_PROMPT`→`SOUL.md`, `gh_pr_view`→
+  `github_get_pr`). Documented the desktop non-streaming `/api/chat` chat contract
+  and the frozen build's plugins/tools bundling in the React+Tauri guide.
+
+### Fixed
+- **Desktop chat showed a blank assistant reply (no response).** WKWebView (the
+  Tauri shell) doesn't deliver a `text/event-stream` body through `fetch()` at all
+  — neither `body.getReader()` nor a buffered `clone().text()` fallback returns the
+  bytes — so the streaming `/a2a` turn rendered as an empty assistant bubble even
+  though the agent replied. In the desktop shell the chat now uses the
+  non-streaming `/api/chat` endpoint (ordinary JSON, which WKWebView handles fine —
+  it's how the rest of the console already talks to the sidecar): one request, full
+  reply, rendered once. Browsers keep the token-streaming `/a2a` path (with
+  tool-call cards). Found by building + driving the desktop app directly.
+- **Discord plugin failed to load in the frozen desktop app (`No module named
+  'tools.discord_tools'`).** Migrating Discord to a plugin (#513) removed the only
+  static import of `tools.discord_tools` from `tools/lg_tools.py`, so PyInstaller's
+  import-scan no longer saw it (the plugin imports it, but plugins are loaded by
+  file path — invisible to the scan) and it was dropped from the bundle. The
+  sidecar build now collects the whole `tools` package, so plugin-only tool
+  imports resolve in the frozen app. Caught by running the frozen binary directly;
+  the Google plugin was unaffected (its modules are collected via `mcp_servers`).
+
+### Added
+- **Plugins can contribute managed MCP servers — `register_mcp_server` (ADR
+  0019, #509).** A plugin ships an **MCP server the agent connects to** via a
+  factory `factory(config) -> entry | None` called at every graph build — return
+  an entry when the server should run, `None` when it shouldn't, so it comes and
+  goes with config. Its presence activates MCP even when `mcp.enabled` is off, and
+  a same-named entry replaces a configured one. For frozen desktop builds (no
+  `python` on PATH), a generic `--mcp-plugin <id>` shim re-invokes the binary and
+  runs the plugin's `mcp_main()`. This is what lets the Google surface ship its
+  OAuth-gated server as a plugin. The plugin host also gained `host.config()` (the
+  live config) + `host.apply_settings(patch)` (persist + reload) so a plugin route
+  can read live config and apply a config change.
+
+### Changed
+- **Google ingress is now a first-party plugin (`plugins/google`, #509).** The
+  Gmail/Calendar managed MCP server, its OAuth-gated launch, the `GET
+  /api/config/google/status` + `POST /api/config/google/connect` routes, and the
+  `google` config/secrets/Settings group all moved out of `server.py`,
+  `tools/mcp_tools.py`, and the core config layer into a self-contained plugin
+  (ADR 0019), built on the new `register_mcp_server`. Behaviour is unchanged — the
+  Settings group, wizard step, Connect button and live-reconnect-on-save all work
+  as before — but a fork can now **disable Google entirely** with `plugins: {
+  disabled: [google] }`, or swap in its own integration, with no core edit. No
+  config migration: the plugin claims the existing top-level `google` section. The
+  desktop sidecar now bundles the `plugins/` tree so the Discord + Google plugins
+  load in the frozen app.
+- **Discord ingress is now a first-party plugin (`plugins/discord`, #509).** The
+  Discord DM gateway, the `POST /api/config/test-discord` route, the outbound
+  `discord_*` tools, and the `discord` config/secrets/Settings group all moved
+  out of `server.py` + the core config layer into a self-contained plugin (ADR
+  0018/0019). Behaviour is unchanged — the Settings group, wizard step, Test
+  button and live-reconnect-on-save all work as before — but a fork can now
+  **disable Discord entirely** with `plugins: { disabled: [discord] }` (drops the
+  surface *and* the tools), or swap in its own ingress plugin, with no core edit.
+  No config migration needed: the plugin claims the existing top-level `discord`
+  section, so saved tokens/admin IDs keep working.
+
+### Added
+- **Plugin host context — `registry.host` (#509 prereq).** A plugin surface/route
+  can now reach the **agent invoke** + the **event bus** (`host.invoke(prompt,
+  session_id)` / `host.publish` / `host.subscribe`) — host services it can't build
+  itself. The server populates a process singleton before any surface starts. The
+  last foundation a real ingress surface (Discord-style gateway) needs to live in
+  a plugin instead of `server.py`.
+- **`plugins.disabled` denylist + plugin surface `reload` hook (#509 prereqs).**
+  `plugins.disabled` turns off a bundled first-party plugin even if its manifest
+  says `enabled: true` — so a fork drops a built-in surface without deleting it.
+  `register_surface(..., reload=fn)` lets a surface reconnect on a config change
+  (the server calls `reload(new_config)` on the loop), so a config-driven surface
+  keeps live-reconnect instead of needing a restart. Both pave the way for
+  migrating the Discord/Google surfaces to plugins (#509).
+- **Plugins can contribute config, settings & secrets (ADR 0019, #508).** A
+  plugin **declares its config in the manifest** (`config_section` / `config`
+  defaults / `secrets` / `settings`) — known at config-load time without importing
+  the plugin. It claims a top-level config section and gets: a resolved config
+  (manifest defaults ⊕ YAML ⊕ secrets overlay, read via `registry.config`),
+  secret routing to `secrets.yaml` (via a dynamic `secret_paths()`), and an
+  auto-generated **System → Settings** group — with no `config.py` /
+  `config_io.py` / `settings_schema.py` edit. A section colliding with a built-in
+  is ignored. Completes the plugin reach (config + ADR 0018's surface/route/
+  subagent), so a fork ships a fully self-contained configurable surface as a
+  plugin — the prerequisite for migrating the built-in Discord/Google surfaces
+  (#509). The `plugins/hello` example now declares a config section + secret.
+- **Plugins can contribute surfaces, routes & subagents (ADR 0018, #506).** The
+  plugin `register(registry)` contract gained `register_router` (a FastAPI
+  `APIRouter`, mounted under `/plugins/<id>`), `register_surface` (a lifecycle
+  `start`/`stop` background surface, run on the server loop like the Discord
+  gateway), and `register_subagent` (a `SubagentConfig` added to
+  `SUBAGENT_REGISTRY`) — on top of the existing tools + skills. So a fork ships
+  its own ingress / HTTP endpoint / delegate as a `plugins/<id>/` directory with
+  **no `server.py` / registry / `SUBAGENT_REGISTRY` edit** — the last fork
+  re-sync friction point. Routes + surfaces wire once at init (a `plugins.enabled`
+  change needs a restart); contributions show in `GET /api/runtime/status`. The
+  shipped `plugins/hello` example now demonstrates all five contribution types.
+
+### Changed
+- **Fork & re-sync ergonomics — customize via config/plugins/env, not core
+  edits.** A fork-extensibility audit found the biggest re-sync tax was the fork
+  guide telling forks to `sed s/protoagent/<name>/` (~120 files diverge → every
+  upstream merge conflicts) for a purely cosmetic internal rename — the
+  user-facing name is already `identity.name`-driven. Quick wins:
+  - **`.gitattributes`: `CHANGELOG.md merge=union`** — the changelog no longer
+    conflicts on a fork merge / upstream cherry-pick (both sides' entries coexist).
+  - **Tool denylist** — drop named core tools via config (`tools.disabled`,
+    live-reloadable) instead of editing `tools/lg_tools.py::get_all_tools()`.
+    "Keep what you want, drop the rest, add your own (plugin)" is now fully
+    config + plugin driven.
+  - **Release pipeline gates on the `RELEASE_ENABLED` repo variable** (not a
+    `github.repository == 'protoLabsAI/protoAgent'` literal), so forks enable
+    releases without editing `prepare-release.yml` / `release.yml`.
+  - **Fork guide + `TEMPLATE.md` rewritten** to set the name in config + SOUL.md,
+    keep the internal `protoagent` identifier, and use the repo variable.
+
 ## [0.13.0] - 2026-06-04
 
 ### Added

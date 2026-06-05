@@ -4,11 +4,18 @@ Drives the running agent over the same JSON-RPC + SSE surface that
 real A2A callers use:
 
 - ``agent_card()`` — GET ``/.well-known/agent-card.json``
-- ``ask()``        — ``message/send`` + ``tasks/get`` poll
-- ``stream()``     — ``message/stream`` SSE
-- ``cancel()``     — ``tasks/cancel``
+- ``ask()``        — ``SendMessage`` + ``GetTask`` poll
+- ``stream()``     — ``SendStreamingMessage`` SSE
+- ``cancel()``     — ``CancelTask``
 
 Returns structured ``TaskResult`` objects the runner asserts against.
+
+This speaks the **A2A 1.0** wire shape that ``a2a-sdk`` (≥1.1) serves:
+proto method names (``SendMessage`` etc.), an ``A2A-Version: 1.0``
+header (without it the SDK falls back to 0.3 and rejects these
+methods), ``role: "ROLE_USER"``, and untyped ``parts: [{"text": …}]``
+(no ``kind`` discriminator). See ``tests/test_a2a_handler.py`` for the
+canonical request/response shapes.
 
 Auth picks up both surfaces the template exposes (see ``server.py``):
 
@@ -80,7 +87,9 @@ class AgentClient:
         env_bearer, env_api_key = _resolve_auth_env()
         token = bearer if bearer is not None else env_bearer
         x_api = api_key if api_key is not None else env_api_key
-        self.headers = {"Content-Type": "application/json"}
+        # A2A-Version: 1.0 is mandatory — a2a-sdk's dispatcher treats a missing
+        # header as 0.3 and then 404s the 1.0 proto methods (SendMessage, …).
+        self.headers = {"Content-Type": "application/json", "A2A-Version": "1.0"}
         if token:
             self.headers["Authorization"] = f"Bearer {token}"
         if x_api:
@@ -139,29 +148,59 @@ class AgentClient:
         set a goal on one turn and trigger the loop on the next.
         """
         mid = str(uuid.uuid4())
-        params: dict = {
-            "message": {
-                "role": "user",
-                "parts": [{"kind": "text", "text": prompt}],
-                "messageId": mid,
-            }
+        message: dict = {
+            "role": "ROLE_USER",
+            "parts": [{"text": prompt}],
+            "messageId": mid,
         }
+        # contextId is a field of Message in 1.0 — SendMessageRequest itself only
+        # has {tenant, message, configuration, metadata}, so putting it at params
+        # level is a -32602.
         if context_id is not None:
-            params["contextId"] = context_id
+            message["contextId"] = context_id
         payload = {
             "jsonrpc": "2.0",
             "id": mid,
-            "method": "message/send",
-            "params": params,
+            "method": "SendMessage",
+            "params": {"message": message},
         }
         start = time.time()
-        async with httpx.AsyncClient(timeout=30) as client:
-            r = await client.post(f"{self.base_url}/a2a", headers=self.headers, json=payload)
+
+        def _finish(res: dict, task_id: str) -> TaskResult:
+            text, usage = _extract(res)
+            return TaskResult(
+                task_id=task_id,
+                state=_norm_state((res.get("status") or {}).get("state", "")),
+                text=text,
+                artifacts=res.get("artifacts", []),
+                usage=usage,
+                duration_ms=int((time.time() - start) * 1000),
+            )
+
+        # Non-streaming SendMessage *blocks* until the task is terminal (a2a-sdk
+        # 1.1), so the POST itself must hold the whole turn budget — a fixed 30s
+        # would ReadTimeout on any slow turn (web_search, subagents) even though
+        # the case allows longer. (The 0.3 message/send returned immediately and
+        # this client polled; 1.0 collapsed that into one blocking call.)
+        async with httpx.AsyncClient(timeout=timeout_s) as client:
+            try:
+                r = await client.post(f"{self.base_url}/a2a", headers=self.headers, json=payload)
+            except httpx.TimeoutException:
+                return TaskResult(
+                    task_id="", state="timeout",
+                    duration_ms=int((time.time() - start) * 1000),
+                )
             r.raise_for_status()
             resp = r.json()
             if "error" in resp:
                 return TaskResult(task_id="", state="failed", error=str(resp["error"]))
-            task_id = resp.get("result", {}).get("id", "")
+            # SendMessage wraps the task in result.task (vs GetTask, which returns
+            # the task directly at result). Non-streaming SendMessage blocks until
+            # terminal, so the first response is usually already complete.
+            task = resp.get("result", {}).get("task", {})
+            task_id = task.get("id", "")
+            if _is_terminal((task.get("status") or {}).get("state", "")):
+                return _finish(task, task_id)
 
             deadline = start + timeout_s
             while time.time() < deadline:
@@ -172,58 +211,52 @@ class AgentClient:
                     json={
                         "jsonrpc": "2.0",
                         "id": "p",
-                        "method": "tasks/get",
+                        "method": "GetTask",
                         "params": {"id": task_id},
                     },
                 )
                 poll.raise_for_status()
                 res = poll.json().get("result", {})
-                state = (res.get("status") or {}).get("state", "")
-                if state in ("completed", "failed", "canceled"):
-                    text, usage = _extract(res)
-                    return TaskResult(
-                        task_id=task_id,
-                        state=state,
-                        text=text,
-                        artifacts=res.get("artifacts", []),
-                        usage=usage,
-                        duration_ms=int((time.time() - start) * 1000),
-                    )
+                if _is_terminal((res.get("status") or {}).get("state", "")):
+                    return _finish(res, task_id)
             return TaskResult(
                 task_id=task_id, state="timeout",
                 duration_ms=int((time.time() - start) * 1000),
             )
 
-    # ── message/stream (SSE) ────────────────────────────────────────────────
+    # ── SendStreamingMessage (SSE) ──────────────────────────────────────────
 
     async def stream(self, prompt: str, *, timeout_s: int = 90, context_id: str | None = None) -> tuple[list[dict], TaskResult | None]:
         """Stream a turn over SSE. Returns (event_log, final TaskResult).
 
-        Each event is a dict shaped ``{kind, result}``. Use this to assert
-        on the streaming protocol itself (status-update sequence, final
-        flag, artifact chunks). Most cases should use ``ask()`` instead.
+        Each SSE ``data:`` frame is an A2A 1.0 oneof under ``result`` — one of
+        ``task`` (initial snapshot), ``statusUpdate``, ``artifactUpdate``, or
+        ``message``. We log each as ``{kind, result}`` (``kind`` is the oneof
+        field name), accumulate artifact parts, and finalize when a status
+        frame is ``final`` or terminal. Use this to assert on the streaming
+        protocol itself; most cases should use ``ask()`` instead.
 
         ``context_id`` pins the A2A contextId (= session_id) so the turn
         runs in a known session (e.g. one a goal was set on).
         """
         mid = str(uuid.uuid4())
-        params: dict = {
-            "message": {
-                "role": "user",
-                "parts": [{"kind": "text", "text": prompt}],
-                "messageId": mid,
-            }
+        message: dict = {
+            "role": "ROLE_USER",
+            "parts": [{"text": prompt}],
+            "messageId": mid,
         }
-        if context_id is not None:
-            params["contextId"] = context_id
+        if context_id is not None:  # see ask(): contextId lives inside the message
+            message["contextId"] = context_id
         payload = {
             "jsonrpc": "2.0",
             "id": mid,
-            "method": "message/stream",
-            "params": params,
+            "method": "SendStreamingMessage",
+            "params": {"message": message},
         }
         events: list[dict] = []
         final: TaskResult | None = None
+        artifacts: list[dict] = []  # accumulated across artifactUpdate frames
+        task_id = ""
         start = time.time()
         async with httpx.AsyncClient(timeout=timeout_s) as client:
             async with client.stream(
@@ -238,24 +271,42 @@ class AgentClient:
                 async for line in r.aiter_lines():
                     if not line or line.startswith(":"):
                         continue
-                    if line.startswith("data:"):
-                        raw = line[5:].strip()
-                        if not raw:
-                            continue
-                        try:
-                            data = json.loads(raw)
-                        except json.JSONDecodeError:
-                            events.append({"kind": "raw", "raw": raw})
-                            continue
-                        result = (data.get("result") or {})
-                        kind = result.get("kind", "?")
-                        events.append({"kind": kind, "result": result})
-                        if kind in ("status-update", "task") and result.get("final"):
-                            text, usage = _extract(result)
+                    if not line.startswith("data:"):
+                        continue
+                    raw = line[5:].strip()
+                    if not raw:
+                        continue
+                    try:
+                        data = json.loads(raw)
+                    except json.JSONDecodeError:
+                        events.append({"kind": "raw", "raw": raw})
+                        continue
+                    result = data.get("result") or {}
+                    kind = next(iter(result), "?") if result else "?"
+                    payload_obj = result.get(kind, {}) if kind != "?" else {}
+                    events.append({"kind": kind, "result": payload_obj})
+
+                    if kind == "task":
+                        task_id = payload_obj.get("id", "") or task_id
+                        artifacts = payload_obj.get("artifacts") or artifacts
+                    elif kind == "artifactUpdate":
+                        task_id = payload_obj.get("taskId", "") or task_id
+                        art = payload_obj.get("artifact")
+                        if art:
+                            artifacts.append(art)
+                    elif kind == "statusUpdate":
+                        task_id = payload_obj.get("taskId", "") or task_id
+                        status = payload_obj.get("status") or {}
+                        state = status.get("state", "")
+                        if payload_obj.get("final") or _is_terminal(state):
+                            text, usage = _extract(
+                                {"artifacts": artifacts, "status": status}
+                            )
                             final = TaskResult(
-                                task_id=result.get("taskId") or result.get("id", ""),
-                                state=(result.get("status") or {}).get("state", "unknown"),
+                                task_id=task_id,
+                                state=_norm_state(state) or "unknown",
                                 text=text,
+                                artifacts=artifacts,
                                 usage=usage,
                                 duration_ms=int((time.time() - start) * 1000),
                             )
@@ -281,7 +332,7 @@ class AgentClient:
             r.raise_for_status()
             return r.json()
 
-    # ── tasks/cancel ────────────────────────────────────────────────────────
+    # ── CancelTask ──────────────────────────────────────────────────────────
 
     async def cancel(self, task_id: str) -> dict:
         async with httpx.AsyncClient(timeout=10) as client:
@@ -291,30 +342,50 @@ class AgentClient:
                 json={
                     "jsonrpc": "2.0",
                     "id": "c",
-                    "method": "tasks/cancel",
+                    "method": "CancelTask",
                     "params": {"id": task_id},
                 },
             )
             return r.json()
 
 
+def _norm_state(state: str) -> str:
+    """``TASK_STATE_COMPLETED`` → ``completed``; pass through already-lowercased
+    legacy states unchanged. The runner asserts on the lowercase names."""
+    if state.startswith("TASK_STATE_"):
+        return state[len("TASK_STATE_"):].lower()
+    return state
+
+
+def _is_terminal(state: str) -> bool:
+    """A task in one of these states won't change on further polling. Mirrors
+    ``tests/test_a2a_handler.py::_poll_terminal`` (input_required parks the
+    task — it's terminal for polling purposes)."""
+    return _norm_state(state) in ("completed", "failed", "canceled", "input_required")
+
+
 def _extract(result: dict) -> tuple[str, dict]:
-    """Pull text + cost data out of an A2A result envelope."""
+    """Pull text + cost data out of an A2A result envelope.
+
+    Tolerant of both the A2A 1.0 part shape (untyped — a part carries a
+    ``text`` or ``data`` field directly) and the legacy 0.x shape (parts
+    tagged with ``kind``)."""
     text_parts: list[str] = []
     usage: dict = {}
-    artifacts = result.get("artifacts") or []
-    for art in artifacts:
-        for p in art.get("parts", []):
-            if p.get("kind") == "text" and p.get("text"):
+
+    def _scan(parts: list[dict] | None) -> None:
+        nonlocal usage
+        for p in parts or []:
+            if p.get("text"):
                 text_parts.append(p["text"])
-            elif p.get("kind") == "data" and isinstance(p.get("data"), dict):
-                if "usage" in p["data"]:
-                    usage = dict(p["data"]["usage"])
-                    if "durationMs" in p["data"]:
-                        usage["durationMs"] = p["data"]["durationMs"]
+            elif isinstance(p.get("data"), dict) and "usage" in p["data"]:
+                usage = dict(p["data"]["usage"])
+                if "durationMs" in p["data"]:
+                    usage["durationMs"] = p["data"]["durationMs"]
+
+    for art in result.get("artifacts") or []:
+        _scan(art.get("parts"))
     status = result.get("status") or {}
     msg = status.get("message") or {}
-    for p in msg.get("parts") or []:
-        if p.get("kind") == "text" and p.get("text"):
-            text_parts.append(p["text"])
+    _scan(msg.get("parts"))
     return "\n".join(text_parts).strip(), usage

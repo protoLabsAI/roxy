@@ -92,6 +92,35 @@ def test_enabled_via_manifest(tmp_path, monkeypatch) -> None:
     assert [t.name for t in res.tools] == ["m_tool"]
 
 
+def test_multi_module_plugin_with_relative_import(tmp_path, monkeypatch) -> None:
+    """A plugin whose id has a hyphen AND whose __init__.py uses a relative import
+    (``from .tools import …``) must load. Regression: the loader used the raw id as
+    the module name (a hyphen is illegal) and didn't register it in sys.modules, so
+    the relative import failed with "No module named protoagent_plugin_<id>".
+    """
+    root = tmp_path / "plugins"
+    d = root / "multi-mod"
+    d.mkdir(parents=True)
+    (d / "protoagent.plugin.yaml").write_text(
+        "id: multi-mod\nname: Multi mod\nversion: 0.1.0\nenabled: true\n", encoding="utf-8")
+    (d / "tools.py").write_text(
+        "from langchain_core.tools import tool\n"
+        "@tool\n"
+        "def mm_tool() -> str:\n"
+        "    '''sibling-module tool'''\n"
+        "    return 'ok'\n"
+        "def get_tools():\n"
+        "    return [mm_tool]\n", encoding="utf-8")
+    (d / "__init__.py").write_text(
+        "from .tools import get_tools\n"
+        "def register(registry):\n"
+        "    registry.register_tools(get_tools())\n", encoding="utf-8")
+    monkeypatch.setattr(plugin_loader, "_plugin_roots", lambda config: [root])
+    res = load_plugins(_cfg())
+    assert [t.name for t in res.tools] == ["mm_tool"]
+    assert res.meta[0]["loaded"] is True
+
+
 def test_tool_collision_skipped(tmp_path, monkeypatch) -> None:
     root = tmp_path / "plugins"
     _make_plugin(root, "c", enabled=True, tool="current_time")  # core tool name
@@ -135,3 +164,111 @@ def test_from_yaml_parses_plugins(tmp_path) -> None:
     p.write_text("plugins:\n  enabled: [hello]\n  dir: /tmp/p\n")
     cfg = LangGraphConfig.from_yaml(p)
     assert cfg.plugins_enabled == ["hello"] and cfg.plugins_dir == "/tmp/p"
+
+
+# --- ADR 0018: routers / surfaces / subagents -------------------------------
+
+_EXT_PLUGIN = '''
+class _FakeRouter:
+    routes = []
+
+class _Sub:
+    name = "plug_sub"
+
+def _start():
+    return None
+
+def _stop():
+    return None
+
+def register(registry):
+    registry.register_router(_FakeRouter())            # default prefix /plugins/<id>
+    registry.register_router(_FakeRouter(), prefix="/x")  # explicit prefix honored
+    registry.register_surface(_start, stop=_stop, name="surf")
+    registry.register_subagent(_Sub())
+'''
+
+
+def test_plugin_contributes_router_surface_subagent(tmp_path, monkeypatch) -> None:
+    root = tmp_path / "plugins"
+    _make_plugin(root, "ext", enabled=True, body=_EXT_PLUGIN)
+    monkeypatch.setattr(plugin_loader, "_plugin_roots", lambda config: [root])
+    res = load_plugins(_cfg())
+
+    # Routers: default prefix is namespaced to the plugin id; explicit honored.
+    assert sorted(r["prefix"] for r in res.routers) == ["/plugins/ext", "/x"]
+    assert all(r["plugin_id"] == "ext" for r in res.routers)
+    # Surface + subagent collected, tagged with the plugin id.
+    assert [s["name"] for s in res.surfaces] == ["surf"]
+    assert all(s["plugin_id"] == "ext" for s in res.surfaces)
+    assert [getattr(s, "name", None) for s in res.subagents] == ["plug_sub"]
+    # Meta reports the counts.
+    m = res.meta[0]
+    assert m["routers"] == 2 and m["surfaces"] == 1 and m["subagents"] == ["plug_sub"]
+
+
+# --- ADR 0019: config / secrets / settings ----------------------------------
+
+_CFG_MANIFEST = (
+    "config_section: cfgplug\n"
+    "config: {greeting: hi, api_key: ''}\n"
+    "secrets: [api_key]\n"
+    "settings:\n"
+    "  - {key: greeting, label: Greeting, type: string}\n"
+    "  - {key: api_key, label: Key, type: secret}\n"
+)
+
+
+def test_plugin_declares_config_schema(tmp_path) -> None:
+    from graph.plugins.pconfig import discover_plugin_config
+
+    root = tmp_path / "plugins"
+    _make_plugin(root, "cfgplug", enabled=True, manifest_extra=_CFG_MANIFEST)
+    schemas = discover_plugin_config([root], {"cfgplug"})
+    assert len(schemas) == 1
+    s = schemas[0]
+    assert s.section == "cfgplug"
+    assert s.defaults == {"greeting": "hi", "api_key": ""}
+    assert s.secrets == ["api_key"]
+    assert [f["key"] for f in s.settings] == ["greeting", "api_key"]
+
+
+def test_plugin_config_only_for_enabled(tmp_path) -> None:
+    from graph.plugins.pconfig import discover_plugin_config
+
+    root = tmp_path / "plugins"
+    _make_plugin(root, "cfgplug", enabled=False, manifest_extra=_CFG_MANIFEST)
+    assert discover_plugin_config([root], set()) == []          # disabled → none
+    assert len(discover_plugin_config([root], {"cfgplug"})) == 1  # operator-enabled
+
+
+def test_plugin_section_collision_with_builtin_ignored(tmp_path) -> None:
+    from graph.plugins.pconfig import discover_plugin_config
+
+    root = tmp_path / "plugins"
+    _make_plugin(root, "evil", enabled=True,
+                 manifest_extra="config_section: model\nconfig: {x: 1}\n")
+    # 'model' is a reserved built-in section — the plugin can't claim it.
+    assert discover_plugin_config([root], {"evil"}) == []
+
+
+def test_plugins_disabled_overrides_manifest_enabled(tmp_path, monkeypatch) -> None:
+    root = tmp_path / "plugins"
+    _make_plugin(root, "onplug", enabled=True, tool="on_tool")
+    monkeypatch.setattr(plugin_loader, "_plugin_roots", lambda config: [root])
+    # manifest enabled: true → loads
+    assert [t.name for t in load_plugins(_cfg()).tools] == ["on_tool"]
+    # plugins.disabled wins → not loaded
+    assert load_plugins(_cfg(plugins_disabled=["onplug"])).tools == []
+
+
+def test_registry_exposes_plugin_host() -> None:
+    """A surface/route reaches host services (agent invoke + bus) via registry.host."""
+    from pathlib import Path
+
+    from graph.plugins.host import HOST
+    from graph.plugins.registry import PluginRegistry
+
+    r = PluginRegistry("p", Path("/tmp"))
+    assert r.host is HOST                      # the process singleton the server fills
+    assert hasattr(r.host, "invoke") and hasattr(r.host, "publish") and hasattr(r.host, "subscribe")

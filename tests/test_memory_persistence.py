@@ -114,6 +114,25 @@ def test_persist_session_captures_messages(tmp_path):
     assert any("4" in c for c in contents)
 
 
+def test_persist_session_strips_reasoning_from_assistant(tmp_path):
+    """ADR 0021: the persisted session (later injected as <prior_sessions>) must
+    not carry the model's <scratch_pad> — strip it at the write source."""
+    mod = _reload_memory({"MEMORY_PATH": str(tmp_path), "PROTOAGENT_DISABLE_MEMORY": ""})
+    messages = [
+        HumanMessage(content="What is 2+2?"),
+        AIMessage(content="<scratch_pad>add 2 and 2, that's 4</scratch_pad><output>It's 4.</output>"),
+    ]
+    state = _make_state("strip-test", messages=messages)
+    mod._persist_session(state, "t")
+
+    data = json.loads((tmp_path / "strip-test.json").read_text())
+    blob = json.dumps(data)
+    assert "scratch_pad" not in blob
+    assert "add 2 and 2" not in blob          # internal reasoning gone
+    assert "It's 4." in blob                   # user-facing answer kept
+    assert "scratch_pad" not in (data["final_output"] or "")
+
+
 def test_persist_session_final_output_is_last_ai_message(tmp_path):
     mod = _reload_memory({"MEMORY_PATH": str(tmp_path), "PROTOAGENT_DISABLE_MEMORY": ""})
 
@@ -445,6 +464,29 @@ def test_after_agent_persists_on_terminal_turn(tmp_path):
         mw.after_agent(state, runtime)
 
     mock_persist.assert_called_once_with(state, "trace-after")
+
+
+def test_after_agent_does_not_dump_findings_to_store(tmp_path):
+    """ADR 0021: the per-turn raw knowledge dump is gone. after_agent must NOT
+    write to the knowledge store — conversation knowledge is captured by the
+    summarized harvest on retirement, not a raw per-turn dump."""
+    mod = _reload_memory({"MEMORY_PATH": str(tmp_path), "PROTOAGENT_DISABLE_MEMORY": ""})
+
+    store = MagicMock()
+    mw = mod.MemoryMiddleware(knowledge_store=store)
+
+    messages = [
+        HumanMessage(content="What's the release cadence?"),
+        AIMessage(content="x" * 300),  # substantial — the old code would have dumped this
+    ]
+    state = _make_state("after-agent-no-dump", messages=messages)
+
+    with patch.object(mod, "_persist_session"), \
+         patch("tracing.current_trace_id", return_value="t"):
+        mw.after_agent(state, MagicMock())
+
+    store.add_finding.assert_not_called()
+    store.add_chunk.assert_not_called()
 
 
 def test_after_agent_does_not_persist_when_tool_calls_pending(tmp_path):

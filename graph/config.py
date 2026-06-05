@@ -36,6 +36,39 @@ def _load_secrets_doc(config_dir: Path) -> dict:
         return {}
 
 
+def _resolve_plugin_config(data: dict, secrets: dict, config_dir: Path) -> dict:
+    """Resolve each enabled plugin's declared config section (ADR 0019).
+
+    For every plugin that claims a top-level section, merge: manifest defaults ⊕
+    the (secret-stripped) YAML section ⊕ the secrets overlay for its secret keys.
+    Best-effort — never breaks config load. Returns ``{section: resolved_dict}``.
+    """
+    try:
+        from graph.plugins.pconfig import discover_plugin_config, plugin_roots_from
+
+        plugins = data.get("plugins") or {}
+        roots = plugin_roots_from(config_dir, str(plugins.get("dir") or ""))
+        schemas = discover_plugin_config(
+            roots, set(plugins.get("enabled") or []), set(plugins.get("disabled") or []),
+        )
+    except Exception:  # noqa: BLE001 — plugin config is best-effort
+        return {}
+
+    out: dict = {}
+    for sch in schemas:
+        section_yaml = data.get(sch.section) or {}
+        sec_overlay = secrets.get(sch.section) or {}
+        resolved = dict(sch.defaults)
+        resolved.update({k: v for k, v in section_yaml.items() if k not in sch.secrets})
+        for k in sch.secrets:
+            v = sec_overlay.get(k)
+            if v is None:
+                v = section_yaml.get(k)  # belt-and-suspenders if not yet stripped
+            resolved[k] = v if v is not None else resolved.get(k, "")
+        out[sch.section] = resolved
+    return out
+
+
 @dataclass
 class SubagentDef:
     enabled: bool = True
@@ -96,27 +129,14 @@ class LangGraphConfig:
     memory_middleware: bool = True
     scheduler_enabled: bool = True
 
-    # Discord surface (ADR 0015 + 0016) — inbound DM gateway. Configured in-app
-    # (wizard step + Settings) rather than env-only, so the bundled desktop app
-    # has a per-user place for the token. ``bot_token`` lives in the secrets
-    # overlay; ``admin_ids`` are the Discord user IDs allowed to talk to the bot
-    # (empty ⇒ anyone). Off until a token is set. The env vars (DISCORD_BOT_TOKEN
-    # / DISCORD_ADMIN_IDS) remain a fallback for Docker.
-    discord_enabled: bool = False
-    discord_bot_token: str = ""
-    discord_admin_ids: list[str] = field(default_factory=list)
+    # The Discord surface (ADR 0015/0016) is now the first-party `discord` plugin
+    # (ADR 0018/0019, plugins/discord/) — its config lives in plugin_config["discord"],
+    # not a typed field here.
 
-    # Google surface (ADR 0017) — Gmail + Calendar via the bundled MCP server,
-    # connected in-app with an OAuth consent flow (no credentials.json / CLI).
-    # The OAuth client (client_id + client_secret) comes from the operator's
-    # Google Cloud "Desktop app" client; the refreshable token is cached in the
-    # per-user config dir. `client_secret` lives in the secrets overlay. When
-    # enabled + connected, the config layer auto-wires the google MCP server, so
-    # the operator never edits `mcp.servers`. `tz` sets day bounds for "today".
-    google_enabled: bool = False
-    google_client_id: str = ""
-    google_client_secret: str = ""
-    google_tz: str = ""
+    # The Google surface (ADR 0017) is now the first-party `google` plugin (ADR
+    # 0019, plugins/google/) — a managed MCP server it injects via
+    # register_mcp_server. Its config lives in plugin_config["google"], not typed
+    # fields here.
 
     # Enforcement gate — opt-in safety middleware that blocks tool calls
     # before they execute (deny list + per-tool rate limits). Off by default;
@@ -187,6 +207,13 @@ class LangGraphConfig:
     tools_deferred_enabled: bool = False
     tools_deferred_keep: list[str] = field(default_factory=list)
 
+    # Tool denylist — drop named core tools from the agent without editing
+    # ``tools/lg_tools.py::get_all_tools``. A fork keeps what it wants by listing
+    # the rest here (config ``tools.disabled``); plugins still ADD tools. So
+    # "keep what you want, drop the rest, add your own" is fully config + plugin
+    # driven — no core edit that conflicts on upstream re-sync.
+    tools_disabled: list[str] = field(default_factory=list)
+
     # Model routing / failover — wires langchain's ModelFallbackMiddleware.
     # On primary error, retry on each fallback model (same gateway) in order.
     routing_fallback_models: list[str] = field(default_factory=list)
@@ -218,6 +245,11 @@ class LangGraphConfig:
     # is read-only or absent (e.g. local ``python server.py``).
     knowledge_db_path: str = "/sandbox/knowledge/agent.db"
     embed_model: str = "nomic-embed-text"
+    # Semantic recall (ADR 0021): when True, the knowledge store is the
+    # HybridKnowledgeStore (FTS5 + vector embeddings via `embed_model`, fused
+    # with RRF). Default off — needs the gateway to serve an embedding model;
+    # the store's circuit breaker falls back to FTS5 on outage. Off = keyword-only.
+    knowledge_embeddings: bool = False
     knowledge_top_k: int = 5
 
     # Conversation checkpointer — persists each chat session's history per
@@ -242,6 +274,10 @@ class LangGraphConfig:
     # knowledge base before dropping the raw checkpoints — so past conversations
     # stay searchable via memory_recall. Needs the knowledge store enabled.
     checkpoint_harvest_enabled: bool = True
+    # Semantic facts (ADR 0021): on retirement, also extract durable facts from
+    # the conversation (aux model) and consolidate them into the store as
+    # finding_type="fact". Rides the harvest pass; needs harvest enabled.
+    knowledge_facts: bool = True
 
     # Skills — human-authored ``SKILL.md`` folders (AgentSkills open standard)
     # loaded from disk into the FTS5 skill index and retrieved at inference by
@@ -283,7 +319,15 @@ class LangGraphConfig:
     # ``<config_dir>/plugins``); shipped examples live in ``plugins/``.
     # See graph/plugins/ and docs/guides/plugins.md.
     plugins_enabled: list[str] = field(default_factory=list)
+    # Denylist — turn OFF a plugin even if its manifest says ``enabled: true``.
+    # Lets a fork disable a bundled first-party plugin (e.g. the Discord surface)
+    # without deleting its directory or editing core.
+    plugins_disabled: list[str] = field(default_factory=list)
     plugins_dir: str = ""
+    # Plugin-declared config sections (ADR 0019), keyed by the claimed top-level
+    # section. Each value is the section's resolved config (manifest defaults ⊕
+    # YAML ⊕ secrets overlay). A plugin reads its own via plugin_config["<section>"].
+    plugin_config: dict = field(default_factory=dict)
 
     # Identity — captured by the setup wizard, editable via the drawer.
     # ``identity_name`` falls back to the AGENT_NAME env var at runtime;
@@ -376,8 +420,6 @@ class LangGraphConfig:
 
         secrets = _load_secrets_doc(p.parent)
 
-        discord = data.get("discord", {})
-        google = data.get("google", {})
         model = data.get("model", {})
         subagents = data.get("subagents", {})
         middleware = data.get("middleware", {})
@@ -395,8 +437,6 @@ class LangGraphConfig:
         # value still lets create_llm / set_a2a_token fall back to env.
         secret_api_key = secrets.get("model", {}).get("api_key")
         secret_auth_token = secrets.get("auth", {}).get("token")
-        secret_discord_token = secrets.get("discord", {}).get("bot_token")
-        secret_google_secret = secrets.get("google", {}).get("client_secret")
 
         config = cls(
             model_provider=model.get("provider", cls.model_provider),
@@ -415,13 +455,6 @@ class LangGraphConfig:
             audit_middleware=middleware.get("audit", cls.audit_middleware),
             memory_middleware=middleware.get("memory", cls.memory_middleware),
             scheduler_enabled=middleware.get("scheduler", cls.scheduler_enabled),
-            discord_enabled=discord.get("enabled", cls.discord_enabled),
-            discord_bot_token=secret_discord_token or discord.get("bot_token", cls.discord_bot_token),
-            discord_admin_ids=list(discord.get("admin_ids", []) or []),
-            google_enabled=google.get("enabled", cls.google_enabled),
-            google_client_id=google.get("client_id", cls.google_client_id),
-            google_client_secret=secret_google_secret or google.get("client_secret", cls.google_client_secret),
-            google_tz=google.get("tz", cls.google_tz),
             enforcement_enabled=middleware.get("enforcement", cls.enforcement_enabled),
             enforcement_disallowed_tools=(
                 data.get("enforcement", {}).get("disallowed_tools", [])
@@ -446,6 +479,7 @@ class LangGraphConfig:
             execute_code_output_truncate=data.get("execute_code", {}).get("output_truncate", cls.execute_code_output_truncate),
             tools_deferred_enabled=data.get("tools", {}).get("deferred", {}).get("enabled", cls.tools_deferred_enabled),
             tools_deferred_keep=list(data.get("tools", {}).get("deferred", {}).get("keep", []) or []),
+            tools_disabled=list(data.get("tools", {}).get("disabled", []) or []),
             routing_fallback_models=data.get("routing", {}).get("fallback_models", []),
             aux_model=data.get("routing", {}).get("aux_model", cls.aux_model),
             goal_enabled=data.get("goal", {}).get("enabled", cls.goal_enabled),
@@ -463,9 +497,11 @@ class LangGraphConfig:
             checkpoint_max_age_days=data.get("checkpoint", {}).get("max_age_days", cls.checkpoint_max_age_days),
             checkpoint_prune_interval_hours=data.get("checkpoint", {}).get("prune_interval_hours", cls.checkpoint_prune_interval_hours),
             checkpoint_harvest_enabled=data.get("checkpoint", {}).get("harvest_enabled", cls.checkpoint_harvest_enabled),
+            knowledge_facts=data.get("knowledge", {}).get("facts", cls.knowledge_facts),
             workflows_enabled=data.get("workflows", {}).get("enabled", cls.workflows_enabled),
             workflow_dir=data.get("workflows", {}).get("dir", cls.workflow_dir),
             embed_model=knowledge.get("embed_model", cls.embed_model),
+            knowledge_embeddings=knowledge.get("embeddings", cls.knowledge_embeddings),
             knowledge_top_k=knowledge.get("top_k", cls.knowledge_top_k),
             skills_enabled=skills.get("enabled", cls.skills_enabled),
             skills_db_path=skills.get("db_path", cls.skills_db_path),
@@ -476,6 +512,7 @@ class LangGraphConfig:
             mcp_timeout_seconds=mcp.get("timeout_seconds", cls.mcp_timeout_seconds),
             mcp_denylist=list(mcp.get("denylist", []) or []),
             plugins_enabled=list(plugins.get("enabled", []) or []),
+            plugins_disabled=list(plugins.get("disabled", []) or []),
             plugins_dir=plugins.get("dir", cls.plugins_dir),
             identity_name=identity.get("name", cls.identity_name),
             identity_operator=identity.get("operator", cls.identity_operator),
@@ -490,6 +527,7 @@ class LangGraphConfig:
             ),
             filesystem_projects=list(data.get("filesystem", {}).get("projects", []) or []),
             egress_allowed_hosts=list(data.get("egress", {}).get("allowed_hosts", []) or []),
+            plugin_config=_resolve_plugin_config(data, secrets, p.parent),
         )
 
         for name in ("researcher",):

@@ -11,7 +11,6 @@ import json
 import logging
 import os
 import tempfile
-import threading
 from datetime import datetime, timezone
 from typing import Any
 
@@ -92,6 +91,11 @@ def _persist_session(state: dict, trace_id: str) -> None:
     messages_raw: list = state.get("messages", []) or []
 
     # --- Extract user-visible messages ---
+    # Assistant content is run through strip_reasoning so the session file (later
+    # injected as <prior_sessions>) never carries the model's <scratch_pad> —
+    # the ADR 0021 never-persist-reasoning rule applied to this path too.
+    from graph.output_format import strip_reasoning
+
     user_messages: list[dict] = []
     for msg in messages_raw:
         if isinstance(msg, HumanMessage):
@@ -99,7 +103,7 @@ def _persist_session(state: dict, trace_id: str) -> None:
             user_messages.append({"role": "user", "content": content})
         elif isinstance(msg, AIMessage) and msg.content:
             content = msg.content if isinstance(msg.content, str) else str(msg.content)
-            user_messages.append({"role": "assistant", "content": content})
+            user_messages.append({"role": "assistant", "content": strip_reasoning(content)})
 
     # --- Extract tool call records ---
     # Reconstruct from AI messages (which carry tool_calls) and ToolMessages
@@ -134,7 +138,8 @@ def _persist_session(state: dict, trace_id: str) -> None:
     final_output: str | None = None
     for msg in reversed(messages_raw):
         if isinstance(msg, AIMessage) and msg.content:
-            final_output = msg.content if isinstance(msg.content, str) else str(msg.content)
+            raw_final = msg.content if isinstance(msg.content, str) else str(msg.content)
+            final_output = strip_reasoning(raw_final)
             break
 
     # --- Build summary ---
@@ -187,6 +192,82 @@ def _persist_session(state: dict, trace_id: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Prior-sessions loader — single source of truth (ADR 0021)
+# ---------------------------------------------------------------------------
+
+def load_prior_sessions(
+    memory_path: str = MEMORY_PATH,
+    max_sessions: int = 10,
+    max_tokens: int = 2000,
+) -> str:
+    """Format the most-recent persisted sessions as a ``<prior_sessions>`` block.
+
+    The canonical loader used by *both* ``MemoryMiddleware`` and
+    ``KnowledgeMiddleware`` — previously two copy-pasted implementations. Reads
+    up to ``max_sessions`` newest JSON files, drops oldest-first to fit
+    ``max_tokens`` (char/4 approximation), and **strips reasoning at read** so a
+    file written before the persist-time strip (or by an older build) still
+    can't inject ``<scratch_pad>`` into the prompt. Never raises.
+    """
+    from graph.output_format import strip_reasoning
+
+    if not os.path.isdir(memory_path):
+        return ""
+    try:
+        entries: list[tuple[float, str]] = []
+        for fname in os.listdir(memory_path):
+            if not fname.endswith(".json"):
+                continue
+            fpath = os.path.join(memory_path, fname)
+            try:
+                entries.append((os.path.getmtime(fpath), fpath))
+            except OSError:
+                continue
+        entries.sort(reverse=True)  # newest first
+    except OSError:
+        return ""
+    if not entries:
+        return "<prior_sessions/>"
+
+    summaries: list[dict] = []
+    for _, fpath in entries[:max_sessions]:
+        try:
+            with open(fpath, encoding="utf-8") as fh:
+                summaries.append(json.load(fh))
+        except (OSError, json.JSONDecodeError, ValueError):
+            continue
+    if not summaries:
+        return "<prior_sessions/>"
+
+    def _format(s: dict) -> str:
+        ts = s.get("timestamp", "unknown")
+        sid = s.get("session_id", "unknown")
+        lines = [f'<session id="{sid}" timestamp="{ts}">']
+        msgs = s.get("messages", []) or []
+        if msgs:
+            lines.append("  <messages>")
+            for m in msgs:
+                role = m.get("role", "unknown")
+                content = strip_reasoning(m.get("content", "") or "")[:500]
+                lines.append(f"    <{role}>{content}</{role}>")
+            lines.append("  </messages>")
+        final = strip_reasoning(s.get("final_output") or "")[:300]
+        if final:
+            lines.append(f"  <final_output>{final}</final_output>")
+        lines.append("</session>")
+        return "\n".join(lines)
+
+    formatted = [_format(s) for s in summaries]
+    while formatted:
+        if max(1, len("\n".join(formatted)) // 4) <= max_tokens:
+            break
+        formatted.pop()  # drop oldest (newest-first ordering)
+    if not formatted:
+        return "<prior_sessions/>"
+    return "<prior_sessions>\n" + "\n".join(formatted) + "\n</prior_sessions>"
+
+
+# ---------------------------------------------------------------------------
 # Middleware class
 # ---------------------------------------------------------------------------
 
@@ -207,70 +288,13 @@ class MemoryMiddleware(AgentMiddleware):
     # --- Session memory loading (only used when no KnowledgeMiddleware is active) ---
 
     def _load_prior_sessions(self) -> str:
-        """Lazy-load prior session summaries when standalone (no KnowledgeMiddleware).
+        """Prior-session continuity when standalone (no KnowledgeMiddleware).
 
-        When KnowledgeMiddleware is also in the chain it owns `<prior_sessions>`
-        injection. This method runs only when `self._store is None`, so there is
-        no double-injection risk.
-
-        Reads from MEMORY_PATH, returns an XML block or empty string on first
-        run. Mirrors KnowledgeMiddleware.load_memory() but without the store
-        dependency — single source of truth would be cleaner but would couple
-        the two files.
+        Delegates to the shared :func:`load_prior_sessions` (ADR 0021) — one
+        source of truth for both middlewares. Runs only when ``self._store is
+        None``, so there's no double-injection with KnowledgeMiddleware.
         """
-        if not os.path.isdir(MEMORY_PATH):
-            return ""
-        try:
-            entries = []
-            for fname in os.listdir(MEMORY_PATH):
-                if not fname.endswith(".json"):
-                    continue
-                fpath = os.path.join(MEMORY_PATH, fname)
-                try:
-                    entries.append((os.path.getmtime(fpath), fpath))
-                except OSError:
-                    continue
-            entries.sort(reverse=True)
-        except OSError:
-            return ""
-        if not entries:
-            return "<prior_sessions/>"
-        summaries = []
-        for _, fpath in entries[:10]:
-            try:
-                with open(fpath, encoding="utf-8") as fh:
-                    summaries.append(json.load(fh))
-            except (OSError, json.JSONDecodeError, ValueError):
-                continue
-        if not summaries:
-            return "<prior_sessions/>"
-        lines_out = []
-        for s in summaries:
-            ts = s.get("timestamp", "unknown")
-            sid = s.get("session_id", "unknown")
-            lines = [f'<session id="{sid}" timestamp="{ts}">']
-            msgs = s.get("messages", []) or []
-            if msgs:
-                lines.append("  <messages>")
-                for m in msgs:
-                    role = m.get("role", "unknown")
-                    content = (m.get("content", "") or "")[:500]
-                    lines.append(f"    <{role}>{content}</{role}>")
-                lines.append("  </messages>")
-            final = (s.get("final_output") or "")[:300]
-            if final:
-                lines.append(f"  <final_output>{final}</final_output>")
-            lines.append("</session>")
-            lines_out.append("\n".join(lines))
-        # 2K token budget — chars // 4 approx, drop oldest first
-        while lines_out:
-            joined = "\n".join(lines_out)
-            if max(1, len(joined) // 4) <= 2000:
-                break
-            lines_out.pop()
-        if not lines_out:
-            return "<prior_sessions/>"
-        return "<prior_sessions>\n" + "\n".join(lines_out) + "\n</prior_sessions>"
+        return load_prior_sessions(MEMORY_PATH)
 
     def before_model(self, state, runtime) -> dict | None:
         """Inject `<prior_sessions>` into system prompt when running standalone.
@@ -318,11 +342,20 @@ class MemoryMiddleware(AgentMiddleware):
     # --- Knowledge extraction (existing) ---
 
     def after_agent(self, state, runtime) -> dict | None:
-        """Queue conversation for async knowledge extraction. Persists session on terminal turn."""
+        """Persist a session summary on the terminal turn.
+
+        Knowledge capture is **not** done here. The per-turn ``add_finding``
+        dump that used to live here stored raw assistant turns — scratch_pad and
+        all, truncated mid-content — which the retrieval layer then recycled into
+        future prompts. ADR 0021 removed it: conversation knowledge is captured
+        by ``conversation_harvest`` (summarized, scratch_pad-stripped) when a
+        thread retires, and semantic facts by the extractor — extract, don't
+        dump; background, not hot-path.
+        """
         messages = state.get("messages", [])
 
-        # --- Session persistence: detect terminal turn ---
-        # Terminal = last message is AIMessage with content and no pending tool calls
+        # Session persistence: terminal = last message is an AIMessage with
+        # content and no pending tool calls.
         if messages:
             last_msg = messages[-1]
             if (
@@ -333,44 +366,6 @@ class MemoryMiddleware(AgentMiddleware):
                 import tracing
                 trace_id = tracing.current_trace_id()
                 _persist_session(state, trace_id)
-
-        # --- Knowledge extraction (only when a store is configured) ---
-        if self._store is None:
-            return None
-        if len(messages) < 2:
-            return None
-
-        # Extract the last exchange (human + AI)
-        last_human = None
-        last_ai = None
-        for msg in reversed(messages):
-            if isinstance(msg, AIMessage) and last_ai is None:
-                last_ai = msg.content if isinstance(msg.content, str) else str(msg.content)
-            elif isinstance(msg, HumanMessage) and last_human is None:
-                last_human = msg.content if isinstance(msg.content, str) else str(msg.content)
-            if last_human and last_ai:
-                break
-
-        if not last_human or not last_ai:
-            return None
-
-        # Only store if the response contains substantial content
-        if len(last_ai) < 100:
-            return None
-
-        # Async storage — don't block the response
-        def _store():
-            try:
-                self._store.add_finding(
-                    content=last_ai[:2000],
-                    source="conversation",
-                    source_type="chat",
-                    finding_type="insight",
-                )
-            except Exception:
-                pass
-
-        threading.Thread(target=_store, daemon=True).start()
         return None
 
     async def aafter_agent(self, state, runtime) -> dict | None:
