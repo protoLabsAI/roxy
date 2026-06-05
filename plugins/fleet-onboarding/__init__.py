@@ -1,12 +1,15 @@
-"""Fleet-onboarding plugin — Roxy's two non-shell onboarding tools.
+"""Fleet-onboarding plugin — Roxy's non-shell fleet tools.
 
-The `onboard-project` skill needs exactly two privileged actions: read a repo's
-GitHub remote, and register the project with the Workstacean fleet. Done via
-`run_command` (curl/git) those trip the HITL shell-approval gate
-(`filesystem.run_requires_approval`), so onboarding can't run unsupervised.
+The `onboard-project` skill needs privileged actions that, done via `run_command`
+(curl/git), trip the HITL shell-approval gate (`filesystem.run_requires_approval`)
+and stop onboarding from running unsupervised. These dedicated tools do the same
+work without a shell — file reads and HTTP calls — so they are NOT gated.
 
-These dedicated tools do the same work without a shell — a file read and an HTTP
-POST — so they are NOT gated, and onboarding completes end-to-end on its own.
+- ``repo_github_remote`` — read a repo's GitHub remote from `.git/config`.
+- ``fleet_register``     — register a project with the Workstacean fleet.
+- ``fleet_registry``     — read the protoMaker project registry (the shared
+  source of truth for the fleet, same one protoWorkstacean / pr-pipeline /
+  ci-health use), so Roxy's landscape view stays in lockstep with the fleet.
 
 Enable with ``plugins: { enabled: [fleet-onboarding] }``.
 """
@@ -126,7 +129,52 @@ async def fleet_register(slug: str, title: str, github: str) -> str:
         return json.dumps({"error": f"POST {base}/api/onboard failed: {e}"})
 
 
+@tool
+async def fleet_registry() -> str:
+    """List the fleet from the protoMaker project registry — the shared source of truth, no shell.
+
+    Reads `GET /api/settings/global` → `settings.projects[]` from protoMaker
+    (`PROTOMAKER_API_BASE` or `AUTOMAKER_API_URL`, keyed by `AUTOMAKER_API_KEY`) —
+    the SAME registry protoWorkstacean, pr-pipeline, and ci-health derive their
+    fleet from. Use this as the authoritative fleet/landscape, never a hardcoded
+    list, so my view of which projects exist stays in lockstep with the rest of
+    the fleet.
+
+    Returns JSON: {"count": N, "projects": [{"github": "owner/name", "slug":
+    "name", "path": "<local path>"}], "coords": ["owner/name", ...],
+    "source": "<url>"} — or {"error": "..."}.
+    """
+    import httpx
+
+    base = (os.environ.get("PROTOMAKER_API_BASE") or os.environ.get("AUTOMAKER_API_URL") or "").rstrip("/")
+    key = os.environ.get("AUTOMAKER_API_KEY") or ""
+    if not base:
+        return json.dumps({"error": "neither PROTOMAKER_API_BASE nor AUTOMAKER_API_URL is set"})
+    if not key:
+        return json.dumps({"error": "AUTOMAKER_API_KEY not set — protoMaker rejects the registry read with 401"})
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.get(f"{base}/api/settings/global", headers={"X-API-Key": key})
+        if not (200 <= resp.status_code < 300):
+            return json.dumps({"error": f"GET {base}/api/settings/global -> {resp.status_code}", "body": resp.text[:300]})
+        settings = resp.json().get("settings", resp.json())
+        raw = settings.get("projects") or []
+    except Exception as e:  # noqa: BLE001 — surface the failure, don't crash the turn
+        return json.dumps({"error": f"registry read failed: {e}"})
+
+    projects, coords = [], []
+    for p in raw:
+        g = p.get("github") or {}
+        owner, repo = g.get("owner"), g.get("repo")
+        coord = f"{owner}/{repo}" if owner and repo else None
+        projects.append({"github": coord, "slug": p.get("slug") or (repo.lower() if repo else None), "path": p.get("path")})
+        if coord:
+            coords.append(coord)
+    return json.dumps({"count": len(projects), "projects": projects, "coords": coords, "source": f"{base}/api/settings/global"})
+
+
 def register(registry) -> None:
-    """Entry point — register the two onboarding power tools."""
+    """Entry point — register the fleet power tools."""
     registry.register_tool(repo_github_remote)
     registry.register_tool(fleet_register)
+    registry.register_tool(fleet_registry)
