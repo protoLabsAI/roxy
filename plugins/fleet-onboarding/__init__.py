@@ -390,8 +390,9 @@ async def fleet_readiness() -> str:
 
     Encodes the preconditions the delivery saga taught us, so I never start a
     project that will local-merge, churn, or sit paused. Per project (concurrently)
-    it checks: **isolation** on (`useWorktrees`), **not paused** (protoMaker
-    `pausedProjects`), a **ready backlog** to actually run, and **not blocked-heavy**.
+    it checks: a **GitHub remote** to open PRs against, **isolation** on (effective
+    per-project `useWorktrees`), **not paused** (protoMaker `pausedProjects`), a
+    **ready backlog** to actually run, and **not blocked-heavy**.
     Branch protection / required-checks is enforced by protoMaker at start (there's
     no pre-check endpoint) and is flagged as such rather than asserted.
 
@@ -432,7 +433,9 @@ async def fleet_readiness() -> str:
         g = proj.get("github") or {}
         repo = f"{g.get('owner')}/{g.get('repo')}" if g.get("owner") and g.get("repo") else None
         path = proj.get("path")
-        row = {"repo": repo, "blockers": [], "notes": []}
+        # Always carry a readable label — a project with no remote has repo=None
+        # (a hard blocker handled below) but must still be identifiable in output.
+        row = {"repo": repo or proj.get("name") or path or "(unknown)", "blockers": [], "notes": []}
         try:
             sj = (await client.post(f"{base}/api/sitrep", headers=headers, json={"projectPath": path})).json()
             s = sj.get("board") or sj.get("sitrep") or sj
@@ -450,12 +453,28 @@ async def fleet_readiness() -> str:
         paths = [(f.get("filePath") if isinstance(f, dict) else f) or "" for f in files]
         src_dirty = [p for p in paths if p and not _is_runtime(p)]
         runtime_dirt = len(paths) - len(src_dirty)
+        # Worktree isolation is per-project: protoMaker resolves useWorktrees from the
+        # project's own settings (default true); the global projects[] entries don't
+        # carry it, so a global-only read would miss an explicit per-project opt-out.
+        # Resolve per-project -> global -> true; a settings-fetch failure degrades to
+        # the global value (a transient error must never flip a readiness verdict).
+        wt = worktrees_global
+        try:
+            ps = (await client.post(f"{base}/api/settings/project", headers=headers,
+                                    json={"projectPath": path})).json()
+            pset = ps.get("settings", ps) if isinstance(ps, dict) else {}
+            if isinstance(pset, dict) and pset.get("useWorktrees") is not None:
+                wt = bool(pset.get("useWorktrees"))
+        except Exception:  # noqa: BLE001
+            row["notes"].append("per-project settings unreadable — used global useWorktrees")
         paused = bool(proj.get("id") in paused_keys or path in paused_keys
                       or (repo and repo in paused_keys) or proj.get("name") in paused_keys)
-        row.update({"worktrees": worktrees_global, "paused": paused, "backlog": backlog,
+        row.update({"worktrees": wt, "paused": paused, "backlog": backlog,
                     "blocked": blocked, "blocked_pct": pct,
                     "dirty_files": len(src_dirty), "runtime_dirt": runtime_dirt})
-        if not worktrees_global:
+        if not repo:
+            row["blockers"].append("no GitHub remote — can't open a PR")
+        if not wt:
             row["blockers"].append("useWorktrees OFF — agents would commit in-place, no PR")
         if paused:
             row["blockers"].append("paused (protoMaker pausedProjects)")
