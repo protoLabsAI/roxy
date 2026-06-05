@@ -260,9 +260,135 @@ async def fleet_sitrep() -> str:
     return json.dumps({"count": len(results), "fleet": fleet, "attention": attention, "projects": results})
 
 
+def _api_base_key() -> tuple[str, str]:
+    base = (os.environ.get("PROTOMAKER_API_BASE") or os.environ.get("AUTOMAKER_API_URL") or "").rstrip("/")
+    return base, (os.environ.get("AUTOMAKER_API_KEY") or "")
+
+
+async def _origin_state(client, base: str, headers: dict, path: str) -> dict:
+    """Open issues + open/merged PRs for a repo, via protoMaker's GitHub App (server-side `gh`)."""
+    state: dict = {"open_issue_numbers": set(), "open_issues": [], "open_prs": [], "merged_prs": []}
+    ir = await client.post(f"{base}/api/github/issues", headers=headers, json={"projectPath": path})
+    for it in (ir.json().get("openIssues") or []):
+        n = it.get("number")
+        if n is not None:
+            state["open_issue_numbers"].add(n)
+            state["open_issues"].append({"number": n, "title": it.get("title")})
+    pr = await client.post(f"{base}/api/github/prs", headers=headers, json={"projectPath": path})
+    pj = pr.json()
+    state["open_prs"] = [{"number": p.get("number"), "title": p.get("title")} for p in (pj.get("openPRs") or [])]
+    state["merged_prs"] = [{"number": p.get("number"), "title": p.get("title")} for p in (pj.get("mergedPRs") or [])]
+    return state
+
+
+@tool
+async def repo_origin_state(project_path: str) -> str:
+    """Origin truth for one repo — open issues + open/merged PRs, no shell, no token.
+
+    Reads protoMaker's GitHub-App-backed `/api/github/issues` + `/api/github/prs`
+    (server-side `gh`), so I can answer "is this actually shipped?" without running
+    git/gh myself (which trips the HITL gate). Returns JSON: {"open_issues":
+    [{number,title}], "open_prs": [...], "merged_prs": [...]}.
+    """
+    base, key = _api_base_key()
+    if not base or not key:
+        return json.dumps({"error": "PROTOMAKER_API_BASE/AUTOMAKER_API_URL or AUTOMAKER_API_KEY not set"})
+    import httpx
+
+    headers = {"X-API-Key": key, "Content-Type": "application/json"}
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            s = await _origin_state(client, base, headers, project_path)
+    except Exception as e:  # noqa: BLE001
+        return json.dumps({"error": f"origin state read failed: {e}"})
+    s.pop("open_issue_numbers", None)
+    return json.dumps(s)
+
+
+_DONE = {"done"}
+
+
+def _verdict(status: str, issue_open: bool) -> str:
+    """Reconcile rule as code: done = issue closed / merged; an OPEN issue means actionable."""
+    done = status in _DONE
+    if done and issue_open:
+        return "over_closed"      # marked done but its issue is still OPEN — don't trust the done
+    if not done and not issue_open:
+        return "maybe_shipped"    # issue closed but feature still open — likely shipped elsewhere
+    return "consistent"
+
+
+@tool
+async def fleet_reconcile() -> str:
+    """Deterministic drift report across the whole fleet — features vs origin truth, in parallel.
+
+    For every project (concurrently): cross-references each issue-linked feature's
+    board status against the live GitHub issue state, applying the reconcile rule
+    in CODE — a `done` feature whose issue is still OPEN is `over_closed` (don't
+    trust the done); an open feature whose issue is CLOSED is `maybe_shipped`. No
+    shell, no hand-judgement.
+
+    Returns JSON: {"fleet": {over_closed,maybe_shipped,consistent,unlinked},
+    "drift": [{repo,feature_id,title,status,issue,issue_open,verdict}],
+    "projects": [{repo, over_closed, maybe_shipped, consistent, unlinked}]}.
+    Only `over_closed` + `maybe_shipped` items appear in `drift` — those are what I act on.
+    """
+    base, key = _api_base_key()
+    if not base or not key:
+        return json.dumps({"error": "PROTOMAKER_API_BASE/AUTOMAKER_API_URL or AUTOMAKER_API_KEY not set"})
+    import asyncio
+
+    import httpx
+
+    headers = {"X-API-Key": key, "Content-Type": "application/json"}
+
+    async def _proj(client, proj):
+        g = proj.get("github") or {}
+        repo = f"{g.get('owner')}/{g.get('repo')}" if g.get("owner") and g.get("repo") else None
+        path = proj.get("path")
+        row = {"repo": repo, "over_closed": 0, "maybe_shipped": 0, "consistent": 0, "unlinked": 0, "drift": []}
+        try:
+            fr = await client.post(f"{base}/api/features/list", headers=headers, json={"projectPath": path})
+            feats = fr.json().get("features") or []
+            origin = await _origin_state(client, base, headers, path)
+        except Exception as e:  # noqa: BLE001
+            row["error"] = str(e)[:80]
+            return row
+        openset = origin["open_issue_numbers"]
+        for f in feats:
+            num = f.get("githubIssueNumber") or f.get("issueNumber")
+            if not num:
+                row["unlinked"] += 1
+                continue
+            v = _verdict(f.get("status") or "", num in openset)
+            row[v] += 1
+            if v != "consistent":
+                row["drift"].append({"repo": repo, "feature_id": f.get("id"), "title": (f.get("title") or "")[:80],
+                                     "status": f.get("status"), "issue": num, "issue_open": num in openset, "verdict": v})
+        return row
+
+    try:
+        async with httpx.AsyncClient(timeout=45) as client:
+            g = await client.get(f"{base}/api/settings/global", headers=headers)
+            projs = g.json().get("settings", g.json()).get("projects") or []
+            rows = await asyncio.gather(*[_proj(client, p) for p in projs])
+    except Exception as e:  # noqa: BLE001
+        return json.dumps({"error": f"fleet reconcile failed: {e}"})
+
+    fleet = {"over_closed": 0, "maybe_shipped": 0, "consistent": 0, "unlinked": 0}
+    drift = []
+    for r in rows:
+        for k in fleet:
+            fleet[k] += r.get(k, 0)
+        drift.extend(r.pop("drift", []))
+    return json.dumps({"fleet": fleet, "drift": drift, "projects": rows})
+
+
 def register(registry) -> None:
     """Entry point — register the fleet power tools."""
     registry.register_tool(repo_github_remote)
     registry.register_tool(fleet_register)
     registry.register_tool(fleet_registry)
     registry.register_tool(fleet_sitrep)
+    registry.register_tool(repo_origin_state)
+    registry.register_tool(fleet_reconcile)
