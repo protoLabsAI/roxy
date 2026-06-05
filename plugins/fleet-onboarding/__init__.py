@@ -389,16 +389,28 @@ async def fleet_readiness() -> str:
     """Auto-mode pre-flight for every project — is it SAFE to start? Deterministic, parallel.
 
     Encodes the preconditions the delivery saga taught us, so I never start a
-    project that will local-merge, block on worktree creation, or churn. Per
-    project (concurrently) it checks: **isolation** on (`useWorktrees`), a **clean
-    base** (no dirty/untracked tree — protoMaker's worktree guard refuses a dirty
-    one), **ready backlog** to actually run, and **not blocked-heavy**. Branch
-    protection / required-checks is enforced by protoMaker at start (there's no
-    pre-check endpoint) and is flagged as such rather than asserted.
+    project that will local-merge, churn, or sit paused. Per project (concurrently)
+    it checks: **isolation** on (`useWorktrees`), **not paused** (protoMaker
+    `pausedProjects`), a **ready backlog** to actually run, and **not blocked-heavy**.
+    Branch protection / required-checks is enforced by protoMaker at start (there's
+    no pre-check endpoint) and is flagged as such rather than asserted.
+
+    **Base dirtiness is NOT a blocker** (corrected 2026-06-05). Verified against
+    protoMaker's ``createWorktreeForBranch`` (post-#4100): it checks out
+    ``origin/<base>`` into a *separate* dir, so the base working tree's
+    uncommitted/untracked files are irrelevant and don't propagate. The old
+    "dirty base → worktree creation will fail" gate was a false premise that
+    over-gated the whole fleet to 0/8 on protoMaker's own ``.automaker/``/``.beads/``
+    runtime churn. We now surface genuine stray *source* files (runtime paths
+    filtered) as an advisory ``notes`` entry, never a blocker. The real
+    worktree-creation failure mode — a configured base branch absent on origin
+    (the #4086 ``origin/dev`` invalid-ref) — now degrades rather than throws and
+    isn't cheaply pre-checkable here; a dirty *feature* worktree is a runtime
+    restart-safety check, also not pre-flight.
 
     Returns JSON: {"ready": ["owner/name", ...], "not_ready": [{repo, blockers}],
-    "compliance_note": "...", "projects": [{repo, ready, worktrees, clean, backlog,
-    blocked, blocked_pct, dirty_files, blockers}]}.
+    "compliance_note": "...", "projects": [{repo, ready, worktrees, paused, backlog,
+    blocked, blocked_pct, dirty_files, runtime_dirt, blockers, notes}]}.
     """
     base, key = _api_base_key()
     if not base or not key:
@@ -409,11 +421,18 @@ async def fleet_readiness() -> str:
 
     headers = {"X-API-Key": key, "Content-Type": "application/json"}
 
-    async def _ready(client, proj, worktrees_global):
+    # protoMaker writes these into a checkout at runtime — never a real readiness
+    # signal, and base dirtiness doesn't block worktree creation regardless.
+    _runtime_dirt = (".automaker/", ".automaker", ".beads/", ".beads")
+
+    def _is_runtime(p: str) -> bool:
+        return p.startswith(_runtime_dirt)
+
+    async def _ready(client, proj, worktrees_global, paused_keys):
         g = proj.get("github") or {}
         repo = f"{g.get('owner')}/{g.get('repo')}" if g.get("owner") and g.get("repo") else None
         path = proj.get("path")
-        row = {"repo": repo, "blockers": []}
+        row = {"repo": repo, "blockers": [], "notes": []}
         try:
             sj = (await client.post(f"{base}/api/sitrep", headers=headers, json={"projectPath": path})).json()
             s = sj.get("board") or sj.get("sitrep") or sj
@@ -426,27 +445,49 @@ async def fleet_readiness() -> str:
         backlog = s.get("backlog") or 0
         blocked = s.get("blocked") or 0
         pct = round(100 * blocked / total) if total else 0
-        clean = len(files) == 0
-        row.update({"worktrees": worktrees_global, "clean": clean, "backlog": backlog,
-                    "blocked": blocked, "blocked_pct": pct, "dirty_files": len(files)})
+        # Split base dirt into runtime churn (.automaker/.beads — ignored) vs genuine
+        # source changes (advisory only; not a worktree blocker — see docstring).
+        paths = [(f.get("filePath") if isinstance(f, dict) else f) or "" for f in files]
+        src_dirty = [p for p in paths if p and not _is_runtime(p)]
+        runtime_dirt = len(paths) - len(src_dirty)
+        paused = bool(proj.get("id") in paused_keys or path in paused_keys
+                      or (repo and repo in paused_keys) or proj.get("name") in paused_keys)
+        row.update({"worktrees": worktrees_global, "paused": paused, "backlog": backlog,
+                    "blocked": blocked, "blocked_pct": pct,
+                    "dirty_files": len(src_dirty), "runtime_dirt": runtime_dirt})
         if not worktrees_global:
             row["blockers"].append("useWorktrees OFF — agents would commit in-place, no PR")
-        if not clean:
-            row["blockers"].append(f"dirty base ({len(files)} changed/untracked) — worktree creation will fail")
+        if paused:
+            row["blockers"].append("paused (protoMaker pausedProjects)")
         if backlog == 0:
             row["blockers"].append("no ready backlog")
         if pct >= 25:
             row["blockers"].append(f"blocked-heavy ({pct}%)")
+        if src_dirty:
+            row["notes"].append(
+                f"{len(src_dirty)} uncommitted source file(s) (advisory — inert for "
+                f"worktree creation): {', '.join(src_dirty[:5])}"
+                + (" …" if len(src_dirty) > 5 else ""))
         row["ready"] = not row["blockers"]
         return row
+
+    def _paused_keys(settings) -> set:
+        keys: set = set()
+        for p in settings.get("pausedProjects") or []:
+            if isinstance(p, str):
+                keys.add(p)
+            elif isinstance(p, dict):
+                keys.update(v for v in (p.get("id"), p.get("path"), p.get("name")) if v)
+        return keys
 
     try:
         async with httpx.AsyncClient(timeout=45) as client:
             g = (await client.get(f"{base}/api/settings/global", headers=headers)).json()
             settings = g.get("settings", g)
             worktrees_global = bool(settings.get("useWorktrees"))
+            paused_keys = _paused_keys(settings)
             projs = settings.get("projects") or []
-            rows = await asyncio.gather(*[_ready(client, p, worktrees_global) for p in projs])
+            rows = await asyncio.gather(*[_ready(client, p, worktrees_global, paused_keys) for p in projs])
     except Exception as e:  # noqa: BLE001
         return json.dumps({"error": f"fleet readiness failed: {e}"})
 
