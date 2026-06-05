@@ -1576,6 +1576,7 @@ async def _chat_langgraph_stream(
     *,
     caller_trace: dict | None = None,
     resume: bool = False,
+    thread_key: str | None = None,
 ):
     """Async generator — yields (event_type, payload) tuples from the
     LangGraph run. Consumed by ``a2a_executor.ProtoAgentExecutor`` to
@@ -1666,9 +1667,12 @@ async def _chat_langgraph_stream(
 
             # thread_id keys this session's history in the checkpointer (bound
             # at compile time in create_agent_graph). The prefix isolates A2A
-            # sessions from Gradio chat in the shared MemorySaver.
+            # sessions from Gradio chat in the shared MemorySaver. ``thread_key``,
+            # when set, keys the thread to the PROJECT (roxy Phase 2) so every
+            # turn scoped to a project shares one continuous working memory,
+            # decoupled from the per-conversation A2A ``context_id``.
             config = {
-                "configurable": {"thread_id": f"a2a:{session_id}"},
+                "configurable": {"thread_id": f"a2a:{thread_key or session_id}"},
                 "recursion_limit": 200,
             }
 

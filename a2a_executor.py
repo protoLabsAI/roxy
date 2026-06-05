@@ -39,6 +39,7 @@ from a2a.server.tasks import TaskUpdater
 from a2a.types import Part, Task, TaskState, TaskStatus
 from google.protobuf import json_format, struct_pb2
 
+import project_session
 import protolabs_a2a as pa
 
 logger = logging.getLogger(__name__)
@@ -196,8 +197,15 @@ class ProtoAgentExecutor(AgentExecutor):
         # project, prepend a prominent scope banner so every tool binds to that
         # project's path and a multi-project board can't bleed across turns.
         scope = _extract_project_scope(context)
+        # Per-project session (roxy Phase 2): the checkpoint thread is keyed to the
+        # PROJECT, not this A2A conversation, so every turn on a project shares one
+        # continuous working memory. ``None`` for an unscoped/fleet-wide turn.
+        session = project_session.resolve(scope)
         if scope:
             text = _project_scope_banner(scope) + "\n\n" + (text or "")
+            if session:
+                logger.info("[scope] turn pinned to project %s (thread a2a:%s)",
+                            session.slug, session.thread_key)
         caller_trace = _extract_caller_trace(context)
 
         started = time.monotonic()
@@ -232,6 +240,7 @@ class ProtoAgentExecutor(AgentExecutor):
         try:
             async for event_type, payload in self._stream_factory(
                 text, context.context_id, resume=resume, caller_trace=caller_trace,
+                thread_key=(session.thread_key if session else None),
             ):
                 if event_type == "text":
                     accumulated += payload
