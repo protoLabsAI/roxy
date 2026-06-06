@@ -2,6 +2,29 @@
 
 ## [0.16.0] - 2026-06-06
 
+First roxy release since v0.13.0 — syncs to upstream protoAgent v0.16.0 and ships
+roxy's accumulated operator work.
+
+### Roxy
+- **Deterministic fleet toolkit** — `fleet_registry` / `fleet_sitrep` /
+  `fleet_readiness` / `fleet_reconcile` / `repo_origin_state`: fleet state +
+  auto-mode pre-flight from the protoMaker registry + GitHub-App origin truth,
+  no shell, in parallel.
+- **Domain separation** — per-request project scope (metadata → scope banner) +
+  per-project session memory (working memory keyed to the project via the
+  upstream `thread_id` resolver seam), so one Roxy behaves as N project-scoped
+  operators.
+- **Operator-fork seam adoption** — roxy's identity (A2A skills + card
+  description) and per-project memory ride upstream's config/plugin seams
+  (`a2a.skills`/`a2a.description`, `register_a2a_skill`,
+  `register_thread_id_resolver`), keeping `server/a2a.py` / `server/chat.py`
+  **zero-delta vs upstream** so syncs stay clean.
+- **Board ↔ GitHub auto-sync** — board features auto-close when their linked
+  issue closes (protoMaker forwarder); the reconcile rule (DONE = merged to
+  origin's default branch) is enforced in code.
+- **Deploy guard** — `a2a.require_routable_url` enabled: roxy refuses to start if
+  its agent card would advertise a loopback URL (belt to the hub's URL-pinning).
+
 ### Added
 - **Eval-case gating (`requires_env`)** — an eval case can now declare
   `requires_env: [VAR, …]`; when any is unset the case is **skipped** (shown
