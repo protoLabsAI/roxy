@@ -2,6 +2,8 @@
 
 ## [0.16.0] - 2026-06-06
 
+## [0.16.0] - 2026-06-06
+
 ### Added
 - **Eval-case gating (`requires_env`)** — an eval case can now declare
   `requires_env: [VAR, …]`; when any is unset the case is **skipped** (shown
