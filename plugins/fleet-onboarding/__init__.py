@@ -661,6 +661,188 @@ def _roxy_thread_id_resolver(request_metadata: dict, session_id: str):
     return f"a2a:{session.thread_key}" if session else None
 
 
+
+# ── Read-only GitHub access (roxy's triage eyes; uses ROXY_GH_READ_TOKEN) ──────
+# Roxy is READ-ONLY on GitHub: she reads repos/CI/PRs/issues to triage + assign,
+# and delegates every write. These hit api.github.com directly (httpx, no shell,
+# no HITL gate) with a read-scoped token, so they work across the whole fleet —
+# including repos the protoMaker GitHub-App PAT can't read (protoContent/protoPen).
+_GH_API = "https://api.github.com"
+
+
+def _gh_token() -> str:
+    return (os.environ.get("ROXY_GH_READ_TOKEN") or "").strip()
+
+
+def _gh_headers() -> dict:
+    return {
+        "Authorization": f"Bearer {_gh_token()}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+
+
+async def _gh_get(client, path: str, params: dict | None = None):
+    r = await client.get(f"{_GH_API}{path}", headers=_gh_headers(), params=params or {})
+    r.raise_for_status()
+    return r.json()
+
+
+_GH_ERR_RE = re.compile(
+    r"(error|fail|✕|✗|×|not ok|exit code|command not found|exception|"
+    r"traceback|assertion|timeout|expected .* to|cannot |refused|unauthorized|"
+    r"forbidden|panic|fatal)",
+    re.IGNORECASE,
+)
+
+
+@tool
+async def gh_ci_runs(repo: str, branch: str = "", limit: int = 15) -> str:
+    """Recent GitHub Actions runs for a repo (read-only) — for CI triage.
+
+    ``repo`` is ``owner/name`` (e.g. ``protoLabsAI/protoCLI``); optional ``branch``
+    filters (e.g. ``main``). Returns JSON {"runs": [{id, name, status, conclusion,
+    branch, event, created, url}]}. Feed a failing run's id to ``gh_ci_failure``.
+    """
+    if not _gh_token():
+        return json.dumps({"error": "ROXY_GH_READ_TOKEN not set"})
+    import httpx
+
+    params = {"per_page": max(1, min(int(limit), 50))}
+    if branch.strip():
+        params["branch"] = branch.strip()
+    try:
+        async with httpx.AsyncClient(timeout=30) as c:
+            d = await _gh_get(c, f"/repos/{repo}/actions/runs", params)
+    except Exception as e:  # noqa: BLE001
+        return json.dumps({"error": f"gh_ci_runs failed: {str(e)[:150]}"})
+    runs = [
+        {"id": w.get("id"), "name": w.get("name"), "status": w.get("status"),
+         "conclusion": w.get("conclusion"), "branch": w.get("head_branch"),
+         "event": w.get("event"), "created": w.get("created_at"), "url": w.get("html_url")}
+        for w in (d.get("workflow_runs") or [])
+    ]
+    return json.dumps({"repo": repo, "runs": runs})
+
+
+@tool
+async def gh_ci_failure(repo: str, run_id: int, max_lines: int = 40) -> str:
+    """Why a GitHub Actions run failed (read-only) — failed jobs + error lines.
+
+    ``repo`` = ``owner/name``; ``run_id`` from ``gh_ci_runs``. For each FAILED job
+    it pulls the log and returns the error-relevant lines (matched, deduped, capped
+    at ``max_lines``; falls back to the log tail) — the deterministic version of
+    hand-grepping a CI log. Returns JSON {"failed_jobs": [{name, failed_steps,
+    errors:[..]}]}.
+    """
+    if not _gh_token():
+        return json.dumps({"error": "ROXY_GH_READ_TOKEN not set"})
+    import httpx
+
+    cap = max(5, min(int(max_lines), 80))
+    try:
+        async with httpx.AsyncClient(timeout=60, follow_redirects=True) as c:
+            jobs = (await _gh_get(c, f"/repos/{repo}/actions/runs/{run_id}/jobs",
+                                  {"per_page": 50})).get("jobs") or []
+            failed = [j for j in jobs if j.get("conclusion") == "failure"]
+            out = []
+            for j in failed[:4]:
+                steps = [s.get("name") for s in (j.get("steps") or [])
+                         if s.get("conclusion") == "failure"]
+                errs: list[str] = []
+                try:
+                    lr = await c.get(f"{_GH_API}/repos/{repo}/actions/jobs/{j['id']}/logs",
+                                     headers=_gh_headers())
+                    if lr.status_code == 200:
+                        lines = [ln.split("Z ", 1)[-1].rstrip()
+                                 for ln in lr.text.splitlines() if ln.strip()]
+                        seen: set = set()
+                        uniq: list[str] = []
+                        for ln in lines:
+                            if _GH_ERR_RE.search(ln):
+                                k = ln[:120]
+                                if k not in seen:
+                                    seen.add(k)
+                                    uniq.append(ln[:200])
+                        errs = uniq[-cap:] if uniq else [ln[:200] for ln in lines[-cap:]]
+                except Exception as e:  # noqa: BLE001
+                    errs = [f"<log fetch failed: {str(e)[:80]}>"]
+                out.append({"name": j.get("name"), "failed_steps": steps, "errors": errs})
+    except Exception as e:  # noqa: BLE001
+        return json.dumps({"error": f"gh_ci_failure failed: {str(e)[:150]}"})
+    return json.dumps({"repo": repo, "run_id": run_id, "failed_jobs": out})
+
+
+@tool
+async def gh_issue(repo: str, number: int) -> str:
+    """Full detail of one GitHub issue (read-only). ``repo`` = ``owner/name``.
+    Returns JSON {number, title, state, labels, author, created, updated, body, url}."""
+    if not _gh_token():
+        return json.dumps({"error": "ROXY_GH_READ_TOKEN not set"})
+    import httpx
+
+    try:
+        async with httpx.AsyncClient(timeout=30) as c:
+            d = await _gh_get(c, f"/repos/{repo}/issues/{number}")
+    except Exception as e:  # noqa: BLE001
+        return json.dumps({"error": f"gh_issue failed: {str(e)[:150]}"})
+    return json.dumps({
+        "number": d.get("number"), "title": d.get("title"), "state": d.get("state"),
+        "labels": [l.get("name") for l in (d.get("labels") or [])],
+        "author": (d.get("user") or {}).get("login"), "created": d.get("created_at"),
+        "updated": d.get("updated_at"), "body": (d.get("body") or "")[:2000],
+        "url": d.get("html_url"),
+    })
+
+
+@tool
+async def gh_pr(repo: str, number: int) -> str:
+    """Full detail of one GitHub pull request (read-only). ``repo`` = ``owner/name``.
+    Returns JSON {number, title, state, draft, merged, mergeable, base, head, author,
+    created, body, url}."""
+    if not _gh_token():
+        return json.dumps({"error": "ROXY_GH_READ_TOKEN not set"})
+    import httpx
+
+    try:
+        async with httpx.AsyncClient(timeout=30) as c:
+            d = await _gh_get(c, f"/repos/{repo}/pulls/{number}")
+    except Exception as e:  # noqa: BLE001
+        return json.dumps({"error": f"gh_pr failed: {str(e)[:150]}"})
+    return json.dumps({
+        "number": d.get("number"), "title": d.get("title"), "state": d.get("state"),
+        "draft": d.get("draft"), "merged": d.get("merged"), "mergeable": d.get("mergeable"),
+        "base": (d.get("base") or {}).get("ref"), "head": (d.get("head") or {}).get("ref"),
+        "author": (d.get("user") or {}).get("login"), "created": d.get("created_at"),
+        "body": (d.get("body") or "")[:2000], "url": d.get("html_url"),
+    })
+
+
+@tool
+async def gh_issues(repo: str, state: str = "open", limit: int = 30) -> str:
+    """List a repo's issues (read-only) — ``state`` in open|closed|all. ``repo`` =
+    ``owner/name``. Unlike repo_origin_state (open-only) this can show closed/all,
+    so you can see what's already done. Returns JSON {"issues": [{number, title,
+    state, labels}]} (pull requests excluded)."""
+    if not _gh_token():
+        return json.dumps({"error": "ROXY_GH_READ_TOKEN not set"})
+    import httpx
+
+    st = state if state in ("open", "closed", "all") else "open"
+    try:
+        async with httpx.AsyncClient(timeout=30) as c:
+            d = await _gh_get(c, f"/repos/{repo}/issues",
+                              {"state": st, "per_page": max(1, min(int(limit), 100))})
+    except Exception as e:  # noqa: BLE001
+        return json.dumps({"error": f"gh_issues failed: {str(e)[:150]}"})
+    items = [
+        {"number": i.get("number"), "title": i.get("title"), "state": i.get("state"),
+         "labels": [l.get("name") for l in (i.get("labels") or [])]}
+        for i in (d or []) if "pull_request" not in i
+    ]
+    return json.dumps({"repo": repo, "state": st, "issues": items})
+
+
 def register(registry) -> None:
     """Entry point — register the fleet power tools."""
     registry.register_tool(repo_github_remote)
@@ -670,6 +852,12 @@ def register(registry) -> None:
     registry.register_tool(repo_origin_state)
     registry.register_tool(fleet_reconcile)
     registry.register_tool(fleet_readiness)
+    # read-only GitHub triage eyes (ROXY_GH_READ_TOKEN) — repos/CI/PRs/issues
+    registry.register_tool(gh_ci_runs)
+    registry.register_tool(gh_ci_failure)
+    registry.register_tool(gh_issue)
+    registry.register_tool(gh_pr)
+    registry.register_tool(gh_issues)
     # roxy identity + memory scoping via the upstream fork seams (#570/#571)
     for _spec in _A2A_SKILLS:
         registry.register_a2a_skill(_spec)
