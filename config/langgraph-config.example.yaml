@@ -40,6 +40,8 @@ model:
   temperature: 0.2
   max_tokens: 32768  # 32k — required headroom for the Qwen models we run
   max_iterations: 50
+  request_timeout: 120   # per-call timeout (s) on the model client — bounds a hung/slow gateway
+  max_retries: 2         # transient-error retries inside the client
   # Advanced sampling — all optional; omit to use the gateway / model-card
   # defaults. top_p + presence_penalty are standard OpenAI params; top_k +
   # repetition_penalty + chat_template_kwargs ride extra_body for vLLM-style
@@ -111,6 +113,11 @@ skills:
 # free-text "chat" placeholder so a fresh clone stays callable. The card `name`
 # already follows identity.name / AGENT_NAME.
 a2a:
+  # Deploy-time guard: refuse to start if the card would advertise a loopback URL
+  # (e.g. A2A_PUBLIC_URL unset on a deployed agent → http://127.0.0.1:.../a2a,
+  # unreachable to remote consumers). Leave off for local/desktop runs (loopback
+  # is correct same-host); turn ON for any agent other agents dial over the network.
+  # require_routable_url: true
   # description: "Acme Bot — turns support tickets into triaged, drafted replies."
   # skills:
   #   - id: triage_ticket

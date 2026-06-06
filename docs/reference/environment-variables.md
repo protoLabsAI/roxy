@@ -29,6 +29,7 @@ Every env var the template reads at runtime.
 | Variable | Default | What |
 |---|---|---|
 | `PROTOAGENT_UI` | `full` | UI deployment tier (or `--ui`): `full` (Gradio + React console + API/A2A), `console` (console + API/A2A, no Gradio), `none` (API + A2A + `/metrics` only — the lean headless stack). The Docker image defaults to `none`. |
+| `PROTOAGENT_HOST` | `127.0.0.1` | Bind address (or `--host`). **Defaults to loopback** so a local/desktop run isn't exposed on all interfaces — the operator/console API (`/api/*`, `/api/chat`, `/v1/*`) is otherwise reachable by anything that can hit the port. The container entrypoint + deploy manifests set `0.0.0.0` because their boundary is the published port + network policy, not the in-container bind. Binding non-loopback **without** an A2A auth token logs a security warning at startup. |
 | `PROTOAGENT_HEADLESS` | (unset) | **Deprecated** alias for `PROTOAGENT_UI=console` (or `--headless`). |
 | `PROTOAGENT_HEADLESS_SETUP` | (unset) | Set `1`/`true` to auto-complete setup from a validated config even outside the `none` tier (no wizard). The `none` tier implies this. |
 
@@ -38,9 +39,13 @@ Setup without the wizard: `python -m server --setup` validates the live config (
 
 | Variable | Default | What |
 |---|---|---|
-| `A2A_AUTH_TOKEN` | (unset — open mode) | Required bearer token for all A2A routes (POST `/a2a`, `message/send`, `tasks/*`, SSE streaming). When set, requests without `Authorization: Bearer <token>` get 401. Token comparison uses `hmac.compare_digest` (constant-time). |
+| `A2A_AUTH_TOKEN` | (unset — open mode) | Required bearer token for the A2A routes **and** the operator/console + OpenAI-compat APIs — `/a2a`, `/api/*`, `/api/chat`, `/v1/*`. When set, requests without `Authorization: Bearer <token>` get 401. Constant-time comparison (`hmac.compare_digest`). |
 
-When unset, the handler logs a WARNING at startup (`"A2A auth token not configured — endpoint is open"`) and accepts all traffic — appropriate for local development, not production. When set, the agent card advertises `securitySchemes.bearer` so A2A consumers know to present credentials.
+When unset, startup logs a WARNING (`"A2A auth token not configured — endpoint is open"`) and accepts all traffic — fine for local dev (and safe behind the loopback-default bind, see `PROTOAGENT_HOST`), not for an exposed deployment. When set, the agent card advertises `securitySchemes.bearer`.
+
+**Scope.** The guard covers everything that can drive the agent: `/a2a`, the operator API (`/api/*` — run subagents, rewrite config/SOUL, schedule jobs), `/api/chat`, and `/v1/*`. **Public (never guarded):** `/healthz`, `/.well-known/agent-card.json`, `/metrics`, the static console at `/app`, and the read-only `/api/events` SSE stream (browsers' `EventSource` can't send an `Authorization` header; it exposes only activity/inbox events, no action).
+
+**Console.** When a token is set, the React console reads it from `localStorage["protoagent.authToken"]` and sends it as a bearer on every API + A2A call. Set it once in the browser (`localStorage.setItem("protoagent.authToken", "<token>")`) for a token-protected deployment; local/desktop runs (no token) need nothing.
 
 ## A2A agent-card endpoint
 
