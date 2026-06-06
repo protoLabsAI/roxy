@@ -1540,6 +1540,23 @@ textarea {
   font-weight: 600;
 }
 
+/* Background chat-streaming indicator on the Chat rail button — a small pulsing
+   dot (no count), shown while a turn streams on another tab. */
+.rail-dot {
+  position: absolute;
+  top: 6px;
+  right: 8px;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #46c46a;
+  animation: rail-dot-pulse 1.4s ease-in-out infinite;
+}
+@keyframes rail-dot-pulse {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.45; transform: scale(0.7); }
+}
+
 .rail button {
   position: relative;
 }
@@ -3042,3 +3059,55 @@ textarea {
 .icon-button:hover { background: var(--bg-hover); color: var(--fg); }
 .icon-button.danger:hover { color: var(--error); border-color: color-mix(in srgb, var(--error) 40%, transparent); }
 .playbook-foot { margin-top: 16px; font-size: 11.5px; color: var(--fg-muted); display: flex; align-items: center; gap: 6px; }
+
+/* ── Delegates panel (ADR 0025) — Settings → Integrations ──────────────────── */
+.delegates-section .subagent-row strong { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.delegate-type-badge {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  padding: 1px 6px;
+  border-radius: 4px;
+  border: 1px solid var(--border);
+  color: var(--brand-violet-light);
+}
+.delegate-badge-warn { font-size: 10px; color: #e0a23a; }
+.delegate-badge-ok { font-size: 10px; color: var(--fg-muted); }
+.delegate-form {
+  margin-top: 14px;
+  padding: 14px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg);
+  display: grid;
+  gap: 12px;
+}
+.delegate-form-head { display: flex; align-items: center; justify-content: space-between; }
+.delegate-type-picker { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 8px; }
+.delegate-type-tile {
+  display: grid;
+  gap: 3px;
+  text-align: left;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg);
+  color: var(--fg);
+  cursor: pointer;
+}
+.delegate-type-tile:hover { border-color: var(--brand-violet); }
+.delegate-type-tile.active { border-color: var(--brand-violet); background: color-mix(in srgb, var(--brand-violet) 12%, var(--bg)); }
+.delegate-type-tile-label { font-size: 13px; font-weight: 600; }
+.delegate-type-tile-blurb { font-size: 11px; color: var(--fg-muted); }
+.delegate-field-help { font-size: 11px; color: var(--fg-muted); }
+.delegate-health { font-size: 10px; line-height: 1; }
+.delegate-health.ok { color: #46c46a; }
+.delegate-health.down { color: #e0533a; }
+.delegate-health.unknown { color: var(--fg-muted); }
+
+/* Plugin-contributed console views (ADR 0026) — optional subnav above, iframe fills. */
+.plugin-view { padding: 0; overflow: hidden; display: flex; flex-direction: column; }
+.plugin-view-body { position: relative; flex: 1; min-height: 0; }
+.plugin-view-frame { width: 100%; height: 100%; border: 0; background: var(--bg); display: block; }
+.plugin-view-state { display: flex; align-items: center; gap: 8px; padding: 24px; color: var(--fg-muted); font-size: 13px; }
