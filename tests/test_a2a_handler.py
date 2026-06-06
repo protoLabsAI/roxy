@@ -269,10 +269,8 @@ async def test_terminal_artifact_carries_all_extensions_in_order():
 
 
 @pytest.mark.asyncio
-async def test_only_confidence_part_when_nothing_else_to_report():
-    """A bare text completion yields the text part + the always-on confidence
-    DataPart (declared on the card → emitted every turn, roxy#22) and nothing
-    else: no empty worldstate-delta, and no cost part when there's no usage."""
+async def test_no_extension_parts_when_nothing_to_report():
+    """A bare text completion yields only the text part — no empty DataParts."""
     async def stream(text, ctx, *, resume=False, caller_trace=None, **kwargs):
         yield ("done", "just text")
 
@@ -281,10 +279,7 @@ async def test_only_confidence_part_when_nothing_else_to_report():
         task = (await _send_msg(c)).json()["result"]["task"]
         final = await _poll_terminal(c, task["id"])
     parts = final["artifacts"][0]["parts"]
-    assert parts[0]["text"] == "just text"
-    # confidence is the only extension part — worldstate/cost stay absent when empty.
-    mimes = [p.get("metadata", {}).get("mimeType") for p in parts[1:]]
-    assert mimes == [pa.CONFIDENCE_MIME]
+    assert len(parts) == 1 and parts[0]["text"] == "just text"
 
 
 @pytest.mark.asyncio

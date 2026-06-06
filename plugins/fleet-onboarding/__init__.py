@@ -19,6 +19,8 @@ from __future__ import annotations
 import json
 import os
 import re
+
+import project_session
 from pathlib import Path
 
 from langchain_core.tools import tool
@@ -518,6 +520,147 @@ async def fleet_readiness() -> str:
     })
 
 
+# A2A card skills (roxy identity) — registered via the upstream #570 seam
+# (registry.register_a2a_skill) so server/a2a.py is never edited on a fork.
+_A2A_SKILLS: list[dict] = [
+    {
+        "id": "portfolio_sitrep",
+        "name": "Portfolio SitRep",
+        "description": "Sweep every managed protoMaker project and return a roll-up: a portfolio total then per-project flowing / stalled / blocked.",
+        "tags": ["pm", "status"],
+        "examples": ["portfolio_sitrep"],
+    },
+    {
+        "id": "board_sweep",
+        "name": "Board Sweep",
+        "description": "Sweep the portfolio, then take the smallest unblocking action per project and report what was done.",
+        "tags": ["pm", "unblock"],
+        "examples": ["board_sweep", "board_sweep protocli"],
+    },
+    {
+        "id": "project_decompose",
+        "name": "Project Decompose",
+        "description": "Decompose a project into epics -> milestones -> features (research -> PRD -> milestones -> features), pausing at the human approval gate.",
+        "tags": ["pm", "planning"],
+        "examples": ["project_decompose <project>"],
+    },
+    {
+        "id": "unblock_feature",
+        "name": "Unblock Feature",
+        "description": "Investigate a blocked/stalled feature and take the smallest unblocking action, or escalate with a crisp ask.",
+        "tags": ["pm", "unblock"],
+        "examples": ["unblock_feature <featureId>"],
+    },
+    {
+        "id": "audit_project",
+        "name": "Audit Project",
+        "description": "Audit a project (a local dir or GitHub repo), read-only: inspect code, config, tests and deploy setup and return a prioritized, evidence-backed backlog proposal (features / tech-debt / bugs). Assessment only — stops before onboarding.",
+        "tags": ["pm", "audit"],
+        "examples": ["audit_project <dir|owner/repo>", "audit the portfolio"],
+    },
+    {
+        # Structured: the #476 finalizer enforces output_schema and emits the
+        # validated onboarding plan as an onboarding-plan-v1 DataPart alongside
+        # the prose. The skillHint surfaces [skill: onboard_project], anchoring
+        # the lead to the onboard-project disk-skill playbook (not project_decompose).
+        "id": "onboard_project",
+        "name": "Onboard Project",
+        "description": "Onboard a project (a local dir or GitHub repo) into the protoMaker fleet: read its conformance gaps against the workspace-config + CI-lockdown standards, create the onboarding project with a two-epic board (fleet-conformance true-up + the audit's product backlog), and register it via /api/onboard. Branch protection is an operator step. Read-only; proposes first, executes on approval.",
+        "tags": ["pm", "onboarding", "planning"],
+        "examples": ["onboard_project <dir|owner/repo>", "onboard the portfolio"],
+        "result_mime": "application/vnd.protolabs.onboarding-plan-v1+json",
+        "output_schema": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "project": {"type": "string", "description": "project slug, e.g. portfolio"},
+                "target": {"type": "string", "description": "local path or owner/repo audited"},
+                "summary": {"type": "string", "description": "2-3 sentence read: what it is + stack"},
+                "conformance": {
+                    "type": "array",
+                    "description": "one row per workspace-config / CI-lockdown rule",
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "properties": {
+                            "rule": {"type": "string"},
+                            "status": {"type": "string", "enum": ["pass", "fail", "unknown"]},
+                            "trueUp": {"type": "string", "description": "action to close the gap; empty if pass"},
+                        },
+                        "required": ["rule", "status"],
+                    },
+                },
+                "board": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "description": "the two-epic onboarding board",
+                    "properties": {
+                        "fleetConformance": {
+                            "type": "array",
+                            "description": "true-up features; actor=operator for branch protection",
+                            "items": {
+                                "type": "object",
+                                "additionalProperties": False,
+                                "properties": {
+                                    "title": {"type": "string"},
+                                    "actor": {"type": "string", "enum": ["agent", "operator"]},
+                                },
+                                "required": ["title", "actor"],
+                            },
+                        },
+                        "productBacklog": {
+                            "type": "array",
+                            "description": "features / tech-debt / bugs from the audit",
+                            "items": {
+                                "type": "object",
+                                "additionalProperties": False,
+                                "properties": {
+                                    "title": {"type": "string"},
+                                    "priority": {"type": "string", "enum": ["P0", "P1", "P2"]},
+                                },
+                                "required": ["title", "priority"],
+                            },
+                        },
+                    },
+                    "required": ["fleetConformance", "productBacklog"],
+                },
+                "fleetRegister": {"type": "string", "description": "the exact POST /api/onboard call to run on approval"},
+                "operatorActions": {"type": "array", "items": {"type": "string"}, "description": "e.g. the apply-branch-protection command + ruleset prerequisite"},
+                "openQuestions": {"type": "array", "items": {"type": "string"}},
+            },
+            "required": ["project", "conformance", "board", "fleetRegister"],
+        },
+    },
+    {
+        "id": "chat",
+        "name": "Chat",
+        "description": "General-purpose chat / Q&A about the portfolio.",
+        "tags": ["general"],
+        "examples": ["what's the portfolio status?"],
+    },
+]
+
+
+def _roxy_thread_id_resolver(request_metadata: dict, session_id: str):
+    """Key working memory to the PROJECT (roxy domain separation, Phase 2),
+    derived from A2A request metadata. This is the upstream #571 thread_id-resolver
+    seam, replacing the old executor ``thread_key`` plumbing: returns the
+    project-scoped thread_id when the turn is pinned to a project, else ``None``
+    so the chat backend falls back to the default ``a2a:<session_id>``.
+    """
+    md = request_metadata or {}
+    path = md.get("projectPath") or md.get("project_path")
+    name = (md.get("project") or md.get("projectSlug")
+            or md.get("projectRepo") or md.get("project_slug"))
+    scope: dict = {}
+    if isinstance(path, str) and path.strip():
+        scope["path"] = path.strip()
+    if isinstance(name, str) and name.strip():
+        scope["name"] = name.strip()
+    session = project_session.resolve(scope)
+    return f"a2a:{session.thread_key}" if session else None
+
+
 def register(registry) -> None:
     """Entry point — register the fleet power tools."""
     registry.register_tool(repo_github_remote)
@@ -527,3 +670,7 @@ def register(registry) -> None:
     registry.register_tool(repo_origin_state)
     registry.register_tool(fleet_reconcile)
     registry.register_tool(fleet_readiness)
+    # roxy identity + memory scoping via the upstream fork seams (#570/#571)
+    for _spec in _A2A_SKILLS:
+        registry.register_a2a_skill(_spec)
+    registry.register_thread_id_resolver(_roxy_thread_id_resolver)

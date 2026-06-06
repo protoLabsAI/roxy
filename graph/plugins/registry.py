@@ -47,10 +47,12 @@ class PluginRegistry:
         self.host = HOST
         self.tools: list = []
         self.skill_dirs: list[Path] = []
+        self.a2a_skills: list[dict] = []  # A2A card skill specs (#570)
         self.routers: list[dict] = []     # {"router", "prefix"}
         self.surfaces: list[dict] = []    # {"name", "start", "stop"}
         self.subagents: list = []         # SubagentConfig instances
         self.mcp_servers: list = []       # factories: config -> entry dict | None
+        self.thread_id_resolver = None    # (request_metadata, session_id) -> str (#571)
 
     def register_tool(self, tool) -> None:
         """Expose a LangChain tool to the agent."""
@@ -73,6 +75,33 @@ class PluginRegistry:
         if not p.is_absolute():
             p = self.plugin_dir / p
         self.skill_dirs.append(p)
+
+    def register_a2a_skill(self, spec: dict) -> None:
+        """Contribute an A2A *card* skill — advertised on the agent card and,
+        when it declares ``output_schema`` + ``result_mime``, enforced by the
+        executor's structured finalizer (#570). Distinct from
+        ``register_skill_dir`` (disk ``SKILL.md`` procedural memory): this is what
+        the card advertises to callers. ``spec`` is a dict with at least
+        ``id``/``name``/``description`` (+ optional ``tags``/``examples``/
+        ``output_schema``/``result_mime``)."""
+        if not isinstance(spec, dict) or not spec.get("id") or not spec.get("name"):
+            log.warning("[plugins] %s: register_a2a_skill needs a dict with id+name: %r",
+                        self.plugin_id, spec)
+            return
+        self.a2a_skills.append(spec)
+
+    def register_thread_id_resolver(self, fn) -> None:
+        """Override how the checkpointer ``thread_id`` is derived for each turn
+        (#571): ``fn(request_metadata: dict, session_id: str) -> str``. Lets a
+        fork scope memory off request metadata (e.g. per-project working memory)
+        without editing ``server/chat.py``. One resolver wins — last registration
+        across enabled plugins (a warning fires if more than one is contributed).
+        Unset ⇒ the template default (``a2a:<session_id>``)."""
+        if not callable(fn):
+            log.warning("[plugins] %s: register_thread_id_resolver needs a callable: %r",
+                        self.plugin_id, fn)
+            return
+        self.thread_id_resolver = fn
 
     def register_router(self, router, prefix: str | None = None) -> None:
         """Mount a FastAPI ``APIRouter`` on the server (ADR 0018).

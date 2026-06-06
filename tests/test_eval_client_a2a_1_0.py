@@ -33,12 +33,8 @@ import evals.client as ec
 from a2a_executor import ProtoAgentExecutor, set_terminal_hook
 
 
-async def _hello_stream(text, ctx, *, resume=False, caller_trace=None, thread_key=None):
-    """A minimal lead stream: some text + a usage frame → terminal.
-
-    ``thread_key`` mirrors the real stream factory's signature (roxy per-project
-    session memory, #48) — the executor passes it through on every call.
-    """
+async def _hello_stream(text, ctx, *, resume=False, caller_trace=None, **kwargs):
+    """A minimal lead stream: some text + a usage frame → terminal."""
     yield ("text", "hello world")
     yield ("usage", {"input_tokens": 10, "output_tokens": 5, "cost_usd": 0.001})
     yield ("done", "hello world")

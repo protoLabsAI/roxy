@@ -28,10 +28,12 @@ log = logging.getLogger("protoagent.plugins")
 class PluginLoadResult:
     tools: list = field(default_factory=list)
     skill_dirs: list = field(default_factory=list)
+    a2a_skills: list = field(default_factory=list)  # A2A card skill specs (#570)
     routers: list = field(default_factory=list)    # {plugin_id, router, prefix} (ADR 0018)
     surfaces: list = field(default_factory=list)    # {plugin_id, name, start, stop}
     subagents: list = field(default_factory=list)   # SubagentConfig
     mcp_servers: list = field(default_factory=list)  # factories: config -> entry|None (ADR 0019)
+    thread_id_resolver: object = None  # (request_metadata, session_id) -> str (#571); last plugin wins
     meta: list[dict] = field(default_factory=list)
 
 
@@ -190,6 +192,12 @@ def load_plugins(config, *, core_tool_names: set[str] | None = None) -> PluginLo
 
         result.tools.extend(kept)
         result.skill_dirs.extend(registry.skill_dirs)
+        result.a2a_skills.extend(registry.a2a_skills)
+        if registry.thread_id_resolver is not None:  # last plugin wins (#571)
+            if result.thread_id_resolver is not None:
+                log.warning("[plugins] %s overrides a thread_id resolver already set by "
+                            "another plugin", manifest.id)
+            result.thread_id_resolver = registry.thread_id_resolver
         # Surfaces / routes / subagents (ADR 0018) — tagged with the plugin id so
         # the server can namespace + report them.
         for r in registry.routers:

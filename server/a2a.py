@@ -39,135 +39,48 @@ def _bearer_configured() -> bool:
 # text (today's default). The schema lives HERE (skill config), not on the card
 # — ``AgentSkill`` only carries ``output_modes`` (the MIME), per the A2A spec.
 #
-# REPLACE when forking. The template ships one free-text placeholder so a fresh
-# clone is callable; the commented fields below show a structured skill.
+# This is the TEMPLATE DEFAULT — one free-text placeholder so a fresh clone is
+# callable. Forks declare their real skills WITHOUT editing this file (#570):
+# either in ``langgraph-config.yaml`` (``a2a.skills: [...]``) or via a plugin
+# (``registry.register_a2a_skill(spec)``). ``_resolved_skill_specs()`` merges
+# both and falls back here when neither is set.
 _SKILL_SPECS: list[dict] = [
-    {
-        "id": "portfolio_sitrep",
-        "name": "Portfolio SitRep",
-        "description": "Sweep every managed protoMaker project and return a roll-up: a portfolio total then per-project flowing / stalled / blocked.",
-        "tags": ["pm", "status"],
-        "examples": ["portfolio_sitrep"],
-    },
-    {
-        "id": "board_sweep",
-        "name": "Board Sweep",
-        "description": "Sweep the portfolio, then take the smallest unblocking action per project and report what was done.",
-        "tags": ["pm", "unblock"],
-        "examples": ["board_sweep", "board_sweep protocli"],
-    },
-    {
-        "id": "project_decompose",
-        "name": "Project Decompose",
-        "description": "Decompose a project into epics -> milestones -> features (research -> PRD -> milestones -> features), pausing at the human approval gate.",
-        "tags": ["pm", "planning"],
-        "examples": ["project_decompose <project>"],
-    },
-    {
-        "id": "unblock_feature",
-        "name": "Unblock Feature",
-        "description": "Investigate a blocked/stalled feature and take the smallest unblocking action, or escalate with a crisp ask.",
-        "tags": ["pm", "unblock"],
-        "examples": ["unblock_feature <featureId>"],
-    },
-    {
-        "id": "audit_project",
-        "name": "Audit Project",
-        "description": "Audit a project (a local dir or GitHub repo), read-only: inspect code, config, tests and deploy setup and return a prioritized, evidence-backed backlog proposal (features / tech-debt / bugs). Assessment only — stops before onboarding.",
-        "tags": ["pm", "audit"],
-        "examples": ["audit_project <dir|owner/repo>", "audit the portfolio"],
-    },
-    {
-        # Structured: the #476 finalizer enforces output_schema and emits the
-        # validated onboarding plan as an onboarding-plan-v1 DataPart alongside
-        # the prose. The skillHint surfaces [skill: onboard_project], anchoring
-        # the lead to the onboard-project disk-skill playbook (not project_decompose).
-        "id": "onboard_project",
-        "name": "Onboard Project",
-        "description": "Onboard a project (a local dir or GitHub repo) into the protoMaker fleet: read its conformance gaps against the workspace-config + CI-lockdown standards, create the onboarding project with a two-epic board (fleet-conformance true-up + the audit's product backlog), and register it via /api/onboard. Branch protection is an operator step. Read-only; proposes first, executes on approval.",
-        "tags": ["pm", "onboarding", "planning"],
-        "examples": ["onboard_project <dir|owner/repo>", "onboard the portfolio"],
-        "result_mime": "application/vnd.protolabs.onboarding-plan-v1+json",
-        "output_schema": {
-            "type": "object",
-            "additionalProperties": False,
-            "properties": {
-                "project": {"type": "string", "description": "project slug, e.g. portfolio"},
-                "target": {"type": "string", "description": "local path or owner/repo audited"},
-                "summary": {"type": "string", "description": "2-3 sentence read: what it is + stack"},
-                "conformance": {
-                    "type": "array",
-                    "description": "one row per workspace-config / CI-lockdown rule",
-                    "items": {
-                        "type": "object",
-                        "additionalProperties": False,
-                        "properties": {
-                            "rule": {"type": "string"},
-                            "status": {"type": "string", "enum": ["pass", "fail", "unknown"]},
-                            "trueUp": {"type": "string", "description": "action to close the gap; empty if pass"},
-                        },
-                        "required": ["rule", "status"],
-                    },
-                },
-                "board": {
-                    "type": "object",
-                    "additionalProperties": False,
-                    "description": "the two-epic onboarding board",
-                    "properties": {
-                        "fleetConformance": {
-                            "type": "array",
-                            "description": "true-up features; actor=operator for branch protection",
-                            "items": {
-                                "type": "object",
-                                "additionalProperties": False,
-                                "properties": {
-                                    "title": {"type": "string"},
-                                    "actor": {"type": "string", "enum": ["agent", "operator"]},
-                                },
-                                "required": ["title", "actor"],
-                            },
-                        },
-                        "productBacklog": {
-                            "type": "array",
-                            "description": "features / tech-debt / bugs from the audit",
-                            "items": {
-                                "type": "object",
-                                "additionalProperties": False,
-                                "properties": {
-                                    "title": {"type": "string"},
-                                    "priority": {"type": "string", "enum": ["P0", "P1", "P2"]},
-                                },
-                                "required": ["title", "priority"],
-                            },
-                        },
-                    },
-                    "required": ["fleetConformance", "productBacklog"],
-                },
-                "fleetRegister": {"type": "string", "description": "the exact POST /api/onboard call to run on approval"},
-                "operatorActions": {"type": "array", "items": {"type": "string"}, "description": "e.g. the apply-branch-protection command + ruleset prerequisite"},
-                "openQuestions": {"type": "array", "items": {"type": "string"}},
-            },
-            "required": ["project", "conformance", "board", "fleetRegister"],
-        },
-    },
     {
         "id": "chat",
         "name": "Chat",
-        "description": "General-purpose chat / Q&A about the portfolio.",
-        "tags": ["general"],
-        "examples": ["what's the portfolio status?"],
+        "description": "General-purpose chat interface. Replace with your agent's real skills.",
+        "tags": ["template"],
+        "examples": ["hello", "what can you do?"],
+        # To make a skill return schema-enforced structured output, add:
+        #   "output_schema": {"type": "object", "properties": {...}, "required": [...]},
+        #   "result_mime": "application/vnd.protolabs.<your-skill>-v1+json",
     },
 ]
 
 
+def _resolved_skill_specs() -> list[dict]:
+    """The agent's advertised A2A skills, resolved at runtime (#570) so a fork
+    never edits this file. Sources, in order: ``a2a.skills`` from
+    ``langgraph-config.yaml`` (``STATE.graph_config.a2a_skills``), then
+    plugin-contributed skills (``register_a2a_skill`` → ``STATE.plugin_a2a_skills``).
+    Falls back to the template placeholder ``_SKILL_SPECS`` when neither is set,
+    so a fresh clone stays callable."""
+    cfg = STATE.graph_config
+    resolved: list[dict] = []
+    if cfg is not None:
+        resolved.extend(getattr(cfg, "a2a_skills", None) or [])
+    resolved.extend(getattr(STATE, "plugin_a2a_skills", None) or [])
+    return resolved or _SKILL_SPECS
+
+
 def _agent_skills():
-    """Build the card's ``AgentSkill`` list from ``_SKILL_SPECS``. A spec with a
-    ``result_mime`` advertises it in ``output_modes`` (the A2A-native way to tell
-    consumers the skill emits that structured type)."""
+    """Build the card's ``AgentSkill`` list from the resolved skill specs. A spec
+    with a ``result_mime`` advertises it in ``output_modes`` (the A2A-native way
+    to tell consumers the skill emits that structured type)."""
     from a2a.types import AgentSkill
 
     skills = []
-    for s in _SKILL_SPECS:
+    for s in _resolved_skill_specs():
         kwargs = dict(
             id=s["id"],
             name=s["name"],
@@ -187,8 +100,8 @@ def structured_skill_schema(skill_id: str) -> dict | None:
     text). The executor's structured finalizer (#476) reads this to run the
     forced-tool-call against the schema and emit the validated object as a
     ``result_mime`` DataPart. The schema isn't on the card (``AgentSkill`` has no
-    schema field) — it lives in ``_SKILL_SPECS``."""
-    for s in _SKILL_SPECS:
+    schema field) — it lives in the resolved skill specs."""
+    for s in _resolved_skill_specs():
         if s["id"] == skill_id and s.get("output_schema") and s.get("result_mime"):
             return {"schema": s["output_schema"], "mime": s["result_mime"]}
     return None
@@ -241,16 +154,27 @@ def _a2a_card_url() -> str:
     return f"{base}/a2a"
 
 
+# Template default card description — used when a fork sets no ``a2a.description``
+# in config (#570). Forks override via config, not by editing this file.
+_DEFAULT_CARD_DESCRIPTION = (
+    "protoAgent template — A2A 1.0 LangGraph agent. "
+    "Replace this description with your agent's actual purpose."
+)
+
+
 def _build_agent_card_proto():
     """Build the A2A 1.0 ``AgentCard`` (proto) served at
     ``/.well-known/agent-card.json``, applying the protoLabs fleet conventions
     via ``protolabs_a2a.build_agent_card``.
 
-    **Fork this.** Replace ``name``, ``description``, and ``_agent_skills()``
-    with your agent's actual surface. The four custom extensions
-    (cost / confidence / worldstate-delta / tool-call) are declared by default
-    — this template emits cost-v1 + confidence-v1 from ``_chat_langgraph_stream``
-    and worldstate-delta / tool-call when a tool reports them.
+    Identity is config/plugin-driven (#570), so a fork shouldn't edit this file:
+    ``name`` resolves from identity (``agent_name()``), ``description`` from
+    ``a2a.description`` in ``langgraph-config.yaml`` (falling back to the template
+    default below), and ``skills`` from config/plugins (``_resolved_skill_specs``).
+    The four custom extensions (cost / confidence / worldstate-delta / tool-call)
+    are declared by default — the template emits cost-v1 + confidence-v1 from
+    ``_chat_langgraph_stream`` and worldstate-delta / tool-call when a tool reports
+    them.
 
     The interface ``url`` (``_a2a_card_url``) targets the JSON-RPC endpoint
     (``/a2a``) at the agent's reachable address — set ``A2A_PUBLIC_URL`` when
@@ -258,14 +182,11 @@ def _build_agent_card_proto():
     """
     import protolabs_a2a as pa
 
+    cfg = STATE.graph_config
+    description = (getattr(cfg, "a2a_description", "") or "").strip() or _DEFAULT_CARD_DESCRIPTION
     return pa.build_agent_card(
         name=agent_name(),
-        description=(
-            "Roxy — autonomous project manager for the protoMaker board. Sweeps "
-            "the portfolio, keeps work flowing, decomposes projects into "
-            "epics/milestones/features, and unblocks work. Read-only on code "
-            "(PR review is Quinn's); delegates triage/review to the fleet."
-        ),
+        description=description,
         url=_a2a_card_url(),
         version=_package_version(),
         skills=_agent_skills(),
