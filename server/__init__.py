@@ -224,6 +224,7 @@ from server.a2a import (  # noqa: E402,F401 — re-export of the extracted A2A s
     _agent_skills,
     _bearer_configured,
     _build_agent_card_proto,
+    assert_routable_card_url,
     _package_version,
     _record_a2a_telemetry,
     structured_skill_schema,
@@ -290,6 +291,12 @@ def _main():
         description=f"{AGENT_NAME_ENV} — protoAgent server",
     )
     parser.add_argument("--port", type=int, default=7870)
+    # Bind host. Defaults to loopback so a local/desktop run is NOT exposed on
+    # all interfaces (prod-readiness: the console + operator API are otherwise
+    # reachable by anything that can reach the port). Containers set
+    # PROTOAGENT_HOST=0.0.0.0 (entrypoint / deploy manifests) because their
+    # boundary is the network policy + published port, not the in-container bind.
+    parser.add_argument("--host", type=str, default=os.environ.get("PROTOAGENT_HOST", "127.0.0.1"))
     parser.add_argument("--config", type=str, default=None)
     parser.add_argument(
         "--ui",
@@ -538,6 +545,14 @@ def _main():
             log.exception("[discord] shutdown failed")
         if STATE.checkpoint_prune_task is not None:
             STATE.checkpoint_prune_task.cancel()
+        # Close the long-lived A2A push-notification client (created below in
+        # _main) so its connection pool doesn't leak on shutdown/reload — matters
+        # in the desktop-sidecar restart loop. Best-effort; NameError if boot
+        # never reached its construction is swallowed.
+        try:
+            await _a2a_push_client.aclose()
+        except Exception:
+            log.exception("[a2a] push client close failed")
 
     # Chat / goal / health / OpenAI-compat HTTP surface. Extracted to
     # operator_api/chat_routes.py (ADR 0023 phase 3); ``ui`` is passed in
@@ -601,6 +616,10 @@ def _main():
     )
 
     a2a_card = _build_agent_card_proto()
+    # Deploy-time guard (opt-in): refuse to start if the card would advertise a
+    # loopback URL — a deployed agent that does so is silently unreachable to
+    # remote consumers. No-op unless a2a.require_routable_url is set.
+    assert_routable_card_url()
 
     # Durable SQLite-backed task + push-config stores (survive restart; 24h TTL
     # sweep on tasks). The push-config store rejects SSRF callback URLs at
@@ -685,10 +704,22 @@ def _main():
             footer_links=[],
             favicon_path=str(static_dir / "favicon.svg") if (static_dir / "favicon.svg").exists() else None,
         )
-        log.info("Starting %s (ui=full) on http://0.0.0.0:%d", agent_name(), args.port)
+        log.info("Starting %s (ui=full) on http://%s:%d", agent_name(), args.host, args.port)
     else:
         app = fastapi_app
-        log.info("Starting %s (ui=%s) on http://0.0.0.0:%d", agent_name(), ui, args.port)
+        log.info("Starting %s (ui=%s) on http://%s:%d", agent_name(), ui, args.host, args.port)
+
+    # Loud warning when exposed on all interfaces with no A2A auth token: the
+    # operator/console API (/api/*, /api/chat, /v1/*) is reachable by untrusted
+    # callers. Loopback (the default) is safe; a container behind a network
+    # policy is the intended 0.0.0.0 case.
+    if args.host not in ("127.0.0.1", "localhost", "::1") and not _bearer_configured():
+        log.warning(
+            "[security] binding %s with NO A2A auth token — the agent + operator "
+            "API are open to anything that can reach this port. Set auth.token / "
+            "A2A_AUTH_TOKEN, or bind 127.0.0.1 (the default), or front it with a "
+            "network policy.", args.host,
+        )
 
     # Don't outlive the launcher. When run as a desktop sidecar the Tauri shell
     # sets PROTOAGENT_PARENT_PID; a PyInstaller-frozen onefile runs as a
@@ -696,7 +727,7 @@ def _main():
     # server orphaned (holding its port). Poll the launcher and exit if it dies.
     _install_parent_death_watchdog()
 
-    uvicorn.run(app, host="0.0.0.0", port=args.port)
+    uvicorn.run(app, host=args.host, port=args.port)
 
 
 if __name__ == "__main__":

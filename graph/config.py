@@ -87,6 +87,12 @@ class LangGraphConfig:
     max_tokens: int = 32768  # 32k — required headroom for the Qwen models we run
     max_iterations: int = 50
 
+    # Per-call timeout (seconds) on the model client + transient-retry cap. Bounds
+    # a hung/slow gateway so a turn surfaces a clean error instead of blocking the
+    # A2A task / SSE stream indefinitely (prod-readiness). 0/None ⇒ SDK default.
+    request_timeout: float = 120.0
+    llm_max_retries: int = 2
+
     # Advanced sampling — all opt-in. ``None`` (or a negative top_k) means
     # "let the gateway / model card decide". top_p and presence_penalty are
     # standard OpenAI params; top_k and repetition_penalty aren't, so they
@@ -351,6 +357,12 @@ class LangGraphConfig:
     # agent_name()).
     a2a_skills: list[dict] = field(default_factory=list)
     a2a_description: str = ""
+    # When true, refuse to start if the card would advertise a loopback URL
+    # (e.g. A2A_PUBLIC_URL unset on a deployed agent → http://127.0.0.1:.../a2a,
+    # silently unreachable to remote consumers). Off by default — local/desktop
+    # runs SHOULD advertise loopback (the client is same-host). Enforced by
+    # server/a2a.py::assert_routable_card_url() at startup.
+    a2a_require_routable_url: bool = False
 
     # Instance id for multi-instance data scoping (ADR 0004). When set, every
     # store nests under <base>/<id>/ so several instances can share one
@@ -472,6 +484,8 @@ class LangGraphConfig:
             temperature=model.get("temperature", cls.temperature),
             max_tokens=model.get("max_tokens", cls.max_tokens),
             max_iterations=model.get("max_iterations", cls.max_iterations),
+            request_timeout=model.get("request_timeout", cls.request_timeout),
+            llm_max_retries=model.get("max_retries", cls.llm_max_retries),
             top_p=model.get("top_p", cls.top_p),
             top_k=model.get("top_k", cls.top_k),
             presence_penalty=model.get("presence_penalty", cls.presence_penalty),
@@ -544,6 +558,7 @@ class LangGraphConfig:
             identity_operator=identity.get("operator", cls.identity_operator),
             a2a_skills=list(a2a.get("skills", []) or []),
             a2a_description=a2a.get("description", "") or "",
+            a2a_require_routable_url=bool(a2a.get("require_routable_url", False)),
             instance_id=data.get("instance", {}).get("id", "") or data.get("instance_id", cls.instance_id),
             auth_token=secret_auth_token or auth.get("token", cls.auth_token),
             autostart_on_boot=runtime.get("autostart_on_boot", cls.autostart_on_boot),

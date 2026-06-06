@@ -1,5 +1,41 @@
 ## [Unreleased]
 
+## [0.16.0] - 2026-06-06
+
+### Added
+- **Eval-case gating (`requires_env`)** — an eval case can now declare
+  `requires_env: [VAR, …]`; when any is unset the case is **skipped** (shown
+  `SKIP`, excluded from the pass/fail tally) instead of run, so a case needing an
+  optional integration doesn't break the default board. Uses it to ship a gated
+  `code_with_delegation` case (ADR 0024) that verifies end-to-end coding-agent
+  delegation over a live A2A turn — run it with `EVAL_CODING_AGENT=1` once a
+  coding agent is configured. See [Eval your fork](docs/guides/evals.md).
+- **Spawn CLI coding agents over ACP** — a new opt-in `coding_agent` plugin
+  (ADR 0024) adds a `code_with(agent, task)` tool that hands a real, repo-scoped
+  coding job to a purpose-built CLI coding agent (protoCLI `proto`, Claude Code,
+  Codex, Gemini CLI) and returns its result. protoAgent is the
+  [ACP](https://agentclientprotocol.com) *client* — it launches the agent as a
+  subprocess and drives one session over JSON-RPC 2.0 on its stdio
+  (`initialize` → `session/new` → `session/prompt`), accumulating the agent's
+  message as the answer. The ACP client is a port of ORBIS's canonical
+  implementation. Ships **disabled with no agents configured** — each agent gets
+  file + shell access in its (config-pinned, auto-allowed) workdir, so it's a
+  deliberate opt-in; enable with `plugins: { enabled: [coding_agent] }` and
+  declare agents under the `coding_agent` config section. One client (subprocess +
+  session) is cached per agent so follow-up calls continue the same thread.
+  Synchronous (final answer returned; `tool_call` titles logged).
+  See [the guide](docs/guides/coding-agents.md).
+- **Coding-agent permission controls** (ADR 0024) — each configured agent takes a
+  by-kind permission policy applied to the coding agent's `session/request_permission`
+  requests: `auto` (allow all, default), `allowlist` (allow all but
+  `execute`/`delete`), or `readonly` (read-like kinds only) — overridable with
+  `allow_kinds` / `deny_kinds`. Plus a per-call consent gate (`confirm: true`)
+  that asks the operator via `ask_human` before each `code_with` call. Ships
+  agent recipes for protoCLI, Claude Code, Codex, and Gemini CLI. (Per-action
+  live HITL is deferred — pausing a blocking subprocess session mid-turn is
+  incompatible with LangGraph's resume model; use `readonly`/`allowlist` for
+  deterministic per-action control.)
+
 ## [0.15.1] - 2026-06-05
 
 ### Fixed
