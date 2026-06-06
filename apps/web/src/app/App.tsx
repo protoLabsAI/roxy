@@ -11,16 +11,20 @@ import {
   Gauge,
   Github,
   Inbox,
+  LayoutDashboard,
   Loader2,
   MessageSquare,
   PanelRight,
   Plus,
+  Puzzle,
   Save,
   Settings2,
+  Sparkles,
   Target,
   Undo2,
   Trash2,
 } from "lucide-react";
+import type { LucideIcon } from "lucide-react";
 import { useQuery } from "@tanstack/react-query";
 import { useEffect, useRef, useState } from "react";
 import type { CSSProperties, ReactNode } from "react";
@@ -31,12 +35,14 @@ import { ActivitySurface } from "../activity/ActivitySurface";
 import { ConfirmDialog } from "./ConfirmDialog";
 import { InboxPanel } from "../inbox/InboxPanel";
 import { ChatSurface } from "../chat/ChatSurface";
+import { useAnyChatStreaming } from "../chat/chat-store";
 import { KnowledgeStore } from "../knowledge/KnowledgeStore";
 import { PlaybooksSurface } from "../playbooks/PlaybooksSurface";
 import { SettingsSurface } from "../settings/SettingsSurface";
 import { TelemetrySurface } from "../telemetry/TelemetrySurface";
 import { WorkflowsSurface } from "../workflows/WorkflowsSurface";
 import { api } from "../lib/api";
+import { PluginView } from "./PluginView";
 import { brandName } from "../lib/brand";
 import { onConnectionChange, onServerEvent } from "../lib/events";
 import type { NotesWorkspace } from "../lib/types";
@@ -50,7 +56,20 @@ import { runtimeStatusQuery } from "../lib/queries";
 
 // Consolidated nav (heavy grouping): four rail surfaces, each grouped one
 // fanning out to sub-views via an in-surface segmented control.
-type Surface = "chat" | "activity" | "studio" | "knowledge" | "system" | "settings";
+// Core surfaces are the fixed literals; plugin views (ADR 0026) add dynamic
+// surfaces keyed `plugin:<pluginId>:<viewId>`. The `(string & {})` keeps literal
+// autocomplete while allowing those runtime keys.
+type Surface = "chat" | "activity" | "studio" | "knowledge" | "system" | "settings" | (string & {});
+
+// Lucide icon names a plugin view may use for its rail glyph (ADR 0026, PR1 set;
+// PR2 widens the allowlist). Unknown/missing → a generic plugin glyph.
+const PLUGIN_VIEW_ICONS: Record<string, LucideIcon> = {
+  Sparkles, LayoutDashboard, Puzzle, Boxes, BarChart3, Database, Gauge, BookOpen, Target,
+};
+function pluginViewIcon(name?: string): ReactNode {
+  const Icon = (name && PLUGIN_VIEW_ICONS[name]) || Puzzle;
+  return <Icon size={18} />;
+}
 // Studio = the workflow authoring/inspection surface. Per ADR 0020 execution is
 // a chat gesture (run subagents/workflows via /<name>), not a surface — so the
 // old "Run" tab is gone and Studio is just Workflows.
@@ -104,6 +123,9 @@ function useLocalStorageState(key: string, fallback: string) {
 
 export function App() {
   const [surface, setSurface] = useState<Surface>("chat");
+  // Background-streaming indicator for the Chat rail (narrow selector → only
+  // re-renders when the boolean flips, not per token).
+  const chatStreaming = useAnyChatStreaming();
   const [systemTab, setSystemTab] = useState<SystemTab>("runtime");
   const [activityTab, setActivityTab] = useState<ActivityTab>("thread");
   const [knowledgeTab, setKnowledgeTab] = useState<KnowledgeTab>("store");
@@ -134,6 +156,25 @@ export function App() {
     refetchInterval: (q) => (q.state.data?.graph_loaded ? false : 2500),
   });
   const runtime = runtimeQ.data ?? null;
+
+  // Plugin-contributed rail surfaces (ADR 0026): each enabled plugin's declared
+  // views become a dynamic rail icon (keyed plugin:<id>:<viewId>) whose panel is
+  // an iframe of the page the plugin serves. PR1 thin vertical — PR2 generalizes
+  // the rail into a full registry.
+  const pluginRail = (runtime?.plugins ?? [])
+    .filter((p) => p.enabled && p.views?.length)
+    .flatMap((p) => (p.views ?? []).map((v) => ({ ...v, key: `plugin:${p.id}:${v.id}` })));
+  const activePluginView = pluginRail.find((v) => v.key === surface) ?? null;
+
+  // Stale-surface fallback: if we're on a plugin view that no longer exists (its
+  // plugin was disabled/removed, or a config reload dropped it) — once runtime is
+  // loaded so we don't bounce during boot — fall back to chat instead of a blank
+  // stage. (ADR 0026.)
+  useEffect(() => {
+    if (runtime && typeof surface === "string" && surface.startsWith("plugin:") && !activePluginView) {
+      setSurface("chat");
+    }
+  }, [runtime, surface, activePluginView]);
   // White-label the window/tab title to the configured identity (default
   // protoAgent), so a fork's title follows its name without a rebuild.
   // brandName() display-cases a bare lower-case slug (e.g. `gina` → `Gina`).
@@ -526,6 +567,7 @@ export function App() {
             label="Chat"
             icon={<MessageSquare size={18} />}
             onClick={() => setSurface("chat")}
+            dot={chatStreaming && surface !== "chat"}
           />
           <RailButton
             active={surface === "activity"}
@@ -558,6 +600,16 @@ export function App() {
             icon={<Settings2 size={18} />}
             onClick={() => setSurface("settings")}
           />
+          {/* Plugin-contributed rail surfaces (ADR 0026) — dynamic, from runtime-status. */}
+          {pluginRail.map((v) => (
+            <RailButton
+              key={v.key}
+              active={surface === v.key}
+              label={v.label}
+              icon={pluginViewIcon(v.icon)}
+              onClick={() => setSurface(v.key)}
+            />
+          ))}
         </aside>
 
         <main className="stage">
@@ -605,9 +657,10 @@ export function App() {
             </div>
           ) : null}
 
-          {surface === "chat" ? (
-            <ChatSurface onError={setError} />
-          ) : null}
+          {/* ChatSurface is rendered UNCONDITIONALLY and hidden via `active` when
+              off-tab — so an in-flight turn keeps streaming in the background and
+              the chat is progressing when you navigate back (not torn down). */}
+          <ChatSurface onError={setError} active={surface === "chat"} />
 
           {surface === "studio" ? <WorkflowsSurface /> : null}
 
@@ -622,6 +675,14 @@ export function App() {
           {surface === "knowledge" && knowledgeTab === "store" ? <KnowledgeStore onError={setError} /> : null}
           {surface === "knowledge" && knowledgeTab === "playbooks" ? <PlaybooksSurface onError={setError} /> : null}
           {surface === "settings" ? <SettingsSurface /> : null}
+
+          {/* Plugin view (ADR 0026) — the plugin serves the page; PluginView hosts
+              it in a same-origin iframe. ChatSurface stays mounted above (hidden)
+              so chat continuity holds while a plugin view is open. Keyed so
+              switching views resets the iframe's load state. */}
+          {activePluginView ? (
+            <PluginView key={activePluginView.key} view={activePluginView} />
+          ) : null}
         </main>
 
         <aside className="right-panel">
@@ -794,12 +855,16 @@ function RailButton({
   icon,
   onClick,
   badge,
+  dot,
 }: {
   active: boolean;
   label: string;
   icon: ReactNode;
   onClick: () => void;
   badge?: number;
+  // A small pulsing indicator (no count) — e.g. a chat turn streaming in the
+  // background while you're on another tab.
+  dot?: boolean;
 }) {
   return (
     <button className={active ? "active" : ""} type="button" onClick={onClick} title={label} aria-label={label}>
@@ -809,6 +874,8 @@ function RailButton({
         <span className="rail-badge" data-testid="activity-badge">
           {badge > 9 ? "9+" : badge}
         </span>
+      ) : dot ? (
+        <span className="rail-dot" data-testid="chat-streaming-dot" aria-label="streaming" />
       ) : null}
     </button>
   );

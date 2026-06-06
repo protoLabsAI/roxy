@@ -16,6 +16,8 @@ import { fileURLToPath } from "node:url";
 import {
   ACTIVITY_HISTORY,
   buildFrames,
+  DELEGATES,
+  DELEGATE_TYPES,
   GOALS,
   INBOX_ITEMS,
   NOTES_WORKSPACE,
@@ -100,6 +102,10 @@ function handleApiGet(pathname) {
       };
     case "/api/settings/schema":
       return { groups: SETTINGS_SCHEMA };
+    case "/api/delegate-types":
+      return DELEGATE_TYPES;
+    case "/api/delegates":
+      return DELEGATES;
     case "/api/workflows":
       return { workflows: WORKFLOWS };
     case "/api/activity":
@@ -185,7 +191,21 @@ const server = createServer(async (req, res) => {
   const { pathname } = url;
 
   if (pathname === "/a2a" && req.method === "POST") {
-    return handleA2AStream(req, res, await readBody(req));
+    const body = await readBody(req);
+    // tasks/get — the reconcile path (self-heal a stuck streaming turn): return a
+    // terminal task carrying the final answer as an artifact.
+    if (body?.method === "tasks/get") {
+      return sendJson(res, {
+        jsonrpc: "2.0",
+        id: body.id,
+        result: {
+          id: body.params?.id, contextId: "reconcile", kind: "task",
+          status: { state: "completed" },
+          artifacts: [{ parts: [{ kind: "text", text: "RECONCILED ANSWER" }] }],
+        },
+      });
+    }
+    return handleA2AStream(req, res, body);
   }
   if (pathname === "/api/events" && req.method === "GET") {
     // Server→client SSE push channel (ADR 0003). Hold the connection open so
@@ -228,6 +248,20 @@ const server = createServer(async (req, res) => {
       return sendJson(res, { enabled: true, deleted: true });
     }
     return sendJson(res, { ok: true });
+  }
+  // Plugin-served pages (ADR 0026) — a tiny listener page so the e2e can assert
+  // the console's post-load init handshake (token + theme via postMessage).
+  if (pathname.startsWith("/plugins/") && req.method === "GET") {
+    res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
+    res.end(
+      `<!doctype html><html><body data-bridge="pending">` +
+      `<p id="p">${pathname}</p><script>` +
+      `window.addEventListener("message",function(e){var m=e.data||{};` +
+      `if(m.type!=="protoagent:init")return;` +
+      `document.body.setAttribute("data-bridge",m.token?"authed":"anon");});` +
+      `</script></body></html>`,
+    );
+    return;
   }
   if (req.method !== "GET") {
     return sendJson(res, { detail: "method not allowed" }, 405);

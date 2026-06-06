@@ -4,6 +4,9 @@ import type {
   BeadsIssue,
   ChatMessage,
   ConfigPayload,
+  DelegateProbe,
+  DelegateTypeSpec,
+  DelegateView,
   GoalState,
   HitlPayload,
   InboxItem,
@@ -710,6 +713,25 @@ export const api = {
     });
   },
 
+  // Reconcile a turn against the server's durable task (A2A tasks/get). Used to
+  // self-heal a chat message stuck in `streaming` after the stream was
+  // interrupted (reload, network blip, a stale tab) — the server task is the
+  // source of truth. Returns the normalized state + the final answer text (empty
+  // until terminal).
+  async getTask(taskId: string): Promise<{ state: string; text: string }> {
+    const res = await request<A2AFrame>("/a2a", {
+      method: "POST",
+      body: { jsonrpc: "2.0", id: `get-${Date.now()}`, method: "tasks/get", params: { id: taskId } },
+    });
+    const result = res.result;
+    const task = (result?.task ?? (result?.kind === "task" ? result : result)) as
+      | NonNullable<A2AFrame["result"]>
+      | undefined;
+    if (!task) return { state: "", text: "" };
+    const state = (task.status?.state || "").toString();
+    return { state, text: textFromTerminalTask(task) };
+  },
+
   // Notes + Beads are agent-global (one persistent store each) — no project
   // scope. The project / allowed-dirs list is purely the filesystem fence.
   getNotes() {
@@ -780,5 +802,34 @@ export const api = {
       `/api/beads/issues/${encodeURIComponent(issueId)}`,
       { method: "DELETE" },
     );
+  },
+
+  // Delegate registry (ADR 0025) — the agents & endpoints the agent can talk to.
+  delegateTypes() {
+    return request<{ types: DelegateTypeSpec[] }>("/api/delegate-types");
+  },
+  delegates() {
+    return request<{ delegates: DelegateView[] }>("/api/delegates");
+  },
+  createDelegate(entry: Record<string, unknown>) {
+    return request<{ ok: boolean; message: string; delegates: DelegateView[] }>("/api/delegates", {
+      method: "POST",
+      body: entry,
+    });
+  },
+  updateDelegate(name: string, entry: Record<string, unknown>) {
+    return request<{ ok: boolean; message: string; delegates: DelegateView[] }>(
+      `/api/delegates/${encodeURIComponent(name)}`,
+      { method: "PUT", body: entry },
+    );
+  },
+  deleteDelegate(name: string) {
+    return request<{ ok: boolean; message: string; delegates: DelegateView[] }>(
+      `/api/delegates/${encodeURIComponent(name)}`,
+      { method: "DELETE" },
+    );
+  },
+  testDelegate(entry: Record<string, unknown>) {
+    return request<DelegateProbe>("/api/delegates/test", { method: "POST", body: entry });
   },
 };

@@ -1,5 +1,111 @@
 ## [Unreleased]
 
+## [0.19.0] - 2026-06-06
+
+### Added
+- **Plugin-contributed console surfaces** (ADR 0026, PR1) — a plugin can declare
+  a `views:` block in its manifest (`{id, label, icon, path}`); the console reads
+  it from `/api/runtime/status` and renders a **dynamic left-rail icon** whose
+  panel is a same-origin **iframe** of the page the plugin serves (e.g.
+  `/plugins/<id>/view`) — so a fork gets its own rail dashboard with no console
+  rebuild. Surfaces are keyed `plugin:<id>:<viewId>`; chat stays mounted (its
+  continuity holds) while a plugin view is open. The `hello` example plugin now
+  ships a demo view. The view is hosted by a dedicated `PluginView` component with
+  load/error states + a stale-surface fallback (returns to chat if a plugin view's
+  plugin is disabled while it's open). A view may declare **`tabs:`** (rendered as
+  a sub-nav that swaps the iframe page), and the console hands the hosted page the
+  operator **bearer + theme tokens via a post-load `postMessage`** (no token in the
+  URL) so it can call its own API and match the console look. The iframe is
+  sandboxed (`allow-scripts allow-forms allow-same-origin`). See
+  [the guide](docs/guides/plugin-views.md) and
+  [ADR 0026](docs/adr/0026-plugin-contributed-console-surfaces.md).
+
+## [0.18.0] - 2026-06-06
+
+### Added
+- **Token-by-token answer streaming** (console + A2A). The agent's answer now
+  streams into the chat bubble as the model writes it, instead of landing all at
+  once at turn end. Two parts: the LLM client runs with `streaming: True` so the
+  graph's `ainvoke` streams under `astream_events` (the chat driver already turns
+  `on_chat_model_stream` into `("text", delta)` events, scoped to the `<output>`
+  region); and the A2A executor now **forwards each text delta as an incremental
+  `artifact-update` (append) frame** (lightly batched), then replaces with the
+  canonical final text + the cost-v1/confidence DataParts on completion. The
+  console already appends artifact deltas, so it fills live with no client change.
+  Backward-compatible: a non-streaming model still delivers the answer once at the
+  end. (`graph/llm.py`, `a2a_executor.py`; tests in `test_a2a_handler.py`.)
+
+### Fixed
+- **Chat self-heals an interrupted stream** (console). A chat turn whose stream
+  was cut off — page reload, network blip, or a stale tab — left the assistant
+  message stuck "streaming" (spinner) **forever**, even after the agent's turn
+  completed server-side. The turn's A2A task id is now persisted on the message,
+  and on load a stuck `streaming` message **reconciles against the durable server
+  task** (`tasks/get`): it finalizes with the completed answer (flipping any
+  running tool cards to done), surfaces a failure, or briefly polls if the turn is
+  genuinely still running — instead of spinning indefinitely. e2e:
+  `chat-reconcile.spec.ts`.
+- **Chat continuity across navigation** (console). Switching from the Chat tab to
+  another surface (Activity/Studio/Settings/…) **unmounted** `ChatSurface` — which
+  tore down the still-mounted session pool, and its unmount cleanup aborted the
+  in-flight stream — so an in-progress turn was lost and the chat appeared to
+  reset on return. `ChatSurface` is now rendered **unconditionally** and hidden
+  via CSS when off-tab (an `active` prop), so the turn keeps streaming into the
+  module-level chat store in the background and the conversation is exactly as you
+  left it when you navigate back — the protoMaker always-mounted pattern. Multiple
+  chat sessions in the pool all keep progressing. Added a pulsing **background-
+  streaming dot** on the Chat rail button (a narrow store selector, so it only
+  re-renders on the streaming on/off transition, not per token). e2e:
+  `chat-continuity.spec.ts`.
+
+### Fixed
+- **Brand favicon** — every surface now shows the canonical protoLabs icon (the
+  violet `#9b87f2` bot outline) instead of a leftover Qwen-template placeholder
+  (a teal `#14b8a6` "Q" in `static/favicon.svg` + the PWA icons, and an off-brand
+  `#7c3aed` outline in the console). Replaced the favicon across `static/`,
+  `docs/public/`, and `apps/web/public/` with the brand mark from
+  [protoContent](https://github.com/protoLabsAI/protoContent)'s design system;
+  fixed the PWA `manifest.json` theme color (`#14b8a6` → `#9b87f2`) and dropped
+  `maskable` from the transparent icons. Added a root `/favicon.svg` + `/favicon.ico`
+  route so a deployed agent's base URL shows the mark, not a 404. Forks inherit the
+  fix on sync.
+
+### Added
+- **Unified delegate registry** (ADR 0025, PR1) — a new opt-in `delegates` plugin
+  gives the agent one tool, `delegate_to(target, query)`, over a hot-swappable
+  roster of the agents and endpoints it can talk to: fleet **A2A agents**,
+  OpenAI-compatible **model endpoints** (ask another model), and **ACP coding
+  agents**. One adapter per type (the acp adapter reuses the ADR 0024 `AcpClient`;
+  the a2a adapter reuses the `peer_tools` JSON-RPC path), each exposing a field
+  schema. Declare delegates in a top-level `delegates:` list; editing it +
+  Save & Reload swaps the roster live (no restart). Unifies what `code_with`
+  (acp) and `peer_consult` (a2a) did and adds model-endpoint delegation. Ships
+  disabled; enable with `plugins: { enabled: [delegates] }`. A console panel to
+  manage delegates from the UI lands in a follow-up slice.
+  See [the guide](docs/guides/delegates.md).
+- **Delegate CRUD REST API** (ADR 0025, PR2) — `/api/delegates` (GET/POST/PUT/
+  DELETE) + `/api/delegates/test` (reachability probe — agent-card GET for a2a,
+  `/v1/models` ping for openai, binary-on-PATH + workdir for acp) +
+  `/api/delegate-types` (the field schema that drives the panel). Mutations write
+  the config + route each delegate's secret to the gitignored `secrets.yaml`
+  (a `delegate_secrets` overlay keyed `<name>.<field>` — never echoed back or kept
+  in tracked config), then hot-reload so the new roster is live next turn. Same
+  operator-console posture as `/api/config`.
+- **Delegate management panel** (ADR 0025, PR3) — a **Delegates** view in the
+  console under **Settings → Integrations**: lists delegates with type/secret/
+  status badges + a per-row **Test** probe; adds one via a type picker
+  (A2A agent / Model endpoint / Coding agent) and a form generated from each
+  type's field schema; edits/deletes; secrets entered route to `secrets.yaml` and
+  are never echoed back. Saving hot-reloads, so the roster is live next turn. The
+  Integrations tab appears whenever the `delegates` plugin is reachable, even with
+  no other integration enabled. (`apps/web`; e2e `delegates.spec.ts`.)
+- **Delegate health prober** (ADR 0025, PR4) — a background surface probes every
+  delegate periodically (initial delay + fixed interval) into a cache that
+  `GET /api/delegates` merges in, so the panel shows a **live health dot** (green
+  reachable / red down / grey unchecked) per delegate, not just on-demand Test.
+  Completes ADR 0025. `code_with` and `peer_consult` are now **deprecated** in
+  favor of `delegate_to` (still functional; removed in a future release).
+
 ## [0.16.0] - 2026-06-06
 
 First roxy release since v0.13.0 — syncs to upstream protoAgent v0.16.0 and ships

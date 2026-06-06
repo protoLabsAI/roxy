@@ -58,7 +58,19 @@ export type RuntimeStatus = {
     tools: string[];
     skills: number;
     error?: string;
+    // Console surfaces (ADR 0026): rail views the plugin contributes.
+    views?: PluginView[];
   }[];
+};
+
+// A plugin-contributed console surface (ADR 0026): a rail icon opening an iframe
+// of `path` (served by the plugin), with optional sub-tabs.
+export type PluginView = {
+  id: string;
+  label: string;
+  icon?: string; // a lucide-react icon name
+  path: string;
+  tabs?: { id: string; label: string; path: string }[];
 };
 
 export type SlashCommand = {
@@ -191,6 +203,9 @@ export type ChatMessage = {
   toolCalls?: ToolCall[];
   createdAt?: number;
   status?: "streaming" | "done" | "error";
+  /** A2A task id for this turn — persisted so a stuck `streaming` message can be
+   *  reconciled against the server's task state on reload (self-heal). */
+  taskId?: string;
 };
 
 // HITL (human-in-the-loop) request surfaced when a turn pauses as input-required
@@ -384,4 +399,28 @@ export type KnowledgeChunk = {
   source_type: string | null;
   finding_type: string | null;
   created_at: string | null;
+};
+
+// Delegate registry (ADR 0025) — the agents & endpoints the agent can talk to.
+export type DelegateFieldSpec = {
+  key: string;
+  label: string;
+  kind: string; // text | secret | args | path | number | textarea | select
+  required: boolean;
+  help: string;
+  placeholder: string;
+  options: string[];
+  default?: unknown;
+};
+export type DelegateTypeSpec = { type: string; label: string; blurb: string; fields: DelegateFieldSpec[] };
+export type DelegateProbe = { ok: boolean | null; latency_ms?: number; error?: string; detail?: string; checked_at?: number };
+export type DelegateView = {
+  name: string;
+  type: string;
+  description: string;
+  configured: boolean;
+  error: string | null;
+  has_secret: boolean;
+  health?: DelegateProbe;
+  [key: string]: unknown;
 };
