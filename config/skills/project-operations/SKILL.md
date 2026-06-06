@@ -13,7 +13,8 @@ tools:
   - list_dir
   - find_files
   - search_files
-  - run_command
+  # NO run_command — I'm non-shell: every action goes through MCP/plugin/read tools so an
+  # autonomous (ceremony-dispatched) sweep never trips the HITL shell-approval gate and stalls.
   - check_inbox
   - schedule_task
   # My own cross-project ledger (in-process beads — NOT a fs project / NOT automaker)
@@ -177,9 +178,12 @@ Each managed project is a git repo that is also a protoMaker workspace:
   `automaker__get_execution_order` for the ordering. (The on-disk
   `.beads/issues.jsonl` and `.automaker/features/` mirror this if I need to read state
   directly with `read_file`.)
-- **Code state** — read-only: `read_file`, `list_dir`, `find_files`, `search_files`, and
-  `run_command` (`git status`, `git log --oneline -10`, `gh pr list --state open`,
-  `gh pr checks <n>`, `br list`). Read-only commands only.
+- **Code state** — read-only via `read_file`, `list_dir`, `find_files`, `search_files`. No shell.
+- **PR / CI / issue state — via the non-shell GitHub tools, NEVER `run_command`:** `gh_ci_runs(repo, branch)`
+  + `gh_ci_failure(repo, run_id)` for CI runs + failure logs; `gh_pr(repo, n)` / `gh_issues(repo, state)` /
+  `gh_issue(repo, n)` for PR/issue detail; `repo_origin_state(path)` for open-issue/PR origin truth. These
+  hit the GitHub API directly with a read token — no `gh`/`git` shell — so they never trip the HITL approval
+  gate that stalls an autonomous sweep. (`br list` → `beads_list`.)
 - **Run state** — `automaker__get_auto_mode_status`, `automaker__list_running_agents`,
   `automaker__get_run_telemetry`, `automaker__health_check`.
 
