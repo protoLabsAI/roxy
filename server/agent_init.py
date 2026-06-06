@@ -70,6 +70,9 @@ def _init_langgraph_agent(headless_setup: bool = False):
     # Egress allowlist (ADR 0008): deny-by-default outbound hosts for fetch_url.
     import egress
     egress.set_allowed_hosts(STATE.graph_config.egress_allowed_hosts)
+    # Opt-in CIDR allowlist for outbound A2A destinations — callbacks + peer_consult (#572).
+    import security
+    security.set_callback_allowlist(STATE.graph_config.security_callback_allowlist)
     # Multi-instance scoping (ADR 0004): seed PROTOAGENT_INSTANCE from config so
     # every store (incl. the env-reading knowledge/scheduler/memory modules) nests
     # under the same id. Opt-in — empty config.instance_id leaves paths unchanged.
@@ -140,6 +143,8 @@ def _init_langgraph_agent(headless_setup: bool = False):
     STATE.plugin_tools, STATE.plugin_skill_dirs, STATE.plugin_meta = (
         _plugins.tools, _plugins.skill_dirs, _plugins.meta,
     )
+    STATE.plugin_a2a_skills = _plugins.a2a_skills  # A2A card skills (#570)
+    STATE.thread_id_resolver = _plugins.thread_id_resolver  # thread_id seam (#571)
     # Surfaces / routes / subagents (ADR 0018). Routers + surfaces are captured
     # here and consumed once by _main (mount) + the startup hook (start) — they
     # don't hot-reload. Subagents register into SUBAGENT_REGISTRY before the graph
@@ -850,8 +855,10 @@ def _reload_langgraph_agent() -> tuple[bool, str]:
     )
     try:
         import egress
+        import security
 
         egress.set_allowed_hosts(new_config.egress_allowed_hosts)  # live-reload (ADR 0008)
+        security.set_callback_allowlist(new_config.security_callback_allowlist)  # live-reload (#572)
     except Exception:  # noqa: BLE001 — never block a reload on the egress update
         pass
     try:

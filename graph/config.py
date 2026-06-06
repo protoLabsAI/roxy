@@ -341,6 +341,17 @@ class LangGraphConfig:
     identity_name: str = "protoagent"
     identity_operator: str = ""
 
+    # A2A card identity (#570). Forks declare their advertised skills + card
+    # description here (or a plugin contributes skills via register_a2a_skill)
+    # instead of editing server/a2a.py. ``a2a_skills`` is a list of skill specs
+    # (id/name/description/tags/examples, + optional output_schema/result_mime);
+    # empty falls back to the template placeholder so a fresh clone stays
+    # callable. ``a2a_description`` overrides the card description; blank uses the
+    # template default. The card ``name`` already resolves from identity (see
+    # agent_name()).
+    a2a_skills: list[dict] = field(default_factory=list)
+    a2a_description: str = ""
+
     # Instance id for multi-instance data scoping (ADR 0004). When set, every
     # store nests under <base>/<id>/ so several instances can share one
     # filesystem without clobbering each other. Empty = single-instance (legacy)
@@ -390,6 +401,13 @@ class LangGraphConfig:
     # for the generated OpenShell network policy (scripts/gen_openshell_policy).
     egress_allowed_hosts: list[str] = field(default_factory=list)
 
+    # Opt-in CIDR allowlist for outbound A2A destinations — push callbacks +
+    # peer_consult (#572). Empty/unset = today's behavior (callbacks keep their
+    # default private-IP denylist; peer_consult unrestricted). When set, an
+    # outbound destination is allowed iff every resolved IP is inside a listed
+    # CIDR. Enforced via ``security.set_callback_allowlist``.
+    security_callback_allowlist: list[str] = field(default_factory=list)
+
     def __post_init__(self):
         # PROTOAGENT_MODEL wins over the YAML/default model so an eval sweep can
         # boot the same agent against different models without editing config
@@ -432,6 +450,10 @@ class LangGraphConfig:
         mcp = data.get("mcp", {})
         plugins = data.get("plugins", {})
         identity = data.get("identity", {})
+        # `or {}` (not a default arg): a section present but empty/commented in
+        # YAML parses to None, and `.get(...)` on the default arg wouldn't catch
+        # that — the example ships an all-commented `a2a:` block.
+        a2a = data.get("a2a") or {}
         auth = data.get("auth", {})
         runtime = data.get("runtime", {})
         operator = data.get("operator", {})
@@ -520,6 +542,8 @@ class LangGraphConfig:
             plugins_dir=plugins.get("dir", cls.plugins_dir),
             identity_name=identity.get("name", cls.identity_name),
             identity_operator=identity.get("operator", cls.identity_operator),
+            a2a_skills=list(a2a.get("skills", []) or []),
+            a2a_description=a2a.get("description", "") or "",
             instance_id=data.get("instance", {}).get("id", "") or data.get("instance_id", cls.instance_id),
             auth_token=secret_auth_token or auth.get("token", cls.auth_token),
             autostart_on_boot=runtime.get("autostart_on_boot", cls.autostart_on_boot),
@@ -531,6 +555,7 @@ class LangGraphConfig:
             ),
             filesystem_projects=list(data.get("filesystem", {}).get("projects", []) or []),
             egress_allowed_hosts=list(data.get("egress", {}).get("allowed_hosts", []) or []),
+            security_callback_allowlist=list((data.get("security") or {}).get("callback_allowlist", []) or []),
             plugin_config=_resolve_plugin_config(data, secrets, p.parent),
         )
 
