@@ -60,13 +60,15 @@ def register(registry):
     registry.register_skill_dir("skills")  # bundle SKILL.md skills (relative to the plugin)
 ```
 
-`register` is called once at load. The registry accepts **six** contribution
-types — a fork adds any of them as a plugin, never editing the core `server/` package:
+`register` is called once at load. The registry accepts these contribution types
+(plus console **views**, declared in the manifest — see [Plugin console views](/guides/plugin-views)) —
+a fork adds any of them as a plugin, never editing the core `server/` package:
 
 | Method | Contributes | Lifecycle |
 |---|---|---|
 | `register_tool(tool)` / `register_tools(iter)` | A LangChain tool | graph build (live-reloads) |
 | `register_skill_dir(path)` | A `SKILL.md` directory (procedural memory) | graph build |
+| `register_workflow_dir(path)` | A directory of `*.yaml` workflow recipes | workflow-registry build |
 | `register_a2a_skill(spec)` | An A2A **card** skill (what the card advertises; optional structured output) | agent-card build |
 | `register_router(router, prefix=None)` | A FastAPI `APIRouter` | **mounted once** at init (default prefix `/plugins/<id>`) |
 | `register_surface(start, stop=None, name=None, reload=None)` | A background surface (a Discord-style gateway) | `start` in startup, `stop` in shutdown, `reload(cfg)` on config save |
@@ -200,3 +202,13 @@ plugins:
 
 Restart, then check `GET /api/runtime/status` — the `hello` plugin shows
 `loaded: true` with its `hello` tool and `greeting` skill.
+
+## Related
+
+- **[Plugin console views](/guides/plugin-views)** — give a plugin its own
+  left-rail icon + view (a dashboard) in the console (ADR 0026).
+- **[Install & publish plugins (git URLs)](/guides/plugin-registry)** — install a
+  plugin from a git URL (`python -m server plugin install <url>`) or publish one as
+  a shareable repo. A repo is a full bundle: besides what `register()` adds, a
+  conventional `skills/` (SKILL.md) and `workflows/` (`*.yaml`) are auto-discovered
+  (ADR 0027).

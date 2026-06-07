@@ -12,10 +12,17 @@ MCP servers, and config — all from the one repo. See
 ```sh
 python -m server plugin install https://github.com/owner/protoagent-plugin-x --ref v1.0
 python -m server plugin list
-python -m server plugin uninstall protoagent-plugin-x
+python -m server plugin uninstall protoagent-plugin-x            # code + lock + enabled ref
+python -m server plugin uninstall protoagent-plugin-x --purge    # also config section + secrets
 python -m server plugin sync          # re-clone the locked set (CI / fresh checkout)
 python -m server plugin install-deps protoagent-plugin-x   # explicit, separate
 ```
+
+**Uninstall removes** the plugin's code, its `plugins.lock` entry, and its
+`plugins.enabled` reference (so nothing dangles). It **keeps** the plugin's config
+section + secrets by default (a reinstall restores your settings); pass `--purge`
+to remove those too. Declared pip deps are **never** auto-removed (shared venv) —
+they're reported so you can `pip uninstall` them if unused.
 
 **Console:** Settings → Integrations → **Plugins** — paste the URL, review the
 manifest + capabilities, install, uninstall.
@@ -33,6 +40,13 @@ Install pins the **resolved commit SHA** and records it in a committed
 gitignored (re-cloned from the lock).
 
 ## Publish one
+
+> **Start from the devkit.** Enable the bundled **`plugin-devkit`** plugin
+> (`plugins: { enabled: [plugin-devkit] }`) — it's the canonical full-bundle
+> example *and* it gives the agent a `scaffold_plugin` tool, a `plugin-architect`
+> subagent + `design-plugin` workflow, and the `building-plugins` skill. With it
+> on, just ask the agent to *"build a plugin that …"* and it scaffolds a working
+> skeleton for you to fill in.
 
 A plugin is a directory (its own repo) with a manifest + a `register()`. The
 **conventional layout** — everything here is picked up when the plugin is enabled:
