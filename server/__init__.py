@@ -273,6 +273,14 @@ from server.agent_init import (  # noqa: E402,F401 — re-export of the extracte
 
 def _main():
 
+    # Plugin management subcommand (ADR 0027): `python -m server plugin install
+    # <git-url>` (+ list/uninstall/sync). Handled before the server argparse —
+    # it fetches code to disk and exits, never starting the server.
+    if len(sys.argv) > 1 and sys.argv[1] == "plugin":
+        from graph.plugins.cli import run_plugin_cli
+
+        raise SystemExit(run_plugin_cli(sys.argv[2:]))
+
     # Frozen-binary entrypoint for a plugin's managed MCP server (ADR 0019): the
     # bundled desktop app has no `python` on PATH, so a plugin's managed-server
     # factory re-invokes this binary with `--mcp-plugin <id>` instead of `-m
@@ -409,6 +417,7 @@ def _main():
     from operator_api.chat_routes import register_chat_routes
     from operator_api.config_routes import register_config_routes
     from operator_api.knowledge_routes import register_knowledge_routes
+    from operator_api.plugin_routes import register_plugin_routes
     from operator_api.routes import register_operator_routes
     from operator_api.telemetry_routes import register_telemetry_routes
 
@@ -562,6 +571,7 @@ def _main():
     # Knowledge store + Playbooks (ADR 0020). Extracted to
     # operator_api/knowledge_routes.py (ADR 0023 phase 3).
     register_knowledge_routes(fastapi_app)
+    register_plugin_routes(fastapi_app)
 
     # --- Telemetry (ADR 0006 Slice 2) --------------------------------------
     # Per-turn cost/latency + advise-only insights (ADR 0006). Extracted to
