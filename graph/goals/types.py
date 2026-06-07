@@ -47,9 +47,16 @@ class GoalState:
     condition: str
     verifier: dict = field(default_factory=lambda: {"type": "llm"})
     status: str = "active"
+    # Disposition (ADR 0030): "drive" = the agent does the work (bounded
+    # continuation loop); "monitor" = an external process drives the metric, the
+    # agent only supervises (verifier-only, out-of-band, no exhaustion).
+    mode: str = "drive"
+    last_checked: float | None = None  # last out-of-band verifier check (monitor)
     checklist: str = ""
     iteration: int = 0
     max_iterations: int = 8
+    # Per-goal patience (ADR 0030 D4); None → the config goal_no_progress_limit.
+    no_progress_limit: int | None = None
     no_progress_streak: int = 0
     last_reason: str = ""
     last_evidence: str = ""
@@ -72,10 +79,9 @@ class GoalState:
     def status_line(self) -> str:
         """One-line human summary for /goal status + continuation footers."""
         vt = self.verifier.get("type", "llm")
-        base = (
-            f"goal [{self.status}] via {vt}: {self.condition!r} "
-            f"(iteration {self.iteration}/{self.max_iterations})"
-        )
+        # Monitor goals have no iteration budget — show the disposition instead.
+        progress = "monitor" if self.mode == "monitor" else f"iteration {self.iteration}/{self.max_iterations}"
+        base = f"goal [{self.status}] via {vt}: {self.condition!r} ({progress})"
         if self.last_reason:
             base += f" — {self.last_reason}"
         return base

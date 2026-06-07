@@ -56,6 +56,8 @@ class PluginRegistry:
         self.thread_id_resolver = None    # (request_metadata, session_id) -> str (#571)
         self.goal_verifiers: dict = {}    # name -> async (spec, ctx) -> VerifyResult (ADR 0028)
         self.goal_hooks: list = []        # {on_achieved, on_failed} terminal reactions (ADR 0028)
+        self.knowledge_stores: dict = {}  # name -> (config) -> KnowledgeBackend (ADR 0031)
+        self.embedders: dict = {}         # name -> (config) -> (text -> vector) embed_fn (ADR 0031)
 
     def register_tool(self, tool) -> None:
         """Expose a LangChain tool to the agent."""
@@ -118,6 +120,31 @@ class PluginRegistry:
             "on_achieved": on_achieved if callable(on_achieved) else None,
             "on_failed": on_failed if callable(on_failed) else None,
         })
+
+    def register_knowledge_store(self, name: str, factory) -> None:
+        """Contribute a knowledge backend (ADR 0031) — ``factory(config) ->
+        KnowledgeBackend`` (see ``knowledge.backend.KnowledgeBackend`` for the
+        surface: pgvector, Qdrant, Chroma, a managed vector DB…). Selected by a
+        fork with ``knowledge.backend: "<name>"``; on a None/error return the agent
+        keeps the built-in SQLite store (degrade-safe). Name it simply (e.g.
+        ``pgvector``); a collision keeps the first."""
+        if not name or not callable(factory):
+            log.warning("[plugins] %s: register_knowledge_store needs a name + factory: %r / %r",
+                        self.plugin_id, name, factory)
+            return
+        self.knowledge_stores[name] = factory
+
+    def register_embedder(self, name: str, factory) -> None:
+        """Contribute an in-process embedder (ADR 0031 follow-up) — ``factory(config)
+        -> (text: str) -> list[float]``. Selected by a fork with
+        ``knowledge.embedder: "<name>"`` for the built-in hybrid store, avoiding the
+        gateway round-trip (e.g. fastembed / sentence-transformers). On a None/error
+        return the agent falls back to the gateway embedder (degrade-safe)."""
+        if not name or not callable(factory):
+            log.warning("[plugins] %s: register_embedder needs a name + factory: %r / %r",
+                        self.plugin_id, name, factory)
+            return
+        self.embedders[name] = factory
 
     def register_a2a_skill(self, spec: dict) -> None:
         """Contribute an A2A *card* skill — advertised on the agent card and,

@@ -241,6 +241,7 @@ class LangGraphConfig:
     goal_enabled: bool = True
     goal_max_iterations: int = 8          # continuation budget per goal
     goal_no_progress_limit: int = 3       # identical verifier evidence N times -> unachievable
+    goal_monitor_interval: int = 60       # seconds between out-of-band monitor-goal checks (ADR 0030)
     goal_eval_model: str = ""             # blank = main model (llm verifier / fuzzy goals)
     goal_verify_timeout: float = 120.0    # seconds for command/test/ci verifiers
 
@@ -250,6 +251,14 @@ class LangGraphConfig:
     # ``~/.protoagent/knowledge/agent.db`` automatically when /sandbox
     # is read-only or absent (e.g. local ``python server.py``).
     knowledge_db_path: str = "/sandbox/knowledge/agent.db"
+    # Knowledge backend selector (ADR 0031) — "" = the built-in SQLite/FTS5 store;
+    # otherwise the name of a plugin-registered backend (register_knowledge_store).
+    # An unregistered name / a factory error degrades to the built-in store.
+    knowledge_backend: str = ""
+    # In-process embedder selector (ADR 0031 follow-up) — "" = the gateway embedder
+    # (create_embed_fn); otherwise a plugin-registered embedder (register_embedder),
+    # used by the built-in hybrid store. Unregistered/error → gateway embedder.
+    knowledge_embedder: str = ""
     # The gateway's embedding model (NOT the chat model). Default is what the
     # protoLabs gateway serves; forks on a different gateway set this to a model
     # their gateway has (check GET /v1/models). A wrong/absent model degrades to
@@ -528,11 +537,14 @@ class LangGraphConfig:
             goal_enabled=data.get("goal", {}).get("enabled", cls.goal_enabled),
             goal_max_iterations=data.get("goal", {}).get("max_iterations", cls.goal_max_iterations),
             goal_no_progress_limit=data.get("goal", {}).get("no_progress_limit", cls.goal_no_progress_limit),
+            goal_monitor_interval=data.get("goal", {}).get("monitor_interval", cls.goal_monitor_interval),
             goal_eval_model=data.get("goal", {}).get("eval_model", cls.goal_eval_model),
             goal_verify_timeout=data.get("goal", {}).get("verify_timeout", cls.goal_verify_timeout),
             subagent_max_concurrency=subagents.get("max_concurrency", cls.subagent_max_concurrency),
             subagent_output_truncate=subagents.get("output_truncate", cls.subagent_output_truncate),
             knowledge_db_path=knowledge.get("db_path", cls.knowledge_db_path),
+            knowledge_backend=knowledge.get("backend", cls.knowledge_backend),
+            knowledge_embedder=knowledge.get("embedder", cls.knowledge_embedder),
             checkpoint_db_path=data.get("checkpoint", {}).get("db_path", cls.checkpoint_db_path),
             telemetry_enabled=data.get("telemetry", {}).get("enabled", cls.telemetry_enabled),
             telemetry_db_path=data.get("telemetry", {}).get("db_path", cls.telemetry_db_path),
