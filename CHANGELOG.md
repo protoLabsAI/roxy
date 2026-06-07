@@ -1,5 +1,35 @@
 ## [Unreleased]
 
+## [0.20.0] - 2026-06-07
+
+### Added
+- **Install plugins from a git URL** (ADR 0027, PR1) — `python -m server plugin
+  install <git-url> [--ref <tag|sha>]` clones a plugin repo into the live plugins
+  dir (already discovered by the loader), **pinned to a resolved commit SHA** and
+  recorded in a committed **`plugins.lock`** for reproducible installs
+  (`plugin sync` re-clones the exact set). Also `plugin list` / `uninstall` /
+  `sync`. Safety baked in: **install ≠ enable ≠ trust** — it only fetches code +
+  reads the manifest (data), never imports the plugin and never pip-installs its
+  deps (`requires_pip` is declared, installed explicitly); it refuses to shadow a
+  built-in, rejects a repo with no manifest, drops git metadata, skips submodules,
+  and supports an optional `plugins.sources.allow` allowlist. Manifest gains
+  `requires_pip` / `repository` / `homepage` / `min_protoagent_version`. A console
+  **Plugins panel** (Settings → Integrations, PR2) installs from a URL, lists
+  installed plugins with their manifest + declared capabilities for review, shows
+  enabled state + the "enable in config + restart" hint, and uninstalls — backed by
+  `/api/plugins/installed|install` + `DELETE /api/plugins/{id}`. PR3 adds the safety
+  rails: **`plugin install-deps <id>`** (the explicit, separate pip step) with a
+  clear "declared deps not installed — run install-deps" diagnostic when an enabled
+  plugin's deps are missing; **audit logging** of install/uninstall/install-deps;
+  and a **`plugins.sources.allow`** allowlist (host/org globs) enforced on CLI +
+  console installs. PR4 makes a plugin repo a **full bundle**: `register()` already
+  contributes tools / subagents / routes / MCP / views, and conventional
+  **`skills/`** (SKILL.md) + **`workflows/`** (`*.yaml`) subdirs are now
+  auto-discovered (data — no boilerplate; `register_workflow_dir()` for non-standard
+  paths), so installing a repo pulls in skills + workflows too. Publish + install
+  guide: [`plugin-registry.md`](docs/guides/plugin-registry.md). See
+  [ADR 0027](docs/adr/0027-install-plugins-from-git-url.md).
+
 ## [0.19.0] - 2026-06-06
 
 ### Added

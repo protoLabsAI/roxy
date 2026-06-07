@@ -28,6 +28,7 @@ log = logging.getLogger("protoagent.plugins")
 class PluginLoadResult:
     tools: list = field(default_factory=list)
     skill_dirs: list = field(default_factory=list)
+    workflow_dirs: list = field(default_factory=list)  # *.yaml recipe dirs (ADR 0027)
     a2a_skills: list = field(default_factory=list)  # A2A card skill specs (#570)
     routers: list = field(default_factory=list)    # {plugin_id, router, prefix} (ADR 0018)
     surfaces: list = field(default_factory=list)    # {plugin_id, name, start, stop}
@@ -179,8 +180,16 @@ def load_plugins(config, *, core_tool_names: set[str] | None = None) -> PluginLo
             registry = PluginRegistry(manifest.id, manifest.path, config=pconf)
             register(registry)
         except Exception as exc:  # noqa: BLE001 — a bad plugin must not break boot
-            entry["error"] = str(exc)
-            log.warning("[plugins] %s failed to load: %s — skipping", manifest.id, exc)
+            # Clear diagnostic when an enabled plugin's declared deps aren't
+            # installed (ADR 0027 D4: install fetches code; deps are explicit).
+            if isinstance(exc, ModuleNotFoundError) and manifest.requires_pip:
+                entry["error"] = (
+                    f"declared deps not installed ({', '.join(manifest.requires_pip)}) — "
+                    f"run: python -m server plugin install-deps {manifest.id}"
+                )
+            else:
+                entry["error"] = str(exc)
+            log.warning("[plugins] %s failed to load: %s — skipping", manifest.id, entry["error"])
             result.meta.append(entry)
             continue
 
@@ -195,6 +204,17 @@ def load_plugins(config, *, core_tool_names: set[str] | None = None) -> PluginLo
 
         result.tools.extend(kept)
         result.skill_dirs.extend(registry.skill_dirs)
+        result.workflow_dirs.extend(registry.workflow_dirs)
+        # Full-bundle auto-discovery (ADR 0027): a plugin repo can ship SKILL.md
+        # skills + *.yaml workflows in conventional subdirs and they're picked up
+        # without any register_* boilerplate — so installing a repo pulls in the
+        # whole bundle (tools+subagents via register(), skills+workflows as data).
+        conv_skills = manifest.path / "skills"
+        if conv_skills.is_dir() and conv_skills not in result.skill_dirs:
+            result.skill_dirs.append(conv_skills)
+        conv_workflows = manifest.path / "workflows"
+        if conv_workflows.is_dir() and conv_workflows not in result.workflow_dirs:
+            result.workflow_dirs.append(conv_workflows)
         result.a2a_skills.extend(registry.a2a_skills)
         if registry.thread_id_resolver is not None:  # last plugin wins (#571)
             if result.thread_id_resolver is not None:
