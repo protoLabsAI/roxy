@@ -1,5 +1,60 @@
 ## [Unreleased]
 
+## [0.22.0] - 2026-06-07
+
+### Changed
+- **Plugin console-view icon allowlist widened** (ADR 0026 D4) — the `views[].icon`
+  set grew from 9 to ~35 lucide names spanning dashboards, data, comms, dev, AI,
+  finance, **space/fleet** (`Rocket`/`Ship`/`Satellite`/`Radar`), and security, so a
+  plugin's rail icon fits its domain (unknown names still fall back to a generic glyph).
+
+### Added
+- **`set_goal` tool** (ADR 0028) — the lead agent can set its **own** standing goal,
+  ground-truthed by a plugin verifier: `set_goal(condition, check, check_args, …)`
+  builds a `plugin` verifier and routes through `set_goal_safe`, so the agent
+  literally can't open a shell/`eval` goal (those stay operator-only via `/goal`).
+  Registered only when goal mode is on; reads the current session at call time.
+- **Goal lifecycle hooks** (ADR 0028, PR3) — a plugin can
+  `registry.register_goal_hook(on_achieved=…, on_failed=…)` to react when a goal
+  reaches a terminal state (achieved → `on_achieved`; exhausted/unachievable →
+  `on_failed`), fired from the controller's `_finish`. Push a notification, record a
+  finding, or set the next goal — the goal system becomes a self-improving-loop
+  building block, not a dead-end status. Sync or async; a raising hook is logged +
+  swallowed (never breaks the goal loop). Completes ADR 0028.
+- **Safe programmatic goal-set** (ADR 0028, PR2) — `GoalController.set_goal_safe()`
+  + `POST /api/goals` let an agent/plugin/REST caller establish a standing goal
+  **only** with a `plugin` verifier. `command`/`test`/`ci` (shell) and `data`
+  (`eval`) verifiers are refused programmatically — they stay operator-only via
+  `/goal` — so a non-operator goal-set can never reach a code-exec sink (D3). The
+  REST route 400s a rejected verifier.
+- **Plugin-contributed goal verifiers** (ADR 0028, PR1) — a plugin can
+  `registry.register_goal_verifier("<name>", fn)` to contribute an in-process goal
+  verifier (auto-namespaced `<plugin-id>:<name>`), referenced by a new **`plugin`**
+  verifier type: `{"type":"plugin","check":"<id>:<name>","args":{…}}`. `args` are
+  declarative data the verifier validates — no shell, no `eval` — so a plugin can
+  ground-truth its own domain state without the `command` verifier's shell-out. A
+  bad/erroring verifier never marks a goal met. Wired through the loader + re-set on
+  config reload. (PR2 will allow setting a `plugin`-verifier goal programmatically.)
+
+## [0.21.0] - 2026-06-07
+
+### Added
+- **Plugin Devkit** — `plugins/plugin-devkit`, a featured first-class plugin that
+  is both the canonical **full-bundle example** and the **plugin-authoring kit**.
+  In one plugin it demonstrates every contribution type — a tool
+  (**`scaffold_plugin`**, writes a new plugin skeleton on disk), a subagent
+  (**`plugin-architect`**), a bundled **`building-plugins` skill** (the authoring
+  contract), a **`design-plugin` workflow** (request → spec), a **console view**,
+  and **config/settings**. Enable it (it ships disabled, like `hello`) to let the
+  agent build its own plugins. See [Install & publish plugins](docs/guides/plugin-registry.md).
+- **Clean plugin delete** (ADR 0027) — `plugin uninstall <id>` now also removes the
+  plugin's `plugins.enabled`/`disabled` reference (no more dangling-enabled errors
+  on the next restart), on top of the code dir + `plugins.lock` entry. A new
+  **`--purge`** flag (CLI) / `?purge=true` (the `DELETE /api/plugins/{id}` route)
+  *also* removes the plugin's config section + its secrets (comment-safe via ruamel).
+  Config/secrets are kept by default so a reinstall restores settings; pip deps are
+  never auto-removed (shared venv) but are reported. Returns a removal report.
+
 ## [0.20.0] - 2026-06-07
 
 ### Added

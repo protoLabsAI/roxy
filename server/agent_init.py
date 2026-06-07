@@ -138,7 +138,8 @@ def _init_langgraph_agent(headless_setup: bool = False):
     # (<server>__<tool>) so they can't be shadowed by a plugin tool anyway.
     _plugins = _build_plugins(
         STATE.graph_config,
-        existing_tools=get_all_tools(STATE.knowledge_store, scheduler=STATE.scheduler),
+        existing_tools=get_all_tools(STATE.knowledge_store, scheduler=STATE.scheduler,
+                                     goal_enabled=getattr(STATE.graph_config, "goal_enabled", True)),
     )
     STATE.plugin_tools, STATE.plugin_skill_dirs, STATE.plugin_meta = (
         _plugins.tools, _plugins.skill_dirs, _plugins.meta,
@@ -146,6 +147,12 @@ def _init_langgraph_agent(headless_setup: bool = False):
     STATE.plugin_workflow_dirs = _plugins.workflow_dirs
     STATE.plugin_a2a_skills = _plugins.a2a_skills  # A2A card skills (#570)
     STATE.thread_id_resolver = _plugins.thread_id_resolver  # thread_id seam (#571)
+    # Register plugin-contributed goal verifiers (ADR 0028) — re-set on each
+    # (re)load so a config change refreshes the available `plugin` verifiers.
+    from graph.goals import hooks as _goal_hooks
+    from graph.goals import verifiers as _goal_verifiers
+    _goal_verifiers.set_plugin_verifiers(_plugins.goal_verifiers)
+    _goal_hooks.set_goal_hooks(_plugins.goal_hooks)
     # Surfaces / routes / subagents (ADR 0018). Routers + surfaces are captured
     # here and consumed once by _main (mount) + the startup hook (start) — they
     # don't hot-reload. Subagents register into SUBAGENT_REGISTRY before the graph
@@ -821,7 +828,8 @@ def _reload_langgraph_agent() -> tuple[bool, str]:
             # is injected into the MCP discovery below (matches _main ordering).
             new_plugins = _build_plugins(
                 new_config,
-                existing_tools=get_all_tools(new_store, scheduler=next_scheduler),
+                existing_tools=get_all_tools(new_store, scheduler=next_scheduler,
+                                             goal_enabled=getattr(new_config, "goal_enabled", True)),
             )
             new_mcp_clients, new_mcp_tools, new_mcp_meta = _build_mcp(
                 new_config, plugin_servers=[s["factory"] for s in new_plugins.mcp_servers]
