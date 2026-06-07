@@ -147,6 +147,11 @@ def _init_langgraph_agent(headless_setup: bool = False):
     STATE.plugin_workflow_dirs = _plugins.workflow_dirs
     STATE.plugin_a2a_skills = _plugins.a2a_skills  # A2A card skills (#570)
     STATE.thread_id_resolver = _plugins.thread_id_resolver  # thread_id seam (#571)
+    # A plugin may provide the knowledge backend (ADR 0031) — swap it in now (the
+    # graph compiles below with STATE.knowledge_store). Default built-in store stays
+    # the collision-check binding + the degrade-safe fallback.
+    STATE.knowledge_store = _apply_plugin_knowledge_backend(
+        STATE.graph_config, STATE.knowledge_store, _plugins)
     # Register plugin-contributed goal verifiers (ADR 0028) — re-set on each
     # (re)load so a config change refreshes the available `plugin` verifiers.
     from graph.goals import hooks as _goal_hooks
@@ -246,6 +251,61 @@ def _build_knowledge_store(config):
     except Exception as exc:
         log.warning("[server] knowledge store init failed: %s; running KB-less", exc)
         return None
+
+
+def _apply_plugin_knowledge_backend(config, store, plugins):
+    """ADR 0031 — swap in a plugin-provided knowledge **backend** (``knowledge.backend``)
+    or, failing that, a plugin **embedder** for the built-in hybrid store
+    (``knowledge.embedder``), selected by config. Degrade-safe: an unregistered name,
+    a None return, or a factory error keeps ``store`` (never KB-less by surprise).
+    Called after plugins load, at both init and reload."""
+    backend = (getattr(config, "knowledge_backend", "") or "").strip()
+    if backend:
+        factory = (getattr(plugins, "knowledge_stores", {}) or {}).get(backend)
+        if factory is None:
+            log.warning("[server] knowledge.backend %r not registered by any plugin — built-in store", backend)
+            return store
+        try:
+            built = factory(config)
+        except Exception as exc:  # noqa: BLE001 — degrade to the built-in store
+            log.warning("[server] knowledge backend %r failed: %s — built-in store", backend, exc)
+            return store
+        if built is None:
+            log.warning("[server] knowledge backend %r returned None — built-in store", backend)
+            return store
+        log.info("[server] knowledge: plugin backend %r", backend)
+        return built
+    # No plugin store selected — maybe a plugin embedder for the built-in hybrid store.
+    embedder = (getattr(config, "knowledge_embedder", "") or "").strip()
+    if embedder:
+        return _apply_plugin_embedder(config, store, plugins, embedder)
+    return store
+
+
+def _apply_plugin_embedder(config, store, plugins, name):
+    """ADR 0031 follow-up — rebuild the built-in store as a HybridKnowledgeStore using
+    a plugin-registered in-process embedder (``register_embedder``). Degrade-safe:
+    unregistered / None / error keeps ``store`` (the gateway-embedder one)."""
+    factory = (getattr(plugins, "embedders", {}) or {}).get(name)
+    if factory is None:
+        log.warning("[server] knowledge.embedder %r not registered by any plugin — gateway embedder", name)
+        return store
+    try:
+        embed_fn = factory(config)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("[server] embedder %r failed: %s — gateway embedder", name, exc)
+        return store
+    if embed_fn is None:
+        log.warning("[server] embedder %r returned None — gateway embedder", name)
+        return store
+    try:
+        from knowledge.hybrid_store import HybridKnowledgeStore
+        rebuilt = HybridKnowledgeStore(db_path=config.knowledge_db_path, embed_fn=embed_fn)
+        log.info("[server] knowledge: hybrid store with plugin embedder %r", name)
+        return rebuilt
+    except Exception as exc:  # noqa: BLE001
+        log.warning("[server] hybrid store w/ embedder %r failed: %s — built-in store", name, exc)
+        return store
 
 
 def _build_skills_index(config, extra_skill_dirs=None):
@@ -460,6 +520,26 @@ async def _checkpoint_prune_loop() -> None:
             except Exception:
                 log.exception("[checkpoint-prune] sweep failed")
         await asyncio.sleep(max(1, interval_h) * 3600)
+
+
+async def _monitor_goals_loop() -> None:
+    """Out-of-band cadence for monitor goals (ADR 0030 D2.1): periodically run each
+    active monitor goal's verifier — no agent turn, no model call — so a met
+    long-horizon objective finishes (firing its on_achieved hook) without waiting
+    for a session turn. Verifier-only; the `drive` loop is untouched."""
+    await asyncio.sleep(15)  # let boot settle before the first tick
+    while True:
+        ctrl = STATE.goal_controller
+        cfg = STATE.graph_config
+        interval = getattr(cfg, "goal_monitor_interval", 60) if cfg else 60
+        if ctrl is not None:
+            try:
+                n = await ctrl.tick_monitor_goals()
+                if n:
+                    log.info("[goal-monitor] %d monitor goal(s) reached a terminal state", n)
+            except Exception:
+                log.exception("[goal-monitor] tick failed")
+        await asyncio.sleep(max(5, interval))
 
 
 async def _retire_thread(thread_id: str) -> str | None:
@@ -837,6 +917,8 @@ def _reload_langgraph_agent() -> tuple[bool, str]:
             new_plugin_tools = new_plugins.tools
             new_plugin_skill_dirs = new_plugins.skill_dirs
             new_plugin_meta = new_plugins.meta
+            # Plugin knowledge backend (ADR 0031) — swap before the graph rebuild.
+            new_store = _apply_plugin_knowledge_backend(new_config, new_store, new_plugins)
             new_skills = _build_skills_index(new_config, extra_skill_dirs=new_plugin_skill_dirs)
             new_workflow_registry = _build_workflow_registry(new_config)
             new_inbox_store = _build_inbox_store(new_config)

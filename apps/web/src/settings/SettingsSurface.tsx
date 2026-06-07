@@ -8,9 +8,10 @@ const DISCORD_GUIDE_URL = "https://protolabsai.github.io/protoAgent/guides/disco
 const GOOGLE_GUIDE_URL = "https://protolabsai.github.io/protoAgent/guides/google#oauth-client";
 
 import { ErrorBoundary, PanelError, PanelSkeleton } from "../app/ErrorBoundary";
+import { StageSubnav } from "../app/StageSubnav";
 import { api } from "../lib/api";
 import { queryKeys, settingsSchemaQuery } from "../lib/queries";
-import type { SettingsField } from "../lib/types";
+import type { SettingsField, SettingsGroup } from "../lib/types";
 import { DelegatesSection } from "./DelegatesSection";
 import { PluginsSection } from "./PluginsSection";
 
@@ -22,18 +23,32 @@ import { PluginsSection } from "./PluginsSection";
 // ErrorBoundary.
 
 export function SettingsSurface() {
+  // SettingsBody owns its own panel <section> (so the sub-tab strip can sit ABOVE
+  // the card, consistent with the rail surfaces). The loading/error fallbacks carry
+  // their own card so the layout doesn't jump.
   return (
-    <section className="panel stage-panel settings-panel">
-      <QueryErrorResetBoundary>
-        {({ reset }) => (
-          <ErrorBoundary onReset={reset} fallback={(a) => <PanelError {...a} label="settings" />}>
-            <Suspense fallback={<PanelSkeleton label="Loading settings…" />}>
-              <SettingsBody />
-            </Suspense>
-          </ErrorBoundary>
-        )}
-      </QueryErrorResetBoundary>
-    </section>
+    <QueryErrorResetBoundary>
+      {({ reset }) => (
+        <ErrorBoundary
+          onReset={reset}
+          fallback={(a) => (
+            <section className="panel stage-panel settings-panel">
+              <PanelError {...a} label="settings" />
+            </section>
+          )}
+        >
+          <Suspense
+            fallback={
+              <section className="panel stage-panel settings-panel">
+                <PanelSkeleton label="Loading settings…" />
+              </section>
+            }
+          >
+            <SettingsBody />
+          </Suspense>
+        </ErrorBoundary>
+      )}
+    </QueryErrorResetBoundary>
   );
 }
 
@@ -110,6 +125,28 @@ function SettingsBody() {
     onError: (e) => setStatus(`connection test failed: ${e instanceof Error ? e.message : String(e)}`),
   });
 
+  // Generic "Test connection" for any group whose plugin declares one (ADR 0029).
+  // Posts the group's fields (short keys; unset secrets fall back to saved config).
+  const [testingSection, setTestingSection] = useState<string | null>(null);
+  const groupFields = (group: SettingsGroup): Record<string, unknown> => {
+    const out: Record<string, unknown> = {};
+    for (const f of group.fields) {
+      const short = f.key.split(".").pop() as string;
+      if (f.key in dirty) out[short] = dirty[f.key];
+      else if (f.type !== "secret") out[short] = f.value;  // never echo an unset secret
+    }
+    return out;
+  };
+  const testGroup = useMutation({
+    mutationFn: (vars: { endpoint: string; fields: Record<string, unknown> }) =>
+      api.testConfig(vars.endpoint, vars.fields),
+    onMutate: () => setStatus("testing connection…"),
+    onSuccess: (r) =>
+      setStatus(r.ok ? `connection OK${r.identity ? ` — ${r.identity}` : ""}` : `connection failed — ${r.error || "no response"}`),
+    onError: (e) => setStatus(`connection test failed: ${e instanceof Error ? e.message : String(e)}`),
+    onSettled: () => setTestingSection(null),
+  });
+
   // Verify a Discord bot token (pending edit or saved). Shows the bot name.
   const testDiscord = useMutation({
     mutationFn: () => api.testDiscord(asStr(dirty["discord.bot_token"])),
@@ -149,17 +186,16 @@ function SettingsBody() {
 
   return (
     <>
-      {/* Sub-nav above the header, matching the other rail surfaces (System,
-          Knowledge, Activity) which render their stage-subnav above the panel. */}
+      {/* Canonical sub-tab strip — above the panel card, shared with the rail
+          surfaces + plugin views (StageSubnav: single source of truth). */}
       {categories.length > 1 ? (
-        <div className="stage-subnav settings-subnav">
-          {categories.map((c) => (
-            <button key={c} className={c === category ? "active" : ""} onClick={() => setActiveCategory(c)}>
-              {c}
-            </button>
-          ))}
-        </div>
+        <StageSubnav
+          active={category}
+          onSelect={setActiveCategory}
+          tabs={categories.map((c) => ({ id: c, label: c }))}
+        />
       ) : null}
+      <section className="panel stage-panel settings-panel">
       <div className="panel-header">
         <div>
           <h1>Settings</h1>
@@ -243,6 +279,29 @@ function SettingsBody() {
                 </a>
               </div>
             ) : null}
+            {/* Generic Test button (ADR 0029) — any plugin group that declares a
+                test endpoint (e.g. communication plugins). Discord/Google above are
+                bespoke and don't set `test`, so there's no overlap. */}
+            {group.test ? (
+              <div className="settings-group-actions">
+                <button
+                  className="secondary-button"
+                  type="button"
+                  onClick={() => {
+                    setTestingSection(group.section);
+                    testGroup.mutate({ endpoint: group.test!.endpoint, fields: groupFields(group) });
+                  }}
+                  disabled={(testGroup.isPending && testingSection === group.section) || save.isPending}
+                >
+                  {testGroup.isPending && testingSection === group.section ? (
+                    <Loader2 className="spin" size={15} />
+                  ) : (
+                    <ShieldCheck size={15} />
+                  )}
+                  Test connection
+                </button>
+              </div>
+            ) : null}
           </section>
         ))}
 
@@ -252,6 +311,7 @@ function SettingsBody() {
         {/* Git-installed plugins (ADR 0027) — install/manage from a URL, under Integrations. */}
         {category === "Integrations" ? <PluginsSection /> : null}
       </div>
+      </section>
     </>
   );
 }

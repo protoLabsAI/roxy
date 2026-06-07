@@ -1,5 +1,77 @@
 ## [Unreleased]
 
+### Changed
+- **Unified panel sub-tabs** — every surface's sub-tab strip now renders through one
+  shared `StageSubnav` component, always **above the panel card**. Previously Settings +
+  plugin views rendered their tabs *inside* the card (so they read as part of the heading)
+  while the rail surfaces rendered them above — now all consistent (single source of truth).
+- **Friendlier Schedule tab** — "New schedule" now opens a **modal** that builds the
+  schedule for you: a **calendar** picker for one-off (→ ISO datetime), **presets** for
+  recurring (hourly / daily / weekdays / weekly + a time picker, → cron), and a raw-cron
+  escape hatch — with a live plain-English preview ("every weekday at 9:00 AM"). No
+  hand-written cron required. The list now shows each job's schedule in plain English too.
+
+### Added
+- **Desktop build CI** — `.github/workflows/desktop-build.yml` builds the macOS desktop
+  app (`.dmg` — the Tauri shell + the PyInstaller server sidecar), signs + notarizes it
+  with the org Apple Developer ID, and attaches it to the GitHub release on a semver tag.
+  Manual dispatch builds an unsigned dev artifact for iteration. Gives the marketing site
+  a real download to point at.
+- **`register_embedder` hook** (ADR 0031 follow-up) — a plugin can supply an in-process
+  embedder (`registry.register_embedder(name, factory→embed_fn)`), selected with
+  `knowledge.embedder: "<name>"`, so the built-in hybrid store can embed locally
+  (fastembed / sentence-transformers) without the gateway round-trip. Degrade-safe:
+  unregistered / None / error falls back to the gateway embedder.
+
+## [0.23.0] - 2026-06-07
+
+### Changed
+- **Console: "Playbooks" renamed to "Skills"** — the surface always *was* the skill
+  index (`SKILL.md`); the "Playbook" label collided with Workflows. Now labeled Skills,
+  with kickers + a "Skills vs Workflows" doc clarifying the distinction (a skill **advises**
+  / is retrieved; a workflow **runs** / is executed). `/api/playbooks` route unchanged.
+
+### Added
+- **Pluggable knowledge backend** (ADR 0031) — `registry.register_knowledge_store(name,
+  factory)` + a `knowledge.backend` config selector let a plugin supply the store
+  (pgvector / Qdrant / Chroma / a managed vector DB) instead of the built-in SQLite/FTS5,
+  with no core edit. Degrade-safe: an unregistered name / None / a factory error keeps the
+  built-in store. A new `KnowledgeBackend` Protocol (`knowledge.backend`) formalizes the
+  consumed surface. The embedder stays gateway-routed (model-swappable via `embed_model`).
+- **`controller.evaluate_now(session_id)`** (ADR 0030 D2.2) — a plugin can trigger an
+  immediate verifier-only goal check from its own state-change path (e.g. right after a
+  sale clears), so achievement is caught promptly instead of at the next monitor tick.
+  No agent turn, no drive bookkeeping; met → finish (hooks fire). Completes ADR 0030.
+- **Monitor goals** (ADR 0030 D1/D2.1/D3) — a goal can be `"mode": "monitor"` for a
+  metric an *external* process drives (a background engine, training run, deployment).
+  Monitor goals aren't added to the agent continuation loop (no wasted turns), **never
+  exhaust** (a long-horizon target is expected to sit unmet across checks), and are
+  evaluated **out-of-band** on a cadence (`goal.monitor_interval`, default 60s) — firing
+  the ADR-0028 `on_achieved` hook when met. Closes ADR-0028's deferred D6. `drive` goals
+  are unchanged. Surfaced by the SpaceTraders fleet fork (a `credits ≥ 1M` goal that
+  stormed the drive loop in minutes).
+- **Per-goal `no_progress_limit`** (ADR 0030 D4) — a goal can carry its own patience
+  (`/goal {"…", "no_progress_limit": N}` or via `set_goal_safe`), overriding the global
+  `goal_no_progress_limit` for that one goal. First slice of monitor goals.
+- **Generic plugin "Test connection" button** (ADR 0029) — a plugin manifest can
+  declare `test: true` and the console renders a Test-connection button for its
+  Settings group (POSTs the group's fields to `/api/config/test-<section>`, unset
+  secrets falling back to saved config) — no React edit. Telegram + Slack get it via
+  the `chat_surface` wirer's test route; Discord keeps its bespoke button.
+- **Communication-plugin standard** (ADR 0029) — a `ChatAdapter` contract +
+  `register_chat_surface` helper (`graph/plugins/chat_surface.py`) so a chat
+  integration only implements transport (connect / receive / send); admin-gating,
+  per-conversation threads, agent invoke, reply-chunking, lifecycle + reconnect, and
+  the Test route are shared. Ships a **Telegram** plugin (`plugins/telegram`, opt-in)
+  as the ~80-line reference — Slack/WhatsApp/etc. follow the same shape. Discord stays
+  bespoke (richer extras) and can migrate incrementally.
+- **Slack plugin** (`plugins/slack`, opt-in) — a Socket Mode `ChatAdapter` (no public
+  URL), proving the standard handles a **websocket** transport as cleanly as Telegram's
+  HTTP long-poll. Needs a bot token (xoxb-) + an app-level token (xapp-).
+- **Devkit comms scaffold** — `scaffold_plugin(..., with_comms=True)` writes a
+  `ChatAdapter` skeleton on the shared wirer, so the agent can stub a new chat
+  integration itself.
+
 ## [0.22.0] - 2026-06-07
 
 ### Changed
