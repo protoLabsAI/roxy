@@ -1,6 +1,43 @@
 ## [Unreleased]
 
+## [0.24.0] - 2026-06-08
+
+### Added
+- **Marketing: a /features page** — differentiators deep-dive + a comparison table vs
+  Hermes & OpenClaw (bare-bones+extensible+A2A-orchestration vs batteries-included),
+  plus the dogfooding story (SpaceTraders / protoTrader / ORBIS-over-A2A). Linked in nav + footer.
+- **Headless-mode docs + advertising** — a [Run headless](docs/guides/headless.md) guide
+  (UI tiers, the OpenAI-compatible `/v1/chat/completions` API, the A2A endpoint, auth,
+  headless `--setup`), a README "Run headless" section, and a marketing feature card —
+  surfacing that protoAgent runs API-first (no UI) drivable via OpenAI or A2A.
+
+### Fixed
+- **Subagent YAML override now actually applies at runtime** — `subagents.<name>.{enabled,
+  tools,max_turns}` was parsed into config but never reached the runtime registry (only the
+  status API read it back, so the documented knob silently did nothing). Wired through
+  `_apply_config_subagents` (init + reload); `enabled: false` removes the subagent. The
+  config-side default now derives from the registry entry (single source of truth) so it
+  can't drift — the old hardcoded default was already missing `memory_ingest`.
+
+### Added
+- **Per-subagent model override in config** (ADR 0001) — `subagents.<name>.model` pins a
+  subagent to a specific model (blank = `routing.aux_model` → main model), so an operator
+  can put a heavy-reasoning subagent on the main model while the rest route to a cheaper
+  alias — no code. Applied to the runtime registry at build + reload (the resolution path
+  in `_run_subagent` already existed); surfaced in the runtime status.
+- **Telemetry: export + disk visibility + retention guardrail** —
+  `GET /api/telemetry/export` + an **Export CSV** button download every recorded turn;
+  the **Runtime** panel now shows on-disk DB sizes (knowledge / telemetry / checkpoint /
+  skills); and `telemetry.retention_days` (default **90**) wires the maintenance loop to
+  prune turns older than the window so the per-turn store can't grow unbounded (0 = keep
+  forever).
+
 ### Changed
+- **Unified panel headers** — every surface's header (title + kicker + actions) now renders
+  through one shared `PanelHeader` component, with a single `.panel-actions` wrapper.
+  Consolidated the duplicate `.settings-actions` / `.notes-actions` classes and standardized
+  refresh buttons to icon-only. Completes the panel-layout single-source-of-truth pass
+  (with `StageSubnav`).
 - **Unified panel sub-tabs** — every surface's sub-tab strip now renders through one
   shared `StageSubnav` component, always **above the panel card**. Previously Settings +
   plugin views rendered their tabs *inside* the card (so they read as part of the heading)

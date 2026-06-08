@@ -16,6 +16,11 @@ from pathlib import Path
 
 import yaml
 
+# The built-in researcher's runtime defaults are the single source of truth; the
+# config-side SubagentDef mirrors them so the YAML override layer can't drift
+# (graph/subagents/config has no graph.config dep — no import cycle).
+from graph.subagents.config import RESEARCHER_CONFIG
+
 # Secrets (model API key, A2A bearer) live in an untracked ``secrets.yaml``
 # sibling of the main config, never in the tracked YAML. See graph/config_io
 # for the write side. ``from_yaml`` overlays them below; both still fall back
@@ -74,6 +79,9 @@ class SubagentDef:
     enabled: bool = True
     tools: list[str] = field(default_factory=list)
     max_turns: int = 30
+    # Per-subagent model override (ADR 0001) — blank = routing.aux_model → main model.
+    # Applied onto the registry's SubagentConfig at build (see _apply_config_subagents).
+    model: str = ""
 
 
 @dataclass
@@ -109,13 +117,12 @@ class LangGraphConfig:
     # graph/subagents/config.py). Add fields here as you add entries to
     # SUBAGENT_REGISTRY. Tool/max_turns here mirror the registry default and
     # are the YAML-overridable layer.
+    # Defaults derived from the registry entry (SSOT) so the YAML-overridable layer
+    # always matches the runtime default — an un-overridden config is a true no-op.
     researcher: SubagentDef = field(default_factory=lambda: SubagentDef(
-        tools=[
-            "current_time",
-            "web_search", "fetch_url",
-            "memory_recall", "memory_list",
-        ],
-        max_turns=40,
+        tools=list(RESEARCHER_CONFIG.tools),
+        max_turns=RESEARCHER_CONFIG.max_turns,
+        model=RESEARCHER_CONFIG.model,
     ))
 
     # Sub-agent fan-out — the `task_batch` tool runs delegations concurrently.
@@ -283,6 +290,9 @@ class LangGraphConfig:
     # and is instance-scoped (ADR 0004).
     telemetry_enabled: bool = True
     telemetry_db_path: str = "/sandbox/telemetry.db"
+    # Retention guardrail (ADR 0006) — turns older than this are pruned by the
+    # periodic maintenance loop so the store can't grow unbounded. 0 = keep forever.
+    telemetry_retention_days: int = 90
     # Checkpoint pruning — keeps the SQLite DB from growing unbounded. Keep the
     # latest N checkpoints per session, and TTL whole sessions idle past
     # max_age_days. Runs every prune_interval_hours (0 disables the sweep).
@@ -548,6 +558,7 @@ class LangGraphConfig:
             checkpoint_db_path=data.get("checkpoint", {}).get("db_path", cls.checkpoint_db_path),
             telemetry_enabled=data.get("telemetry", {}).get("enabled", cls.telemetry_enabled),
             telemetry_db_path=data.get("telemetry", {}).get("db_path", cls.telemetry_db_path),
+            telemetry_retention_days=data.get("telemetry", {}).get("retention_days", cls.telemetry_retention_days),
             checkpoint_keep_per_thread=data.get("checkpoint", {}).get("keep_per_thread", cls.checkpoint_keep_per_thread),
             checkpoint_max_age_days=data.get("checkpoint", {}).get("max_age_days", cls.checkpoint_max_age_days),
             checkpoint_prune_interval_hours=data.get("checkpoint", {}).get("prune_interval_hours", cls.checkpoint_prune_interval_hours),
@@ -597,6 +608,7 @@ class LangGraphConfig:
                     enabled=sub.get("enabled", True),
                     tools=sub.get("tools", getattr(config, name).tools),
                     max_turns=sub.get("max_turns", getattr(config, name).max_turns),
+                    model=sub.get("model", getattr(config, name).model),
                 ))
 
         return config
