@@ -70,6 +70,13 @@ Build a lean **`project-board` protoAgent plugin** and an **ACP spawn loop**, wi
 Roxy as the orchestrator. Collapse protoMaker (for the fleet) to a board table + a
 spawn loop, both inside protoAgent.
 
+> **Guiding constraint — API-first. No UI until the API works.** The board is a
+> data model + an HTTP API + the `delegate_to` orchestration loop, and the entire
+> flow (create project → decompose into Ready features → delegate to coder → PR →
+> delegate to Quinn → merge → Done) must run **headlessly, driven by API/A2A
+> calls**, before any UI is built. The combo list/Kanban view (D5) is a *later
+> projection* over a proven API — explicitly deferred, not part of the first cut.
+
 ### D1 — Auto-mode is a protoAgent plugin, not a separate engine
 The orchestration loop (pull `Ready` → spawn coder → open PR → advance → merge)
 ships as a plugin using the existing reach (`register_tool`, `register_router`,
@@ -140,13 +147,14 @@ The per-feature mechanics the registry/AcpClient already handle:
 > ACP agent can itself be an MCP client. Today's reliable transport is **stdio**
 > (subprocess-per-agent); remote ACP transport is WIP.
 
-### D5 — Combo board UI: one data model, two projections, as tabs
-List view (dense, keyboard-first, the workhorse) **and** Kanban view (columns =
-states = live "which agents are running/done/blocked" ops dashboard) are **two
-projections of the same issues**, toggled — never two data models. The Fleet
-dashboard already shipped in the protomaker plugin (`/plugins/protomaker/dashboard`,
-ADR 0026) is the seed of the Kanban projection. "Lightweight" = instant
-view-switching (local-first) + fixed schema, à la Linear.
+### D5 — Combo board UI (DEFERRED — after the API works)
+**Not in the first cut.** Per the API-first constraint, no board UI until the data
+model + API + orchestration loop run headlessly. When we do build it: list view
+(dense, keyboard-first) **and** Kanban view (columns = states = live ops view) are
+**two projections of the same issues**, toggled — never two data models — over the
+already-proven API. The Fleet dashboard in the protomaker plugin
+(`/plugins/protomaker/dashboard`, ADR 0026) is a seed to revisit *then*. Until
+then the board is API-only; humans/Roxy drive it over HTTP/A2A.
 
 ### D6 — Drop the protoMaker cruft (the "Jira tax")
 Do **not** forward-port: custom workflow schemes / configurable transition graphs,
@@ -226,9 +234,10 @@ The ACP-spawn primitive is already built (ADR 0024/0025) — so the next step is
    declare `proto` (`type: acp`, `proto --acp`) + `quinn` (`type: a2a`). Prove
    `delegate_to("proto", <spec>)` builds in a workdir and `delegate_to("quinn", …)`
    reviews — both ends, end-to-end, on one project.
-2. **Build the lean board + the orchestration loop** (D3/D5): the 6-state store +
-   the Ready→`delegate_to(coder)`→PR→`delegate_to(quinn)`→merge→Done loop +
-   the combo list/Kanban view.
+2. **Build the lean board + the orchestration loop — API-only** (D3): the 6-state
+   store + an HTTP/A2A API + the Ready→`delegate_to(coder)`→PR→`delegate_to(quinn)`
+   →merge→Done loop. Drive + verify it entirely via API calls. **No UI** (D5 is
+   deferred).
 Settle the one shaping decision first (open questions): **board store** —
 plugin-owned DB vs a thin mirror over GitHub Projects (Symphony uses Linear).
 
