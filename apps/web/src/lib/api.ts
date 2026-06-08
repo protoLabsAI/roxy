@@ -21,6 +21,7 @@ import type {
   SlashCommand,
   Playbook,
   Subagent,
+  ToolInfo,
   TelemetryInsights,
   TelemetrySummary,
   TelemetryTurn,
@@ -467,6 +468,10 @@ export const api = {
     return request<{ subagents: Subagent[] }>("/api/subagents");
   },
 
+  tools() {
+    return request<{ tools: ToolInfo[]; count: number }>("/api/tools");
+  },
+
   runSubagent(body: {
     session_id: string;
     type: string;
@@ -500,7 +505,7 @@ export const api = {
     return request<{ jobs: ScheduledJob[]; backend: string }>("/api/scheduler/jobs");
   },
 
-  addSchedule(body: { prompt: string; schedule: string; job_id?: string }) {
+  addSchedule(body: { prompt: string; schedule: string; job_id?: string; timezone?: string }) {
     return request<{ job: ScheduledJob }>("/api/scheduler/jobs", {
       method: "POST",
       body,
