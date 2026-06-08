@@ -274,3 +274,83 @@ plugin-owned DB vs a thin mirror over GitHub Projects (Symphony uses Linear).
   confirmed against an official OpenAI source**; do not architect against it.
 - Exact OpenAI Symphony mechanics are from a secondary source (pattern solid,
   precise cron/comment details illustrative).
+
+---
+
+# Addendum (2026-06-08) — The planning layer: projects-as-docs + a beads DAG + adversarial decomposition
+
+The body above is the **execution** layer (lean board + delegate spine + escalation). This addendum adds the **planning** layer Josh asked for: protoMaker's "projects paradigm" (idea → outline → decision docs → **epics › milestones › features** with **dependency chains**) — but the artifacts live as **docs in the working dir**, not a DB. Researched against protoMaker's actual model + the 2025–26 spec-driven/docs-as-code landscape (Spec-Kit, Kiro, MADR, Beads, Backlog.md).
+
+## Three layers
+1. **Plan** — docs-in-workdir: idea → outline → decision docs (ADRs) → epics › milestones › features. The docs are the narrative source of truth.
+2. **Execute** — the lean board + delegate spine (worktree coder + Quinn reviewer). The board is a *projection*, not a store.
+3. **Escalate** — per-feature model ladder (difficulty → tier; climb on failure).
+
+### D7 — Planning artifacts live as docs in the working dir
+```
+docs/
+  planning/00-idea.md  01-outline.md      # PRD-lite seed → shape of work
+  constitution.md                          # immutable project principles (Spec-Kit) — referenced every step
+  decisions/0001-<slug>.md                  # MADR ADRs — frozen "why", NAMES rejected options
+specs/
+  epic-01-<slug>/epic.md
+    milestone-01-<slug>/
+      feature-001-<slug>/
+        requirements.md   # user stories + EARS acceptance criteria (WHEN…THE SYSTEM SHALL…), P1/P2/P3
+        design.md         # architecture/components; links the relevant ADRs
+        tasks.md          # checkbox tasks, [P]=parallel-safe, test-first order
+AGENTS.md / CLAUDE.md      # how the agent reads/writes the above
+```
+Mapping protoMaker → ours: **Project → Milestone → Phase → Feature** becomes **Epic → Milestone → Feature(=Kiro triad)**; protoMaker's **SPARC PRD** → `planning/` + MADR ADRs; protoMaker already persists this as `.automaker/projects/{slug}/` docs — we just make them **first-class repo docs**, version-controlled, the source of truth.
+
+### D8 — Beads is the execution DAG (decision: **1b**)
+The prose specs are the narrative truth; **beads** is the compiled work-graph the loop runs on (Roxy already speaks beads):
+- One **bead per feature** ↔ links to its `specs/.../feature-NNN/` dir. Bead fields: `id` (hash, merge-safe), `parent` (epic), `blocks`/`depends_on` edges, `status`, `difficulty`, `attempts[]`.
+- `bd ready` = the loop's **deterministic unblocked queue** (transitive blockers resolved offline). Epics are first-class; only `blocks` edges gate readiness.
+- Storage is `.beads/*.jsonl` committed to git → still "in the working dir."
+- **The board is a projection of beads + frontmatter — there is no separate board store, so board-drift (the 82-phantom class) is structurally impossible.** The merge-webhook flips the bead `done`; nothing else sets it.
+
+### D9 — Adversarial decomposition (decision: **2**)
+Each decomposition **step** is produced by a **`decompose` subagent** then hardened by an **`antagonist` subagent** before it's written and the next step builds on it (`register_subagent`, reasoning tier; Roxy orchestrates propose→attack→revise, ≤N rounds):
+
+| Step → artifact | Antagonist attacks |
+|---|---|
+| idea → `outline.md` | Problem real? Non-goals explicit? Scope honest? |
+| outline → `decisions/*.md` | Load-bearing decisions surfaced? Rejected options named? Unstated assumptions? |
+| → epics/milestones | MECE? Right granularity (not 18 phantom phases)? **Which phases are *truly* foundations?** |
+| → feature `requirements/design/tasks` | Criteria **EARS-testable**? design cites right ADRs? deps declared? tasks complete + ordered? |
+
+Then a **human gate** before features go `ready` (protoMaker's PRD-review checkpoint — highest-ROI gate). *Open: gate per-epic vs after full decomposition — see below.*
+
+### D10 — Model escalation ladder (Josh's ask)
+Each feature's `difficulty` sets the **initial** model tier; failure climbs the ladder; the top blocks:
+- `small → protolabs/fast`, `medium → smart`, `large/architectural → reasoning` (the gateway tiers fixed this session).
+- On failure (CI-red or review-reject after a remediation cycle) **bump one rung** (`fast→smart→reasoning`), recording `{tier, outcome}` in the bead's `attempts[]`.
+- Exhaust the ladder → `status: blocked` (human escalation). **Never infinite retry.** CI-fail vs review-reject may climb at different rates (a knob).
+- Zero new infra: the coder dispatch already takes a model — escalation just chooses the tier.
+
+### D11 — Foundation = a *deliberate* merge-gated edge (decision: **3**, refined)
+Keep protoMaker's foundation concept — **still needed even with worktrees** (dependents branch off `<base>`; if the foundation isn't *merged*, that base lacks the shared scaffolding → they recreate it / conflict). Express as a beads `blocks` edge with `gate: merge` (satisfied on merge, not review).
+- **Caveat (why it's double-edged):** it *serializes* on the foundation merge, so it **amplifies merge-loop fragility** — a single stuck foundation PR freezes its whole downstream milestone. It didn't bite directly this session, but the merge loop it rides on did (merge-limbo #854, the `model=reasoning` block, the auto-merge 404) — all now hardened. So foundation-gating is a *forcing function* for merge-loop reliability.
+- **Refinement:** do **not** auto-mark every milestone's phase-1 as foundation (protoMaker over-serializes). Mark foundations **deliberately** — only phases creating genuinely shared structure — and let the rest run parallel. The **antagonist subagent enforces this** at the epics/milestones step ("is this *really* a foundation, or needless serialization?"). D9 and D11 reinforce each other.
+
+### D12 — Constitution + MADR ADRs (decision: **4**)
+`constitution.md` (immutable principles, referenced every step) + **MADR** ADRs in `docs/decisions/` (MADR over lean Nygard because it **names rejected options** → the agent won't re-litigate closed paths). Standard per project.
+
+---
+
+## Alignment with shipped work + greenfield-vs-build-on
+
+**What's shipped (to stay aligned with):**
+- **protoMaker plugin** (roxy #70, committed + live) — Roxy's identity + fleet read/triage tools + scope middleware + dashboard.
+- **Delegate spine — proven, not entangled:** the dev team proved `proto` (acp) + `quinn` (a2a) end-to-end incl. worktree-as-sandbox (`WORKTREE_SANDBOX_42`). But the roster is **gitignored config** (host-only) and the A2A-1.0 fix is **upstream (#705)** — so **no board/loop code is committed**.
+
+**Decision — build the planning+board layer GREENFIELD (recommended), as a sibling plugin:**
+- A new **`board-orchestration`** (a.k.a. `project-board`) plugin — the docs/beads planning layer + the board API + the Ready→delegate→PR→review→merge loop + the decompose/antagonist subagents + the escalation ladder.
+- It **reuses, doesn't modify**, the shipped work: it calls the existing `delegate_to`/`AcpAdapter` (worktree dispatch) + Quinn a2a; the **protomaker plugin stays unchanged** (Roxy's identity + fleet tools). Roxy's deploy enables both as siblings.
+- **Rollback is trivial:** nothing board/loop is committed yet; the one local delta (roxy's `adapters.py`) reverts to upstream #705 on sync; the delegate config is gitignored. So greenfielding the new plugin entangles nothing — if we change our minds, we drop the new plugin and lose nothing shipped.
+
+**Why greenfield over folding into protomaker:** the protomaker plugin is the *agent* (identity + fleet read-tools); the projects paradigm is a cohesive *engine* (decompose → beads DAG → board → loop → escalate). Keeping them sibling plugins keeps each clean and lets the engine be reused by non-Roxy agents later.
+
+## Open question (still pressure-testing)
+- **Human-gate placement:** after *full* decomposition (one approval, but risks over-planning before the first slice is validated) vs **per-epic** (approve epic-1's milestones/features, build+validate, then decompose epic-2 — tighter feedback, matches "don't over-plan"). Leaning per-epic.
