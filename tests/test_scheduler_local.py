@@ -464,3 +464,100 @@ async def test_fire_emits_a2a_1_0_wire_shape(tmp_path, monkeypatch):
     assert msg["contextId"] == ACTIVITY_CONTEXT
     assert msg["metadata"]["scheduler_job_id"] == job.id
     assert msg["metadata"]["origin"] == "scheduler"
+
+
+@pytest.mark.asyncio
+async def test_schedule_task_dedupes_identical_jobs(tmp_path):
+    """schedule_task must not create a second job identical to an active one
+    (same prompt + schedule) — the common cause of scheduled-task spam."""
+    from tools.lg_tools import _build_scheduler_tools
+
+    sched = _make_scheduler(tmp_path)
+    tools = {t.name: t for t in _build_scheduler_tools(sched)}
+    schedule = tools["schedule_task"]
+
+    r1 = await schedule.ainvoke({"prompt": "summarize logs", "when": "0 * * * *"})
+    assert "Scheduled job" in r1
+    r2 = await schedule.ainvoke({"prompt": "summarize logs", "when": "0 * * * *"})
+    assert "Already scheduled" in r2 and "duplicate" in r2
+    assert len(sched.list_jobs()) == 1
+
+    # A different schedule for the same prompt is NOT a duplicate.
+    r3 = await schedule.ainvoke({"prompt": "summarize logs", "when": "0 9 * * *"})
+    assert "Scheduled job" in r3
+    assert len(sched.list_jobs()) == 2
+
+
+@pytest.mark.asyncio
+async def test_slow_fire_not_refired_while_in_flight(tmp_path, monkeypatch):
+    """A scheduled turn that runs longer than the poll interval must fire ONCE.
+
+    message/send blocks until the turn is terminal, so a multi-tick turn would
+    otherwise be re-claimed every second and fire repeatedly (the duplicate
+    scheduled-turn / spam bug). The in-flight guard prevents re-claiming.
+    """
+    s = _make_scheduler(tmp_path)
+    past = (datetime.now(UTC) - timedelta(seconds=1)).isoformat()
+    s.add_job("SLOW", past, job_id="slow")  # one-shot, already due
+
+    calls: list[int] = []
+
+    class _SlowClient:
+        def __init__(self, *_a, **_kw):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_a):
+            return False
+
+        async def post(self, url, headers=None, json=None):
+            calls.append(1)
+            await asyncio.sleep(2.2)  # turn spans multiple 1s poll ticks
+
+            class _R:
+                status_code = 200
+                text = "ok"
+
+            return _R()
+
+    import httpx
+    monkeypatch.setattr(httpx, "AsyncClient", _SlowClient)
+
+    await s.start()
+    await asyncio.sleep(2.8)  # several ticks elapse during the single slow turn
+    await s.stop()
+
+    assert len(calls) == 1          # fired once, not once-per-tick
+    assert s.list_jobs() == []      # one-shot deleted after the turn finally landed
+
+
+def test_per_job_timezone_evaluates_cron_in_that_zone(tmp_path):
+    """A cron with a timezone fires at local wall-clock time, stored as UTC."""
+    from zoneinfo import ZoneInfo
+
+    s = _make_scheduler(tmp_path)
+    job = s.add_job("noon in chicago", "0 12 * * *", job_id="tz", timezone="America/Chicago")
+    assert job.timezone == "America/Chicago"
+    # next_fire is stored UTC; converted back to Chicago it must be 12:00 local.
+    nf_local = datetime.fromisoformat(job.next_fire).astimezone(ZoneInfo("America/Chicago"))
+    assert nf_local.hour == 12 and nf_local.minute == 0
+    # Round-trips through the DB.
+    assert s.list_jobs()[0].timezone == "America/Chicago"
+
+
+def test_invalid_timezone_raises(tmp_path):
+    s = _make_scheduler(tmp_path)
+    with pytest.raises(ValueError, match="invalid timezone"):
+        s.add_job("x", "0 9 * * *", job_id="bad", timezone="Mars/Phobos")
+
+
+def test_no_timezone_defaults_to_utc(tmp_path):
+    from zoneinfo import ZoneInfo
+
+    s = _make_scheduler(tmp_path)
+    job = s.add_job("noon utc", "0 12 * * *", job_id="utc")
+    assert job.timezone is None
+    nf_utc = datetime.fromisoformat(job.next_fire).astimezone(ZoneInfo("UTC"))
+    assert nf_utc.hour == 12

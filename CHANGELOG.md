@@ -1,5 +1,39 @@
 ## [Unreleased]
 
+### Added
+- **Scheduler: per-job timezone** — cron jobs can name an IANA timezone (e.g.
+  `America/Chicago`); `"0 9 * * *"` then means 9am local, DST-aware, stored as UTC.
+  Exposed via `schedule_task(timezone=…)`, the `/api/scheduler/jobs` API, and a timezone
+  picker in the console's Schedule modal (recurring jobs). Defaults to UTC; Workstacean
+  gets it natively.
+
+### Fixed
+- **Scheduler: fix duplicate/runaway scheduled fires** — `message/send` blocks until the
+  turn is terminal, so the old 30s fire timeout false-failed any longer turn and re-fired it
+  every tick (~30s) — duplicate scheduled turns + Activity spam. Fires now run off the poll
+  loop with an in-flight guard (a slow turn fires once, never re-claimed mid-turn), cron rolls
+  forward at claim time, and the timeout is generous + configurable (`SCHEDULER_FIRE_TIMEOUT_S`,
+  default 600s).
+
+### Changed
+- **Plugin view icons: any lucide icon, no allowlist** — a plugin view can name any
+  [lucide](https://lucide.dev) icon (PascalCase or kebab-case). A curated common set renders
+  instantly; anything else lazy-loads in a separate on-demand chunk, so authors aren't limited
+  to a hardcoded list and the main console bundle stays lean.
+
+### Fixed
+- **Scheduler: `schedule_task` dedupes identical jobs** — won't create a second active job
+  with the same prompt + schedule, so a self-rescheduling loop can't pile up duplicates that
+  all fire together (the cause of scheduled-task Activity spam).
+
+### Changed
+- **Console IA: Runtime is top-level with tabs; Plugins is its own section** — the dense
+  System panel is split into **Runtime → Overview · Tools · MCP · Subagents · Telemetry**
+  (a new `/api/tools` endpoint feeds the live tool inventory), and plugins get a dedicated
+  **Plugins** rail section (loaded overview + git-URL install/manage, moved out of Settings).
+- **Scheduler is a first-class right-rail panel** — moved from Activity → Schedule to the
+  right rail (Notes · Beads · Goals · Schedule), one click from chat.
+
 ## [0.24.0] - 2026-06-08
 
 ### Added

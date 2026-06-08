@@ -17,13 +17,14 @@
 
 # protoAgent
 
-Template repository for building protoLabs A2A agents on LangGraph.
+A lean, A2A-native agent on LangGraph — ships a small core, grows with git-URL plugins.
+Run one agent or orchestrate a fleet; drive it from a console, the OpenAI-compatible API,
+or A2A. Local-first, yours to fork.
 
-The purpose of this repo is to keep the boring parts — A2A spec
-handling, cost/extension emission, tracing, release pipeline —
-stable across every agent in the fleet, so forking an agent is
-close to a rewrite of `SOUL.md`, `graph/prompts.py`, and
-`tools/lg_tools.py` and not much else.
+It keeps the boring parts — A2A spec handling, cost/extension emission, tracing, the
+release pipeline — stable across every agent in the fleet, so forking an agent is close
+to a rewrite of `SOUL.md`, `graph/prompts.py`, and `tools/lg_tools.py` and not much else.
+You add capability as plugins instead of inheriting a pile of it.
 
 **Canonical reference implementation**: [protoLabsAI/quinn](https://github.com/protoLabsAI/quinn).
 Quinn was the first agent built on this template — it's a good

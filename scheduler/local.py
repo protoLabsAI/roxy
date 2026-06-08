@@ -144,16 +144,29 @@ def _now_iso() -> str:
     return datetime.now(UTC).isoformat()
 
 
-def _compute_next_fire(schedule: str, *, after: datetime | None = None) -> str:
-    """Resolve a schedule string to the next ISO timestamp it fires.
+def _compute_next_fire(
+    schedule: str, *, after: datetime | None = None, tz: str | None = None,
+) -> str:
+    """Resolve a schedule string to the next ISO (UTC) timestamp it fires.
 
     ``after`` controls when "next" starts — current time by default;
     pass an explicit reference when rescheduling a cron job after a
-    fire so successive fires don't drift.
+    fire so successive fires don't drift. ``tz`` (IANA name) evaluates a
+    cron expression in that timezone — so ``"0 9 * * *"`` means 9am local,
+    handling DST — then normalizes the result to UTC for storage. Ignored
+    for one-shot ISO schedules (those carry their own offset).
     """
     after = after or datetime.now(UTC)
     if is_cron(schedule):
-        return croniter(schedule, after).get_next(datetime).astimezone(UTC).isoformat()
+        base = after
+        if tz:
+            from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+            try:
+                base = after.astimezone(ZoneInfo(tz))
+            except (ZoneInfoNotFoundError, ValueError, KeyError) as exc:
+                raise ValueError(f"invalid timezone {tz!r}: {exc}") from exc
+        return croniter(schedule, base).get_next(datetime).astimezone(UTC).isoformat()
     return parse_iso_to_utc(schedule).isoformat()
 
 
@@ -166,7 +179,8 @@ CREATE TABLE IF NOT EXISTS jobs (
     next_fire   TEXT NOT NULL,
     last_fire   TEXT,
     enabled     INTEGER NOT NULL DEFAULT 1,
-    created_at  TEXT NOT NULL
+    created_at  TEXT NOT NULL,
+    timezone    TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_jobs_next_fire   ON jobs(next_fire);
@@ -202,6 +216,18 @@ class LocalScheduler:
         self._task: asyncio.Task | None = None
         self._stopping = False
         self._lock_fd = None  # owner-lock fd (ADR 0004) held while polling
+        # In-flight fires (job ids) + their background tasks. message/send blocks
+        # until the agent turn reaches a terminal state, so a fire can take as long
+        # as the turn — we run it off the poll loop and guard against re-claiming a
+        # job that's still firing (the cause of duplicate scheduled turns).
+        self._inflight_ids: set[str] = set()
+        self._fire_tasks: set[asyncio.Task] = set()
+        # Fire timeout must comfortably exceed a real turn (web research + subagents
+        # can run minutes); too-short here false-fails long turns into a re-fire loop.
+        try:
+            self._fire_timeout_s = float(os.environ.get("SCHEDULER_FIRE_TIMEOUT_S", "600"))
+        except ValueError:
+            self._fire_timeout_s = 600.0
         self._init_db()
 
     # ── DB plumbing ─────────────────────────────────────────────────────────
@@ -219,6 +245,11 @@ class LocalScheduler:
         try:
             db = self._connect()
             db.executescript(_SCHEMA)
+            # Lightweight migration for stores created before per-job timezone.
+            try:
+                db.execute("ALTER TABLE jobs ADD COLUMN timezone TEXT")
+            except sqlite3.OperationalError:
+                pass  # column already present
             db.commit()
             db.close()
         except sqlite3.DatabaseError:
@@ -226,10 +257,14 @@ class LocalScheduler:
 
     # ── public API (matches SchedulerBackend) ───────────────────────────────
 
-    def add_job(self, prompt: str, schedule: str, *, job_id: str | None = None) -> Job:
+    def add_job(
+        self, prompt: str, schedule: str, *, job_id: str | None = None,
+        timezone: str | None = None,
+    ) -> Job:
         if not prompt or not prompt.strip():
             raise ValueError("scheduler: prompt is required")
-        next_fire = _compute_next_fire(schedule)  # raises ValueError for malformed input
+        # Computes in `timezone` for cron (raises ValueError for a bad tz or schedule).
+        next_fire = _compute_next_fire(schedule, tz=timezone)
 
         job = Job(
             id=job_id or self._generate_id(),
@@ -237,14 +272,15 @@ class LocalScheduler:
             schedule=schedule,
             agent_name=self.agent_name,
             next_fire=next_fire,
+            timezone=timezone,
         )
         db = self._connect()
         try:
             db.execute(
                 "INSERT INTO jobs (id, prompt, schedule, agent_name, next_fire, "
-                "last_fire, enabled, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                "last_fire, enabled, created_at, timezone) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (job.id, job.prompt, job.schedule, job.agent_name,
-                 job.next_fire, job.last_fire, int(job.enabled), job.created_at),
+                 job.next_fire, job.last_fire, int(job.enabled), job.created_at, job.timezone),
             )
             db.commit()
         except sqlite3.IntegrityError as exc:
@@ -322,6 +358,13 @@ class LocalScheduler:
                 log.exception("[scheduler] polling task raised during stop")
             self._task = None
             log.info("[scheduler] local backend stopped")
+        # Let in-flight fires finish briefly, then cancel any stragglers (the turn
+        # continues server-side; we just stop awaiting it on shutdown).
+        if self._fire_tasks:
+            pending = list(self._fire_tasks)
+            done, still = await asyncio.wait(pending, timeout=5)
+            for t in still:
+                t.cancel()
         # Release the owner-lock (ADR 0004) so another instance can take over.
         if self._lock_fd is not None:
             _release_jobs_lock(self.path, self._lock_fd)
@@ -344,18 +387,53 @@ class LocalScheduler:
         now = datetime.now(UTC)
         due = self._claim_due_jobs(now)
         for job in due:
-            # Reschedule (or delete) only when delivery actually
-            # succeeded. A transient HTTP failure leaves the row in
-            # place so the next tick retries; a one-shot stays alive
-            # until it lands rather than vanishing on the first
-            # network blip.
-            if await self._fire(job):
+            # Fire OFF the poll loop: message/send blocks until the turn finishes,
+            # which can be minutes — awaiting it here would stall the cadence and
+            # (on the old 30s timeout) false-fail long turns into a re-fire storm.
+            # Mark in-flight so the next tick won't re-claim a still-firing job.
+            self._inflight_ids.add(job.id)
+            cron = is_cron(job.schedule)
+            # Advance cron NOW so it rolls to its next slot regardless of how long
+            # this turn runs (no duplicate fire mid-turn). One-shots are resolved
+            # when the fire settles (deleted on success, kept for retry on failure).
+            if cron:
                 self._reschedule_or_delete(job, fired_at=now)
-            else:
+            t = asyncio.create_task(self._fire_and_settle(job, cron), name=f"scheduler.fire.{job.id}")
+            self._fire_tasks.add(t)
+            t.add_done_callback(self._fire_tasks.discard)
+
+    async def _fire_and_settle(self, job: Job, cron: bool) -> None:
+        """Run a fire off the poll loop and settle the row when it lands.
+
+        Cron jobs were already advanced at claim time; here we only resolve
+        one-shots (delete on success, leave for retry on failure) and always clear
+        the in-flight guard so the job can be claimed again on its next due slot."""
+        try:
+            ok = await self._fire(job)
+            if not cron:
+                if ok:
+                    self._delete_job(job.id)
+                else:
+                    log.warning(
+                        "[scheduler] one-shot fire failed for job %s; leaving for retry",
+                        job.id,
+                    )
+            elif not ok:
                 log.warning(
-                    "[scheduler] fire failed for job %s; leaving in place for retry",
-                    job.id,
+                    "[scheduler] cron fire failed for job %s; will fire next slot", job.id,
                 )
+        finally:
+            self._inflight_ids.discard(job.id)
+
+    def _delete_job(self, job_id: str) -> None:
+        db = self._connect()
+        try:
+            db.execute("DELETE FROM jobs WHERE id = ? AND agent_name = ?", (job_id, self.agent_name))
+            db.commit()
+        except sqlite3.DatabaseError:
+            log.exception("[scheduler] delete failed for job %s", job_id)
+        finally:
+            db.close()
 
     def _claim_due_jobs(self, now: datetime) -> list[Job]:
         db = self._connect()
@@ -370,14 +448,16 @@ class LocalScheduler:
             return []
         finally:
             db.close()
-        return [_row_to_job(r) for r in rows]
+        # Skip jobs already firing — message/send blocks for the whole turn, so a
+        # slow turn would otherwise be re-claimed every tick and fire repeatedly.
+        return [j for j in (_row_to_job(r) for r in rows) if j.id not in self._inflight_ids]
 
     def _reschedule_or_delete(self, job: Job, *, fired_at: datetime) -> None:
         """Cron jobs roll forward; one-shot jobs are deleted."""
         db = self._connect()
         try:
             if is_cron(job.schedule):
-                next_iso = _compute_next_fire(job.schedule, after=fired_at)
+                next_iso = _compute_next_fire(job.schedule, after=fired_at, tz=job.timezone)
                 db.execute(
                     "UPDATE jobs SET next_fire = ?, last_fire = ? WHERE id = ?",
                     (next_iso, fired_at.isoformat(), job.id),
@@ -411,7 +491,7 @@ class LocalScheduler:
             for row in rows:
                 job = _row_to_job(row)
                 if is_cron(job.schedule):
-                    next_iso = _compute_next_fire(job.schedule)
+                    next_iso = _compute_next_fire(job.schedule, tz=job.timezone)
                     db.execute(
                         "UPDATE jobs SET next_fire = ? WHERE id = ?",
                         (next_iso, job.id),
@@ -478,7 +558,7 @@ class LocalScheduler:
             },
         }
         try:
-            async with httpx.AsyncClient(timeout=30) as client:
+            async with httpx.AsyncClient(timeout=self._fire_timeout_s) as client:
                 r = await client.post(f"{self._invoke_url}/a2a", headers=headers, json=body)
             if r.status_code >= 400:
                 log.error(
@@ -500,6 +580,7 @@ class LocalScheduler:
 
 
 def _row_to_job(row: Any) -> Job:
+    keys = row.keys()
     return Job(
         id=row["id"],
         prompt=row["prompt"],
@@ -509,4 +590,5 @@ def _row_to_job(row: Any) -> Job:
         last_fire=row["last_fire"],
         enabled=bool(row["enabled"]),
         created_at=row["created_at"],
+        timezone=row["timezone"] if "timezone" in keys else None,
     )

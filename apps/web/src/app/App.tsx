@@ -23,6 +23,7 @@ import {
   Target,
   Undo2,
   Trash2,
+  Wrench,
   // Plugin-view rail icons (ADR 0026) — a broader lucide allowlist so plugins
   // (dashboards, data, comms, dev, finance, space/fleet, AI) find a fitting glyph.
   Bot,
@@ -56,8 +57,8 @@ import {
 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 import { useQuery } from "@tanstack/react-query";
-import { useEffect, useRef, useState } from "react";
-import type { CSSProperties, ReactNode } from "react";
+import { lazy, Suspense, useEffect, useRef, useState } from "react";
+import type { ComponentType, CSSProperties, LazyExoticComponent, ReactNode } from "react";
 import { IntroSplash } from "./IntroSplash";
 import { BootGate } from "./BootGate";
 
@@ -83,6 +84,10 @@ import { GoalsPanel } from "./GoalsPanel";
 import { BeadsPanel } from "./BeadsPanel";
 import { SchedulePanel } from "../schedule/SchedulePanel";
 import { RuntimePanel } from "./RuntimePanel";
+import { ToolsPanel } from "./ToolsPanel";
+import { McpPanel } from "./McpPanel";
+import { SubagentsPanel } from "./SubagentsPanel";
+import { PluginsSurface } from "../plugins/PluginsSurface";
 import { SetupWizard } from "../setup/SetupWizard";
 import { runtimeStatusQuery } from "../lib/queries";
 
@@ -91,10 +96,13 @@ import { runtimeStatusQuery } from "../lib/queries";
 // Core surfaces are the fixed literals; plugin views (ADR 0026) add dynamic
 // surfaces keyed `plugin:<pluginId>:<viewId>`. The `(string & {})` keeps literal
 // autocomplete while allowing those runtime keys.
-type Surface = "chat" | "activity" | "studio" | "knowledge" | "system" | "settings" | (string & {});
+type Surface = "chat" | "activity" | "studio" | "knowledge" | "runtime" | "plugins" | "settings" | (string & {});
 
-// Lucide icon names a plugin view may use for its rail glyph (ADR 0026, PR1 set;
-// PR2 widens the allowlist). Unknown/missing → a generic plugin glyph.
+// A plugin view names its rail glyph by lucide icon name. The curated set below
+// is the common-case fast path (already bundled); anything else falls back to the
+// full lucide set by name, so a plugin author can use ANY lucide icon — PascalCase
+// (`LineChart`) or kebab-case (`line-chart`) — without us extending an allowlist.
+// Unknown/missing → a generic plugin glyph.
 const PLUGIN_VIEW_ICONS: Record<string, LucideIcon> = {
   // general
   Sparkles, LayoutDashboard, Puzzle, Boxes, Gauge, Target, Activity, Settings2,
@@ -113,23 +121,53 @@ const PLUGIN_VIEW_ICONS: Record<string, LucideIcon> = {
   // security
   Shield,
 };
+// "line-chart" / "line_chart" / "LineChart" → "LineChart" (lucide's key style).
+function toPascalCase(name: string): string {
+  return name.replace(/(^|[-_ ])([a-z0-9])/g, (_m, _sep, ch: string) => ch.toUpperCase());
+}
+
+// Off the curated path, resolve ANY lucide icon by name — but lazily: the dynamic
+// import pulls the full lucide set into a separate chunk that only loads when a
+// plugin actually uses a non-curated glyph, so the main bundle stays lean.
+type IconComp = LazyExoticComponent<ComponentType<{ size?: number }>>;
+// NB: `Map` is shadowed by the lucide Map icon import — use the global explicitly.
+const lazyIconCache = new globalThis.Map<string, IconComp>();
+function lazyLucideIcon(key: string): IconComp {
+  let comp = lazyIconCache.get(key);
+  if (!comp) {
+    comp = lazy(async () => {
+      const m = await import("lucide-react");
+      const Icon = (m.icons as Record<string, LucideIcon>)[key] || m.Puzzle;
+      return { default: Icon as ComponentType<{ size?: number }> };
+    });
+    lazyIconCache.set(key, comp);
+  }
+  return comp;
+}
 function pluginViewIcon(name?: string): ReactNode {
-  const Icon = (name && PLUGIN_VIEW_ICONS[name]) || Puzzle;
-  return <Icon size={18} />;
+  if (!name) return <Puzzle size={18} />;
+  const Curated = PLUGIN_VIEW_ICONS[name];
+  if (Curated) return <Curated size={18} />;
+  const Lazy = lazyLucideIcon(toPascalCase(name));
+  return (
+    <Suspense fallback={<Puzzle size={18} />}>
+      <Lazy size={18} />
+    </Suspense>
+  );
 }
 // Studio = the workflow authoring/inspection surface. Per ADR 0020 execution is
 // a chat gesture (run subagents/workflows via /<name>), not a surface — so the
 // old "Run" tab is gone and Studio is just Workflows.
-type SystemTab = "runtime" | "telemetry";
+type RuntimeTab = "overview" | "tools" | "mcp" | "subagents" | "telemetry";
 // Activity = the "triggers / events" surface (ADR 0009): what happened (thread),
 // inbound (inbox), and timed (schedule — cron is a trigger, not a work-type).
-type ActivityTab = "thread" | "inbox" | "schedule";
+type ActivityTab = "thread" | "inbox";
 // Knowledge = what the agent knows (ADR 0020): the searchable knowledge Store
 // (factual memory) + Playbooks (procedural memory). Store leads.
 type KnowledgeTab = "store" | "playbooks";
 // The agent's persistent working memory, grouped in the right sidebar:
 // its notebook, its task board, and its goals.
-type RightPanel = "notes" | "beads" | "goals";
+type RightPanel = "notes" | "beads" | "goals" | "schedule";
 
 function createNoteTab() {
   const now = Date.now();
@@ -173,7 +211,7 @@ export function App() {
   // Background-streaming indicator for the Chat rail (narrow selector → only
   // re-renders when the boolean flips, not per token).
   const chatStreaming = useAnyChatStreaming();
-  const [systemTab, setSystemTab] = useState<SystemTab>("runtime");
+  const [runtimeTab, setRuntimeTab] = useState<RuntimeTab>("overview");
   const [activityTab, setActivityTab] = useState<ActivityTab>("thread");
   const [knowledgeTab, setKnowledgeTab] = useState<KnowledgeTab>("store");
   const [rightPanel, setRightPanel] = useState<RightPanel>("notes");
@@ -636,10 +674,16 @@ export function App() {
             onClick={() => setSurface("knowledge")}
           />
           <RailButton
-            active={surface === "system"}
-            label="System"
+            active={surface === "runtime"}
+            label="Runtime"
             icon={<Gauge size={18} />}
-            onClick={() => setSurface("system")}
+            onClick={() => setSurface("runtime")}
+          />
+          <RailButton
+            active={surface === "plugins"}
+            label="Plugins"
+            icon={<Puzzle size={18} />}
+            onClick={() => setSurface("plugins")}
           />
           <RailButton
             active={surface === "settings"}
@@ -682,7 +726,6 @@ export function App() {
                     <span className="subnav-badge" data-testid="inbox-badge">{inboxUnread > 9 ? "9+" : inboxUnread}</span>
                   ) : null,
                 },
-                { id: "schedule", label: "Schedule", icon: CalendarClock },
               ]}
             />
           ) : null}
@@ -697,12 +740,15 @@ export function App() {
               ]}
             />
           ) : null}
-          {surface === "system" ? (
+          {surface === "runtime" ? (
             <StageSubnav
-              active={systemTab}
-              onSelect={(id) => setSystemTab(id as typeof systemTab)}
+              active={runtimeTab}
+              onSelect={(id) => setRuntimeTab(id as typeof runtimeTab)}
               tabs={[
-                { id: "runtime", label: "Runtime", icon: Gauge },
+                { id: "overview", label: "Overview", icon: Gauge },
+                { id: "tools", label: "Tools", icon: Wrench },
+                { id: "mcp", label: "MCP", icon: Plug },
+                { id: "subagents", label: "Subagents", icon: Bot },
                 { id: "telemetry", label: "Telemetry", icon: BarChart3 },
               ]}
             />
@@ -718,11 +764,13 @@ export function App() {
           {surface === "activity" && activityTab === "thread" ? <ActivitySurface onError={setError} /> : null}
           {surface === "activity" && activityTab === "inbox" ? <InboxPanel /> : null}
 
-          {surface === "activity" && activityTab === "schedule" ? <SchedulePanel /> : null}
 
-          {surface === "system" && systemTab === "runtime" ? <RuntimePanel /> : null}
-
-          {surface === "system" && systemTab === "telemetry" ? <TelemetrySurface /> : null}
+          {surface === "runtime" && runtimeTab === "overview" ? <RuntimePanel /> : null}
+          {surface === "runtime" && runtimeTab === "tools" ? <ToolsPanel /> : null}
+          {surface === "runtime" && runtimeTab === "mcp" ? <McpPanel /> : null}
+          {surface === "runtime" && runtimeTab === "subagents" ? <SubagentsPanel /> : null}
+          {surface === "runtime" && runtimeTab === "telemetry" ? <TelemetrySurface /> : null}
+          {surface === "plugins" ? <PluginsSurface /> : null}
           {surface === "knowledge" && knowledgeTab === "store" ? <KnowledgeStore onError={setError} /> : null}
           {surface === "knowledge" && knowledgeTab === "playbooks" ? <PlaybooksSurface onError={setError} /> : null}
           {surface === "settings" ? <SettingsSurface /> : null}
@@ -759,6 +807,10 @@ export function App() {
             <button type="button" className={rightPanel === "goals" ? "active" : ""} onClick={() => setRightPanel("goals")}>
               <Target size={15} />
               Goals
+            </button>
+            <button type="button" className={rightPanel === "schedule" ? "active" : ""} onClick={() => setRightPanel("schedule")}>
+              <CalendarClock size={15} />
+              Schedule
             </button>
           </div>
 
@@ -837,6 +889,7 @@ export function App() {
           {rightPanel === "beads" ? <BeadsPanel confirm={setConfirmState} /> : null}
 
           {rightPanel === "goals" ? <GoalsPanel /> : null}
+          {rightPanel === "schedule" ? <SchedulePanel /> : null}
         </aside>
       </div>
 
