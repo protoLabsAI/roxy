@@ -6,6 +6,7 @@ import {
   Clock,
   Coins,
   Database,
+  Download,
   Hash,
   Layers,
   RefreshCw,
@@ -14,6 +15,8 @@ import {
 import { Suspense } from "react";
 
 import { ErrorBoundary, PanelError, PanelSkeleton } from "../app/ErrorBoundary";
+import { PanelHeader } from "../app/PanelHeader";
+import { api } from "../lib/api";
 import { telemetryQuery } from "../lib/queries";
 
 // Telemetry dashboard (ADR 0006 Slice 3) — reads /api/telemetry/* (the local
@@ -42,21 +45,37 @@ function pct(n: number): string {
   return `${Math.round((n || 0) * 100)}%`;
 }
 
+async function downloadTelemetryCsv() {
+  const blob = await api.exportTelemetry();
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = "telemetry.csv";
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
 function TelemetryBody() {
   const { data, isFetching, refetch } = useSuspenseQuery(telemetryQuery());
   const { enabled, summary, turns, insights } = data;
 
   return (
     <>
-      <div className="panel-header">
-        <div>
-          <h1>Telemetry</h1>
-          <p className="panel-kicker">per-turn cost &amp; latency · {summary?.turns ?? 0} turns recorded</p>
-        </div>
-        <button className="secondary-button" type="button" onClick={() => void refetch()} disabled={isFetching} title="Refresh">
-          <RefreshCw size={15} className={isFetching ? "spin" : ""} /> Refresh
-        </button>
-      </div>
+      <PanelHeader
+        title="Telemetry"
+        kicker={`per-turn cost & latency · ${summary?.turns ?? 0} turns recorded`}
+        actions={
+          <>
+            <button className="icon-button" type="button" onClick={() => void downloadTelemetryCsv()}
+                    disabled={!enabled || !summary?.turns} title="Export CSV" data-testid="telemetry-export">
+              <Download size={16} />
+            </button>
+            <button className="icon-button" type="button" onClick={() => void refetch()} disabled={isFetching} title="Refresh">
+              <RefreshCw size={16} className={isFetching ? "spin" : ""} />
+            </button>
+          </>
+        }
+      />
 
       <div className="stage-body">
         {!enabled ? (

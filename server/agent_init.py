@@ -165,6 +165,7 @@ def _init_langgraph_agent(headless_setup: bool = False):
     # (`global STATE.plugin_routers, STATE.plugin_surfaces` is declared at the top of the fn.)
     STATE.plugin_routers, STATE.plugin_surfaces = _plugins.routers, _plugins.surfaces
     _register_plugin_subagents(_plugins.subagents)
+    _apply_config_subagents(STATE.graph_config)  # YAML subagent overrides (tools/max_turns/model)
 
     # MCP — external Model Context Protocol servers; their tools become agent
     # tools (namespaced <server>__<tool>). Off unless mcp.enabled OR a plugin
@@ -397,6 +398,43 @@ def _register_plugin_subagents(subagents) -> None:
         log.info("[plugins] registered subagent: %s", name)
 
 
+# Built-in subagents whose runtime config the operator can override in YAML
+# (subagents.<name>.{enabled,tools,max_turns,model}). Add an entry here + a
+# SubagentDef field on LangGraphConfig when you make another built-in overridable.
+_OVERRIDABLE_SUBAGENTS = ("researcher",)
+
+
+def _apply_config_subagents(config) -> None:
+    """Apply the YAML subagent override (``subagents.<name>``: enabled / tools /
+    max_turns / model) onto the built-in registry entries — what makes the documented
+    knobs actually take effect at runtime (the resolution path in ``_run_subagent``
+    already existed). Derives each entry from its static default (SSOT, so it's
+    idempotent across reloads and an un-overridden config is a true no-op);
+    ``enabled: false`` removes the subagent (not delegatable). Runs at init + reload."""
+    try:
+        from dataclasses import replace
+
+        from graph.subagents import config as _sub
+        from graph.subagents.config import SUBAGENT_REGISTRY
+    except Exception:  # noqa: BLE001
+        return
+    bases = {"researcher": getattr(_sub, "RESEARCHER_CONFIG", None)}
+    for name in _OVERRIDABLE_SUBAGENTS:
+        base = bases.get(name)
+        sub = getattr(config, name, None)
+        if base is None or sub is None:
+            continue
+        if not getattr(sub, "enabled", True):
+            SUBAGENT_REGISTRY.pop(name, None)  # disabled → not delegatable
+            continue
+        SUBAGENT_REGISTRY[name] = replace(
+            base,
+            tools=list(sub.tools) if sub.tools else list(base.tools),
+            max_turns=sub.max_turns or base.max_turns,
+            model=(sub.model or "").strip() or base.model,
+        )
+
+
 def _build_plugins(config, existing_tools=None):
     """Load enabled drop-in plugins. Returns the PluginLoadResult (tools +
     bundled skill dirs + per-plugin meta). Best-effort — never fatal.
@@ -519,7 +557,19 @@ async def _checkpoint_prune_loop() -> None:
                     )
             except Exception:
                 log.exception("[checkpoint-prune] sweep failed")
-        await asyncio.sleep(max(1, interval_h) * 3600)
+        # Telemetry retention guardrail (ADR 0006) — drop turns older than the
+        # configured window so the per-turn store can't grow unbounded. 0 = keep all.
+        keep_days = getattr(cfg, "telemetry_retention_days", 0) if cfg else 0
+        if STATE.telemetry_store is not None and keep_days > 0:
+            try:
+                removed = await asyncio.to_thread(STATE.telemetry_store.prune, keep_days)
+                if removed:
+                    log.info("[telemetry-prune] removed %d turn(s) older than %dd", removed, keep_days)
+            except Exception:
+                log.exception("[telemetry-prune] sweep failed")
+        # Tick at the checkpoint interval if set, else hourly (so telemetry pruning
+        # still runs when checkpoint pruning is off).
+        await asyncio.sleep(max(1, interval_h or 1) * 3600)
 
 
 async def _monitor_goals_loop() -> None:
@@ -919,6 +969,8 @@ def _reload_langgraph_agent() -> tuple[bool, str]:
             new_plugin_meta = new_plugins.meta
             # Plugin knowledge backend (ADR 0031) — swap before the graph rebuild.
             new_store = _apply_plugin_knowledge_backend(new_config, new_store, new_plugins)
+            _register_plugin_subagents(new_plugins.subagents)
+            _apply_config_subagents(new_config)  # YAML subagent overrides take effect on reload
             new_skills = _build_skills_index(new_config, extra_skill_dirs=new_plugin_skill_dirs)
             new_workflow_registry = _build_workflow_registry(new_config)
             new_inbox_store = _build_inbox_store(new_config)
