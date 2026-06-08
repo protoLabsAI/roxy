@@ -102,8 +102,24 @@ Backlog → Ready → In Progress → In Review → Done
   base_branch (+ worktree), pr_url, priority, project_id(parent, one level),
   session_id?`.
 
-### D4 — ACP spawn loop (worktree per feature → coding CLI → PR)
-Per pulled feature:
+### D4 — Drive coders + reviewers via the existing `delegate_to` (already built)
+**The spawn primitive already exists in protoAgent — we compose it, we don't build
+it.** ADR 0024 ships an `AcpClient` (JSON-RPC over a child CLI's stdio) and ADR
+0025 ships the `delegates` plugin: one `delegate_to(target, query)` tool that
+dispatches to **a2a / openai / acp** delegates declared in `langgraph-config.yaml`.
+It ships **disabled, with no delegates declared** — so this is **config wiring +
+composition**, not new spawn code:
+- **Coders = `acp` delegates.** protoCLI is already ACP-ready — the manifest's
+  canonical example is `name: proto, type: acp, command: proto, args: ["--acp"],
+  workdir: …` (the `workdir` is the confinement boundary). Claude Code / Codex /
+  Gemini drop in the same way (different `command`/`args`).
+- **Quinn (PR review) = an `a2a` delegate.** `delegate_to("quinn", …)` over A2A
+  (the same peer path the `peer_consult` skill-routing in protoAgent #695 hardened).
+- **The board loop just calls `delegate_to`:** `delegate_to(<coder>, spec)` to
+  build (in a per-feature worktree = the delegate `workdir`) → open PR →
+  `delegate_to("quinn", …)` to review. No bespoke spawner.
+
+The per-feature mechanics the registry/AcpClient already handle:
 1. `git worktree add .worktrees/feat-<id> -b feat/<id> <base>` (isolation — non-negotiable for parallel agents; "one file, one owner").
 2. Spawn the chosen coder as an ACP subprocess (cwd = worktree): `claude-code-acp`,
    `codex` (ACP), `gemini --experimental-acp`, opencode, or **protoCLI if/when it
@@ -165,8 +181,10 @@ the standing roxy direction ("less LLM agency, deterministic tools/loops").
   load-bearing, not optional.
 - **Migration:** existing protoMaker boards/features need an export → lean-board
   import; auto-mode cutover is staged (run the ACP loop on one project first).
-- **protoCLI ACP support is unverified** — confirm in-repo or write a
-  `claude-code-acp`-style adapter.
+- **The spawn/review primitive is already built** (ADR 0024/0025 `delegate_to`) and
+  protoCLI is ACP-ready (`proto --acp`) — the only gap is **config wiring** (the
+  `delegates` plugin ships disabled with no delegates declared). De-risk is mostly
+  done; the remaining build is the board + the loop, not the coder mechanism.
 
 **Validation already in hand**
 - Roxy's per-project scope middleware + A2A skills + the Fleet dashboard (the
@@ -188,10 +206,11 @@ the standing roxy direction ("less LLM agency, deterministic tools/loops").
 ---
 
 ## Out of scope / open questions
-- **protoCLI ACP**: does it ship an adapter, or do we write one? (Blocks "spawn
-  protoCLI via ACP" specifically; other coders work regardless.)
+- ~~protoCLI ACP support~~ — **resolved:** protoCLI runs as an `acp` delegate
+  (`proto --acp`); the `delegates` plugin (ADR 0024/0025) is the spawn path. Only
+  the config (enable + declare delegates) is outstanding.
 - **Coder selection policy**: fixed per-project, or Roxy chooses per feature
-  (cost/capability)?
+  (cost/capability)? (`delegate_to` already supports multiple named delegates.)
 - **Where the board state lives**: a plugin-owned store (Postgres/SQLite) vs a
   thin mirror over GitHub Projects/Issues (Symphony uses Linear as the store).
 - **Plugin boundary**: fold board-orchestration into the existing `protomaker`
@@ -201,9 +220,17 @@ the standing roxy direction ("less LLM agency, deterministic tools/loops").
   the token-cost ceiling.
 
 ### Proposed next step
-Lock this direction, then **prototype the riskiest piece**: Roxy → `git worktree`
-→ drive **one** ACP coder (`claude-code-acp` or `codex`) on a real feature → PR,
-end-to-end, on a single project. De-risks ACP before any board rewrite.
+The ACP-spawn primitive is already built (ADR 0024/0025) — so the next step is
+**wiring + the loop**, not a spawn spike:
+1. **Wire the delegates (config):** enable the `delegates` plugin in roxy and
+   declare `proto` (`type: acp`, `proto --acp`) + `quinn` (`type: a2a`). Prove
+   `delegate_to("proto", <spec>)` builds in a workdir and `delegate_to("quinn", …)`
+   reviews — both ends, end-to-end, on one project.
+2. **Build the lean board + the orchestration loop** (D3/D5): the 6-state store +
+   the Ready→`delegate_to(coder)`→PR→`delegate_to(quinn)`→merge→Done loop +
+   the combo list/Kanban view.
+Settle the one shaping decision first (open questions): **board store** —
+plugin-owned DB vs a thin mirror over GitHub Projects (Symphony uses Linear).
 
 ---
 
