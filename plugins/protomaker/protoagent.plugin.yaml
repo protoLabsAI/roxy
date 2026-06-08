@@ -1,0 +1,44 @@
+id: protomaker
+name: protoMaker
+version: 0.1.0
+description: >-
+  Roxy — the protoMaker portfolio manager, as a FULL-BUNDLE plugin (ADR 0027).
+  Stock protoAgent + this plugin = Roxy: 12 fleet read/triage/board tools
+  (registry · sitrep · readiness · reconcile · origin-state + 5 GitHub read
+  tools), the 7 A2A fleet skills (portfolio_sitrep, board_sweep, project_decompose,
+  unblock_feature, …), per-project memory scoping, Quinn peer-delegation, the
+  project-operations / audit-project / onboard-project skills, and the
+  project-scope middleware (domain separation). Supersedes the fleet-onboarding
+  plugin — enable exactly one.
+# Provenance (ADR 0027) — shown in the install review when added by git URL.
+repository: "https://github.com/protoLabsAI/roxy"
+min_protoagent_version: "0.24.0"   # needs the fork seams (#570/#571) + bundle discovery (ADR 0027)
+requires_pip: []                   # pure Python over httpx (a core dependency)
+# Author opt-in OFF: enable via `plugins: { enabled: [protomaker] }` and drop
+# fleet-onboarding (this supersedes it; both registering the same tools would clash).
+enabled: false
+requires_env: []
+# Config + secrets + Settings (ADR 0019). The fleet tools currently read these
+# from the container env (Infisical-injected) with config fallback; declaring them
+# here gives the console Settings surface + secrets routing for a standalone-repo
+# deploy. (Wiring the tools to read registry.config is the extraction follow-up.)
+config_section: protomaker
+config:
+  automaker_api_url: "http://protomaker-server:3008"
+  protomaker_api_base: "http://protomaker-server:3008"
+  workstacean_url: "http://workstacean:3000"
+secrets: [automaker_api_key, gh_read_token, workstacean_api_key, peer_workstacean_token]
+settings:
+  - { key: automaker_api_url, label: "protoMaker API URL", type: string, group: "protoMaker", description: "Board API base — the automaker MCP + fleet tools call this." }
+  - { key: automaker_api_key, label: "protoMaker API key", type: secret, group: "protoMaker", description: "X-API-Key for the protoMaker board API (must match protomaker-server)." }
+  - { key: gh_read_token, label: "GitHub read token", type: secret, group: "protoMaker", description: "Fine-grained read PAT for the gh_* triage tools (repos/CI/PRs/issues). Read-only." }
+  - { key: workstacean_url, label: "Workstacean URL", type: string, group: "protoMaker", description: "Fleet hub — registry source + Quinn peer + bus." }
+  - { key: workstacean_api_key, label: "Workstacean API key", type: secret, group: "protoMaker", description: "Auth for the Workstacean fleet hub." }
+  - { key: peer_workstacean_token, label: "Quinn peer token", type: secret, group: "protoMaker", description: "Bearer for peer_consult delegation to Quinn (pr_review / bug_triage)." }
+# Console rail view (ADR 0026) — a left-rail "Fleet" icon opens the live
+# readiness/board panel served at the path below (dashboard.py).
+views:
+  - { id: fleet, label: "Fleet", icon: "LayoutDashboard", path: "/plugins/protomaker/dashboard" }
+capabilities:
+  network: ["protomaker-server", "workstacean", "api.github.com"]
+  filesystem: read
