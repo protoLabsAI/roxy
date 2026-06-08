@@ -253,3 +253,14 @@ google:
   # client_id: set via the UI
   # client_secret: stored in secrets.yaml (set via the UI)
   tz: ""
+
+# Plugins (ADR 0027). Roxy IS the protoMaker portfolio manager via the bundled
+# `protomaker` full-bundle plugin: 12 fleet read/triage/board tools + 7 A2A skills
+# + per-project memory resolver + project-scope middleware (dormant until ADR 0032
+# register_middleware syncs) + the Fleet console dashboard. Enable exactly one of
+# protomaker / fleet-onboarding — protomaker supersedes it. (The universal gh_*
+# triage tools now live in the upstream `github` plugin; add `github` here once it
+# syncs in, and drop the gh_* tools from protomaker.)
+plugins:
+  enabled:
+    - protomaker
