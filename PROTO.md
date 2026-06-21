@@ -7,6 +7,22 @@ protoAgent is a LangGraph-based agent runtime with a FastAPI server, a React
 console (`apps/web`), a plugin system, and an A2A surface. Python is the core;
 TypeScript is the console.
 
+## This fork — roxy (the Portfolio Manager)
+
+This fork is **roxy**, the reference **Portfolio Manager** host: the manager-of-teams
+tier (ADR 0055) that orchestrates many **Lead Engineer** teams. roxy spins a team up per
+project (`portfolio_spinup_team`), dispatches features to each team's board over A2A,
+rolls up progress, sequences cross-board dependencies, and disposes a team once its board
+drains. She runs **no board of her own** — that's the team tier.
+
+The fork's identity lives in `config/SOUL.md` (roxy's persona) and the **Portfolio Manager
+block** at the bottom of `config/langgraph-config.example.yaml` (enables `[delegates,
+portfolio]`, sets `portfolio.team_template`). The capability comes from the **pm-stack**
+bundle (`python -m server plugin install https://github.com/protoLabsAI/pm-stack`), which
+enables the manager spine and carries the team plugins (`project_board`) installed-but-off
+so the teams roxy spawns discover them here. The team tier is the **leadEngineer** fork.
+Everything below is the shared protoAgent runtime — unchanged.
+
 ---
 
 ## Run it

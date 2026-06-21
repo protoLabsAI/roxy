@@ -286,3 +286,43 @@ fleet:
   warm:
     max: 0                  # warm-agent cap (0 = unlimited)
     grace_seconds: 0        # spare agents touched within N seconds from LRU eviction
+
+# ─────────────────────────────────────────────────────────────────────────────
+# roxy — Portfolio Manager configuration (this fork's identity)
+#
+# roxy is the manager-of-teams tier (ADR 0055): she orchestrates MANY Lead Engineer
+# teams — spinning one up per project, dispatching work, rolling up progress, and
+# disposing a team once its board drains. The team tier is the Lead Engineer bundle
+# (github.com/protoLabsAI/leadEngineer); roxy is the manager that delegates to them.
+#
+# Setup (one time):
+#   1. Install the Portfolio Manager bundle — the manager spine, plus the team plugins
+#      (project_board) installed-but-off so the teams roxy spawns discover them here:
+#        python -m server plugin install https://github.com/protoLabsAI/pm-stack
+#      then apply its suggested `enabled` + config below.
+#   2. (For teams that run real model turns) point portfolio.team_template at a team
+#      config dir whose secrets.yaml + model.api_base are filled — see the portfolio
+#      plugin's examples/team-template. Empty uses that shipped example as-is.
+# ─────────────────────────────────────────────────────────────────────────────
+
+identity:
+  name: roxy
+
+# Brain: `native` runs on the gateway model above. Switch to `acp:claude` (claude CLI
+# installed + ANTHROPIC_MODEL=opus in the launch env) for an Opus brain — orchestration
+# benefits from the stronger planner.
+agent_runtime: native
+
+plugins:
+  # The MANAGER tier only. project_board + agent_browser come installed (via pm-stack)
+  # but stay OFF here — they're for the teams roxy spawns, which discover them in this
+  # host's plugins dir.
+  enabled: [delegates, portfolio]
+  # dir: ""   # default = <config>/plugins, where pm-stack installs the members. Set it
+  #           # only to point spawned teams at a different plugins dir.
+
+portfolio:
+  # The base team config portfolio_spinup_team clones per project ({{REPO}} /
+  # {{TEAM_NAME}} / {{GATE}} filled per spawn). Empty falls back to the portfolio plugin's
+  # shipped example; point it at a creds-filled copy for teams that run real model turns.
+  team_template: ""

@@ -14,6 +14,16 @@ to a rewrite of `SOUL.md`, `graph/prompts.py`, and `tools/lg_tools.py` and not m
 You add capability as plugins instead of inheriting a pile of it.
 
 **Canonical reference implementation**: [protoLabsAI/roxy](https://github.com/protoLabsAI/roxy).
+
+> **This fork is configured as roxy — the Portfolio Manager.** She is the manager-of-teams
+> tier (ADR 0055): she orchestrates many **Lead Engineer** teams, spinning one up per
+> project (`portfolio_spinup_team`), dispatching work to each team's board over A2A, and
+> disposing a team once its board drains — running no board of her own. Her identity is in
+> [`config/SOUL.md`](config/SOUL.md) and the Portfolio Manager block at the bottom of
+> [`config/langgraph-config.example.yaml`](config/langgraph-config.example.yaml); the
+> capability is the [pm-stack](https://github.com/protoLabsAI/pm-stack) bundle, and the
+> team tier is [leadEngineer](https://github.com/protoLabsAI/leadEngineer). See
+> [PROTO.md](PROTO.md) for the fork overview.
 Roxy is a filled-in fork — an autonomous ProtoMaker portfolio manager with its
 own persona, A2A skills, and project registry — a good example of what a fork
 looks like end-to-end.
