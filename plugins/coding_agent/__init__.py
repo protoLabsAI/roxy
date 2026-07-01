@@ -95,12 +95,12 @@ def _session_id_path(spec: dict) -> Path:
     """Where this agent's ACP session id is persisted, so a restart can
     ``session/load`` the same thread instead of starting fresh (#970). Keyed by a
     digest of the full launch+policy signature (the same tuple as the client cache),
-    and ``scope_leaf``'d per instance like every other store so co-located hubs stay
-    isolated. Imported lazily to keep this library host-free for its unit tests."""
-    from infra.paths import data_home, scope_leaf
+    a file under the per-instance ``instance_root/acp_sessions`` store so co-located
+    hubs stay isolated. Imported lazily to keep this library host-free for its unit tests."""
+    from infra.paths import instance_paths
 
     digest = hashlib.sha256(repr(_cache_key(spec)).encode()).hexdigest()[:16]
-    return scope_leaf(data_home() / "acp_sessions" / f"{digest}.json")
+    return instance_paths().store("acp_sessions") / f"{digest}.json"
 
 
 def _client_for(spec: dict) -> AcpClient:
@@ -119,6 +119,30 @@ def _client_for(spec: dict) -> AcpClient:
         )
         _CLIENTS[key] = client
     return client
+
+
+def _drop_client(spec: dict) -> AcpClient | None:
+    """Synchronously pop the cached client for ``spec`` (no await) and return it, so
+    a cancellation handler can ``kill_now()`` it and remove it from the pool without
+    risking that an awaited teardown is itself cancelled. Returns None if none cached."""
+    return _CLIENTS.pop(_cache_key(spec), None)
+
+
+async def close_all() -> bool:
+    """Reap EVERY cached ACP client + its subprocess tree — the shutdown hook so a
+    server stop doesn't strand pooled ``delegate_to`` agents as init-reparented
+    orphans (the leak that piled up to ~20 GB). Idempotent; returns True if any were
+    closed."""
+    clients = list(_CLIENTS.values())
+    _CLIENTS.clear()
+    closed = False
+    for client in clients:
+        try:
+            await client.close()
+            closed = True
+        except Exception:  # noqa: BLE001 — shutdown reap is best-effort
+            log.warning("[coding_agent] close during close_all failed", exc_info=True)
+    return closed
 
 
 async def evict_client(spec: dict) -> bool:

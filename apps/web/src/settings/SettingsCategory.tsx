@@ -1,18 +1,19 @@
 import "./settings.css";
 
 import { Alert } from "@protolabsai/ui/data";
-import { Combobox, DropdownSelect, Input, Switch, Textarea } from "@protolabsai/ui/forms";
+import { Combobox, DropdownSelect, Input, SecretInput, Switch, Textarea } from "@protolabsai/ui/forms";
 import { Badge, Button } from "@protolabsai/ui/primitives";
 import { useMutation, useQueryClient, useSuspenseQuery } from "@tanstack/react-query";
-import { Loader2, RotateCcw, Save } from "lucide-react";
+import { Boxes, RotateCcw, Save } from "lucide-react";
 
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import type { ReactNode } from "react";
 
 import { Accordion, AccordionItem, PanelHeader } from "@protolabsai/ui/navigation";
+import { useToast } from "@protolabsai/ui/overlays";
 import { StagePanel } from "../app/ErrorBoundary";
 import { HelpLink, TestConnectionButton } from "../app/ui-kit";
-import { agentHref, api, isHostConsole } from "../lib/api";
+import { api, isHostConsole } from "../lib/api";
 import { errMsg } from "../lib/format";
 import { queryKeys, settingsSchemaQuery } from "../lib/queries";
 import type { SettingsField, SettingsGroup } from "../lib/types";
@@ -25,54 +26,6 @@ export function SettingsCategoryPanel(props: { category: string; title?: string;
     <StagePanel label="settings" className="settings-panel">
       <SettingsCategory {...props} />
     </StagePanel>
-  );
-}
-
-// Global / box-shared defaults view (ADR 0047) — the host-scoped fields across ALL
-// categories, editable, saving to the host layer. Gated to the host console at the
-// call site (SettingsSurface): a workspace console renders <HostConfigLocked/> instead.
-export function HostDefaultsPanel({
-  categories = ["Agent", "System"],
-  title = "Configuration",
-}: {
-  categories?: string[];
-  title?: string;
-}) {
-  // ONE panel — the host-scoped fields across all the given categories render
-  // together under a single header + Save bar + explainer (grouped by their
-  // section). Previously this mapped one full SettingsCategory PER category, which
-  // stacked duplicate panels each with its own scroll/Save/explainer.
-  return (
-    <StagePanel label="configuration" className="settings-panel">
-      <SettingsCategory
-        category={categories[0]}
-        categories={categories}
-        title={title}
-        emptyHint="No box-shared defaults on this box yet."
-        hostLayer
-      />
-    </StagePanel>
-  );
-}
-
-// Workspace-console view of Global ▸ Configuration (ADR 0047 §7.7): the box-shared
-// defaults are editable only on the host console, so a workspace console gets a
-// read-only pointer. Per-agent overrides still happen under Workspace ▸ Settings.
-export function HostConfigLocked() {
-  return (
-    <section className="panel stage-panel settings-panel">
-      <PanelHeader title="Configuration" kicker="box-shared Global defaults" />
-      <div className="stage-body">
-        <Alert status="info" className="settings-banner">
-          These are the box-shared <strong>Global</strong> defaults — edited on the
-          <strong> host console</strong>. This workspace inherits them; to change a value
-          just for this agent, override it under <strong>Workspace ▸ Settings</strong>.
-        </Alert>
-        <Button variant="primary" type="button" onClick={() => { window.location.href = agentHref("host"); }}>
-          Open host console
-        </Button>
-      </div>
-    </section>
   );
 }
 
@@ -91,11 +44,6 @@ export function SettingsCategory({
   title = "Settings",
   emptyHint,
   footer,
-  // ADR 0047 host-defaults view: when true this renders ONLY the host-scoped
-  // (box-shared) fields and a Save writes to the host layer instead of the agent
-  // leaf. The default (false) is the per-agent Settings — every field, with the
-  // inherited-vs-overridden badge + reset-to-inherited affordance.
-  hostLayer = false,
   // ADR 0059 — when set, render ONLY this plugin's group (its config folded into the
   // plugin's row in the Plugins surface). Pairs with category="Plugins".
   pluginId,
@@ -105,26 +53,23 @@ export function SettingsCategory({
   title?: string;
   emptyHint?: string;
   footer?: ReactNode;
-  hostLayer?: boolean;
   pluginId?: string;
 }) {
   const queryClient = useQueryClient();
   const { data } = useSuspenseQuery(settingsSchemaQuery());
   const groups = useMemo(() => {
-    // One category, or (host-defaults view) several aggregated into one panel.
+    // One category, or several aggregated into one panel (the `categories` prop).
     const inScope = (g: SettingsGroup) =>
       categories ? categories.includes(g.category || "Plugins") : (g.category || "Plugins") === category;
     let selected = data.groups.filter(inScope);
     if (pluginId) selected = selected.filter((g) => g.plugin_id === pluginId);  // one plugin's group (ADR 0059)
-    if (!hostLayer) return selected;
-    // Host-defaults view: keep only the host-scoped fields, dropping now-empty groups.
-    return selected
-      .map((g) => ({ ...g, fields: g.fields.filter((f) => f.scope === "host") }))
-      .filter((g) => g.fields.length);
-  }, [data.groups, category, categories, hostLayer, pluginId]);
+    return selected;
+  }, [data.groups, category, categories, pluginId]);
   const [dirty, setDirty] = useState<Record<string, unknown>>({});
-  const [status, setStatus] = useState("");
   const dirtyKeys = Object.keys(dirty);
+  // Action feedback is a TOAST, not an inline line — transient success/error belongs in the
+  // global toaster (the in-progress state is already on each button's pending spinner).
+  const toast = useToast();
 
   // #963 — conditional field visibility. The live value of every in-scope field
   // (the dirty edit if any, else the saved value), so a `depends_on` predicate is
@@ -154,12 +99,10 @@ export function SettingsCategory({
 
   // Which layer a Save lands in (ADR 0047). On the HOST console a host-scoped field sets the
   // box default (host layer) while an agent-scoped field is the host agent's own (agent leaf)
-  // — so split the write by scope. On a fleet member everything overrides into that agent's
-  // leaf. (`hostLayer` is the legacy host-defaults panel, kept for embedded/plugin callers.)
+  // — so split the write by scope. On a fleet member everything overrides into that agent's leaf.
   const onHost = isHostConsole();
   const save = useMutation({
     mutationFn: async () => {
-      if (hostLayer) return api.saveSettings(dirty, "host");
       if (!onHost) return api.saveSettings(dirty, "agent");
       const scopeOf = (k: string) =>
         groups.flatMap((g) => g.fields).find((f) => f.key === k)?.scope ?? "agent";
@@ -176,15 +119,14 @@ export function SettingsCategory({
         restart_required: rs.flatMap((r) => r.restart_required),
       };
     },
-    onMutate: () => setStatus("saving…"),
     onSuccess: (r) => {
-      if (!r.ok) { setStatus(`save failed: ${r.messages.join(" · ")}`); return; }
-      const restartNote = r.restart_required.length ? ` — restart required for: ${r.restart_required.join(", ")}` : "";
-      setStatus(`${r.messages.join(" · ")}${restartNote}`);
+      if (!r.ok) { toast({ tone: "error", title: "Save failed", message: r.messages.join(" · ") }); return; }
+      const restartNote = r.restart_required.length ? `Restart required for: ${r.restart_required.join(", ")}` : "";
+      toast({ tone: "success", title: "Settings saved", message: restartNote || r.messages.join(" · ") || "Applied." });
       setDirty({});
       void queryClient.invalidateQueries({ queryKey: queryKeys.settings });
     },
-    onError: (e) => setStatus(`save failed: ${errMsg(e)}`),
+    onError: (e) => toast({ tone: "error", title: "Save failed", message: errMsg(e) }),
   });
 
   // ADR 0047 reset-to-inherited — pop one (or more) overridden keys from the agent
@@ -192,24 +134,56 @@ export function SettingsCategory({
   // so the badges + values re-resolve to the inherited source (consistent with save).
   const reset = useMutation({
     mutationFn: (keys: string[]) => api.resetSettings(keys),
-    onMutate: () => setStatus("resetting to inherited…"),
     onSuccess: (r, keys) => {
-      if (!r.ok) { setStatus(`reset failed: ${r.messages.join(" · ")}`); return; }
-      setStatus(r.messages.join(" · "));
+      if (!r.ok) { toast({ tone: "error", title: "Reset failed", message: r.messages.join(" · ") }); return; }
+      toast({ tone: "success", title: "Reset to inherited", message: r.messages.join(" · ") || "Back to the inherited value." });
       // Drop any pending edit on the reset keys — the inherited value is now authoritative.
       setDirty((d) => { const next = { ...d }; for (const k of keys) delete next[k]; return next; });
       void queryClient.invalidateQueries({ queryKey: queryKeys.settings });
     },
-    onError: (e) => setStatus(`reset failed: ${errMsg(e)}`),
+    onError: (e) => toast({ tone: "error", title: "Reset failed", message: errMsg(e) }),
   });
 
   const asStr = (v: unknown) => (typeof v === "string" ? v : "");
   const testConn = useMutation({
     mutationFn: () => api.testModel(asStr(dirty["model.api_base"]), asStr(dirty["model.api_key"]), asStr(dirty["model.name"])),
-    onMutate: () => setStatus("testing connection…"),
-    onSuccess: (r) => setStatus(r.ok ? "connection OK — the model responded." : `connection failed — ${r.error || "no response"}`),
-    onError: (e) => setStatus(`connection test failed: ${errMsg(e)}`),
+    onSuccess: (r) =>
+      r.ok
+        ? toast({ tone: "success", title: "Connection OK", message: "The model responded." })
+        : toast({ tone: "error", title: "Connection failed", message: r.error || "no response" }),
+    onError: (e) => toast({ tone: "error", title: "Connection test failed", message: errMsg(e) }),
   });
+
+  // "Get models" (#1386): probe the gateway named on the FORM — its api_base/key, which may be
+  // a NEW provider you haven't saved yet — for its model list, so you can pick a valid model
+  // BEFORE saving and testing (the saved dropdown would otherwise be stuck on the old gateway's
+  // models → a dead-end). The result is merged into every model-backed dropdown below.
+  const [gatewayModels, setGatewayModels] = useState<string[] | null>(null);
+  const apiBaseField = useMemo(
+    () => groups.flatMap((g) => g.fields).find((f) => f.key === "model.api_base"),
+    [groups],
+  );
+  const getModels = useMutation({
+    // api_base: the form edit, else the saved value. api_key: the form edit, else blank — the
+    // server falls back to the saved (secret) key, which never leaves localStorage as plaintext.
+    mutationFn: () => api.models(asStr(dirty["model.api_base"]) || asStr(apiBaseField?.value), asStr(dirty["model.api_key"])),
+    onSuccess: (r) => {
+      if (r.error) { toast({ tone: "error", title: "Couldn't fetch models", message: r.error }); return; }
+      setGatewayModels(r.models);
+      toast(
+        r.models.length
+          ? { tone: "success", title: `Found ${r.models.length} model${r.models.length === 1 ? "" : "s"}`, message: "Pick one in Primary model, then Test connection." }
+          : { tone: "info", title: "No models", message: "The gateway returned no models." },
+      );
+    },
+    onError: (e) => toast({ tone: "error", title: "Couldn't fetch models", message: errMsg(e) }),
+  });
+  // Merge the freshly-probed models into a model-backed field's options (new gateway's models
+  // first, then whatever was saved), so the dropdown isn't stuck on the old provider's list.
+  const withGatewayModels = (field: SettingsField): SettingsField =>
+    gatewayModels && (field.options_source === "models" || field.options_source === "models+acp")
+      ? { ...field, options: [...new Set([...gatewayModels, ...field.options])] }
+      : field;
 
   // Generic per-group "Test connection" (ADR 0029).
   const [testingSection, setTestingSection] = useState<string | null>(null);
@@ -224,13 +198,15 @@ export function SettingsCategory({
   };
   const testGroup = useMutation({
     mutationFn: (vars: { endpoint: string; fields: Record<string, unknown> }) => api.testConfig(vars.endpoint, vars.fields),
-    onMutate: () => setStatus("testing connection…"),
-    onSuccess: (r) => setStatus(r.ok ? `connection OK${r.identity ? ` — ${r.identity}` : ""}` : `connection failed — ${r.error || "no response"}`),
-    onError: (e) => setStatus(`connection test failed: ${errMsg(e)}`),
+    onSuccess: (r) =>
+      r.ok
+        ? toast({ tone: "success", title: "Connection OK", message: r.identity || "Connected." })
+        : toast({ tone: "error", title: "Connection failed", message: r.error || "no response" }),
+    onError: (e) => toast({ tone: "error", title: "Connection test failed", message: errMsg(e) }),
     onSettled: () => setTestingSection(null),
   });
 
-  const discard = () => { setDirty({}); setStatus(""); };
+  const discard = () => setDirty({});
 
   // The fields + Test/Connect for one group — rendered inside an AccordionItem in the
   // full Settings view, or flat (no accordion) when folded into a plugin's row (ADR 0059).
@@ -239,10 +215,10 @@ export function SettingsCategory({
       {group.fields.filter(isVisible).map((field) => (
         <SettingRow
           key={field.key}
-          field={field}
+          field={withGatewayModels(field)}
           dirty={field.key in dirty}
           value={field.key in dirty ? dirty[field.key] : field.value}
-          showInheritance={!hostLayer}
+          showInheritance
           onHost={onHost}
           onChange={(v) => setDirty((d) => ({ ...d, [field.key]: v }))}
           onReset={() => reset.mutate([field.key])}
@@ -274,16 +250,21 @@ export function SettingsCategory({
         kicker={
           dirtyKeys.length
             ? `${dirtyKeys.length} unsaved change${dirtyKeys.length === 1 ? "" : "s"}`
-            : hostLayer
-              ? "saves to the box-shared host defaults"
-              : runtimeField
-                ? `runtime: ${acpAgent ? `${acpAgent} (ACP)` : "native"}`
-                : "applies on save"
+            : runtimeField
+              ? `runtime: ${acpAgent ? `${acpAgent} (ACP)` : "native"}`
+              : "applies on save"
         }
         actions={
           <>
             {hasModel ? (
-              <TestConnectionButton onClick={() => testConn.mutate()} pending={testConn.isPending} disabled={save.isPending} />
+              <>
+                {/* #1386 — pull the form gateway's model list into the Primary model dropdown, so
+                    switching provider/key isn't a dead-end (the saved list is stale). */}
+                <Button type="button" onClick={() => getModels.mutate()} loading={getModels.isPending} disabled={save.isPending}>
+                  {getModels.isPending ? null : <Boxes size={15} />} Get models
+                </Button>
+                <TestConnectionButton onClick={() => testConn.mutate()} pending={testConn.isPending} disabled={save.isPending} />
+              </>
             ) : null}
             {/* Pilot of the protoLabs design system (ADR 0037 D7) — the real @protolabsai/ui Button. */}
             <Button type="button" onClick={discard} disabled={save.isPending || !dirtyKeys.length}>
@@ -296,14 +277,6 @@ export function SettingsCategory({
         }
       />
       <div className="stage-body">
-        {hostLayer ? (
-          <Alert status="info" className="settings-banner">
-            <strong>Global · box-shared defaults</strong> (ADR 0047) — edits here write to this
-            hub's <code>host-config.yaml</code> and become the inherited default for every agent the
-            hub manages that hasn't set its own value. Per-agent overrides win. (Usually one hub per
-            machine; a machine running several hubs keeps a host-config per hub.)
-          </Alert>
-        ) : null}
         {acpAgent ? (
           <Alert status="info" className="settings-banner">
             Running on <strong>{acpAgent}</strong> (ACP) — it drives each turn with its own tools.
@@ -316,7 +289,6 @@ export function SettingsCategory({
             Needs a restart to take effect: {pendingRestart.join(", ")}
           </Alert>
         ) : null}
-        {status ? <p className="settings-status">{status}</p> : null}
         {!groups.length && !footer ? <p className="muted">{emptyHint || "Nothing to configure here."}</p> : null}
 
         {/* Each field group is a collapsible accordion (DS 0.29) so a dense category
@@ -335,11 +307,14 @@ export function SettingsCategory({
           </div>
         ) : (
           <Accordion className="settings-groups">
-            {groups.map((group) => {
+            {groups.map((group, i) => {
               const groupDirty = group.fields.filter(isVisible).reduce((n, f) => n + (f.key in dirty ? 1 : 0), 0);
               return (
                 <AccordionItem
                   key={group.section}
+                  // Open the first group by default so a panel never lands fully collapsed
+                  // (the operator sees content immediately; the rest expand on demand).
+                  defaultOpen={i === 0}
                   title={
                     <span className="settings-group-head">
                       {group.section}
@@ -368,7 +343,12 @@ function inheritance(field: SettingsField, onHost: boolean): { label: string; st
   if (onHost) {
     // On the host console you ARE the box: a host-scoped field is the shared default every
     // agent inherits (not "inherited from" anything); agent-scoped fields are the host's own.
-    if (field.scope === "host") return { label: "box default", status: "info", overridden: false };
+    // But if the agent leaf ALSO sets it (source=="agent"), the leaf WINS at runtime (ADR 0047)
+    // and silently shadows the box default — surface that as a warning + reset (issue #1459).
+    if (field.scope === "host")
+      return field.source === "agent"
+        ? { label: "overridden by agent config", status: "warning", overridden: true }
+        : { label: "box default", status: "info", overridden: false };
     return null;
   }
   // A fleet member (non-host): the ADR 0047 inheritance view.
@@ -414,8 +394,8 @@ function SettingRow({
           <p className="setting-inheritance">
             <Badge status={inherit.status}>{inherit.label}</Badge>
             {inherit.overridden && onReset ? (
-              <Button variant="ghost" size="sm" type="button" onClick={onReset} disabled={resetting}>
-                {resetting ? <Loader2 className="spin" size={13} /> : <RotateCcw size={13} />}
+              <Button variant="ghost" size="sm" type="button" onClick={onReset} loading={resetting}>
+                {resetting ? null : <RotateCcw size={13} />}
                 Reset to inherited
               </Button>
             ) : null}
@@ -426,11 +406,62 @@ function SettingRow({
         {showInheritance && !onHost && dirty && field.scope === "host" && field.source !== "agent" ? (
           <p className="setting-override-note">Saving overrides the box default for this agent only.</p>
         ) : null}
+        {/* Host console: this box default is shadowed by the agent leaf — the shown value is the
+            effective (agent) value that wins, so editing the box default here has no runtime effect
+            until the agent override is removed via Reset to inherited (issue #1459). */}
+        {showInheritance && onHost && field.scope === "host" && field.source === "agent" ? (
+          <p className="setting-override-note">
+            The agent config overrides this box default — the agent value shown is what runs. Reset to use the box default.
+          </p>
+        ) : null}
       </div>
       <div className="setting-control">
         <SettingInput field={field} value={value} onChange={onChange} />
       </div>
     </div>
+  );
+}
+
+// A free-form string list (repos, allowed dirs, …) edited as ONE text field. Items are
+// separated by a comma OR a newline — both work, so you can paste "a, b, c" or one per
+// line. It keeps its own raw text while focused so a separator isn't eaten mid-type (the
+// old controlled `value={list.join(...)}` re-derived the text every keystroke, dropping
+// the trailing separator via filter(Boolean) — which made adding a 2nd item impossible).
+// Parsed → a clean string[] on every change; re-syncs from `value` on an external change
+// (discard / reset / load).
+// Split a string-list text field into clean items: comma OR newline separated, trimmed,
+// empties dropped — so "a, b", "a\nb", and "a , , b\n" all yield ["a","b"].
+export function parseStringList(text: string): string[] {
+  return text.split(/[,\n]/).map((s) => s.trim()).filter(Boolean);
+}
+
+function StringListInput({ id, value, onChange }: { id: string; value: unknown; onChange: (v: unknown) => void }) {
+  const items = Array.isArray(value) ? value.filter((v): v is string => typeof v === "string") : [];
+  const [text, setText] = useState(items.join(", "));
+  const lastParsed = useRef(items);
+  useEffect(() => {
+    // Adopt the parent value only when it changed to something we didn't just emit
+    // (e.g. Discard reverted it) — otherwise leave the user's in-progress text alone.
+    if (JSON.stringify(items) !== JSON.stringify(lastParsed.current)) {
+      setText(items.join(", "));
+      lastParsed.current = items;
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [value]);
+  return (
+    <Textarea
+      id={id}
+      className="setting-input setting-textarea"
+      rows={2}
+      value={text}
+      placeholder="comma-separated (e.g. owner/repo, owner/repo2)"
+      onChange={(e) => {
+        setText(e.target.value);
+        const parsed = parseStringList(e.target.value);
+        lastParsed.current = parsed;
+        onChange(parsed);
+      }}
+    />
   );
 }
 
@@ -502,17 +533,7 @@ export function SettingInput({ field, value, onChange }: { field: SettingsField;
     );
   }
   if (field.type === "string_list") {
-    const text = Array.isArray(value) ? value.join("\n") : "";
-    return (
-      <Textarea
-        id={id}
-        className="setting-input setting-textarea"
-        rows={3}
-        value={text}
-        placeholder="one per line"
-        onChange={(e) => onChange(e.target.value.split("\n").map((s) => s.trim()).filter(Boolean))}
-      />
-    );
+    return <StringListInput id={id} value={value} onChange={onChange} />;
   }
   if (field.type === "text") {
     // A scalar multiline string (#964) — a system prompt, template, or blurb. Renders
@@ -529,10 +550,9 @@ export function SettingInput({ field, value, onChange }: { field: SettingsField;
   }
   if (field.type === "secret") {
     return (
-      <Input
+      <SecretInput
         id={id}
         className="setting-input"
-        type="password"
         autoComplete="new-password"
         value={typeof value === "string" ? value : ""}
         placeholder={field.is_set ? "•••••••• (set — leave blank to keep)" : "unset"}

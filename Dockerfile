@@ -1,3 +1,32 @@
+# ---------------------------------------------------------------------------
+# Stage 1 — node builder: build the React operator console (apps/web → dist/).
+#
+# `apps/web/dist` is .gitignored (build output, never committed), so the final
+# image can't just `COPY` it from the context — it has to be BUILT here. Without
+# this stage the `console` tier 404s at /app: mount_react_app finds no
+# dist/index.html and silently returns False (the #874 bug). We build only the
+# `@protoagent/web` workspace; `npm ci` at the root resolves the npm workspaces
+# (web + desktop), but the desktop workspace only pulls a JS CLI, so the install
+# stays light and these node_modules never reach the final image.
+# ---------------------------------------------------------------------------
+FROM node:20-slim AS web-builder
+WORKDIR /build
+# Copy only what the web build needs (lockfile-first so this layer caches across
+# source-only churn): the workspace manifests + lockfile, then the app sources.
+# The root + both workspace package.json files are required for `npm ci` to
+# reconstruct the workspace tree the committed package-lock.json describes.
+COPY package.json package-lock.json ./
+COPY apps/web/package.json apps/web/
+COPY apps/desktop/package.json apps/desktop/
+RUN npm ci
+# `prebuild` (check-css-comments + copy-plugin-kit) + `build` (tsc typecheck +
+# vite build) — emits apps/web/dist/, including dist/_ds/ from the plugin-kit.
+COPY apps/web/ apps/web/
+RUN npm run build --workspace @protoagent/web
+
+# ---------------------------------------------------------------------------
+# Stage 2 — python runtime: the agent core + the built console copied in.
+# ---------------------------------------------------------------------------
 FROM python:3.12-slim
 
 # System deps. iproute2 is required when running under NVIDIA OpenShell —
@@ -55,10 +84,12 @@ RUN useradd -m -s /bin/bash -u ${SANDBOX_UID} sandbox
 # add them to requirements.txt.
 # UI tier (ADR 0010): the build-arg bakes PROTOAGENT_UI so the image runs the
 # matching tier — default 'none' (API + A2A + /metrics only, the lean headless
-# image) or 'console' (also serves the React console, which ships as COPY'd static
-# assets, not a pip dep). Either tier uses the same lean core deps, so the install
-# is unconditional; forks that need extras (the google/Discord MCP surfaces,
-# agent-browser, …) add them to requirements-core.txt (note above).
+# image) or 'console' (also serves the React console, built in the web-builder
+# stage above and copied in below as static assets, not a pip dep). Either tier
+# uses the same lean core deps — and the console dist always ships regardless of
+# UI — so the install is unconditional; forks that need extras (the
+# google/Discord MCP surfaces, agent-browser, …) add them to
+# requirements-core.txt (note above).
 ARG UI=none
 COPY requirements*.txt /tmp/
 RUN pip install --no-cache-dir -r /tmp/requirements-core.txt
@@ -69,30 +100,19 @@ RUN pip install --no-cache-dir -r /tmp/requirements-core.txt
 COPY . /opt/protoagent/
 RUN chmod +x /opt/protoagent/entrypoint.sh
 
-# Sandbox workspace + knowledge/audit dirs
+# The React console — copied from the node builder stage, NOT from the build
+# context (apps/web/dist is .gitignored and node_modules is .dockerignore'd, so
+# the source COPY above ships no built console). This is what makes the
+# `console` tier serve /app instead of 404'ing (the #874 bug). Only the static
+# dist/ lands here — the builder's node_modules stay in the discarded stage.
+COPY --from=web-builder /build/apps/web/dist /opt/protoagent/apps/web/dist
+
+# Sandbox workspace + knowledge/audit dirs. /sandbox is the container's instance
+# root (PROTOAGENT_HOME=/sandbox, set in entrypoint.sh): live config + secrets +
+# setup marker + SOUL.md live at /sandbox/config/*, plugins at /sandbox/plugins,
+# every store under /sandbox/ — all persisted by the protoagent-sandbox volume.
 RUN mkdir -p /sandbox /tmp/sandbox /sandbox/audit /sandbox/knowledge \
     && chown -R sandbox:sandbox /sandbox /tmp/sandbox
-
-# Make /opt/protoagent/config writable by the sandbox user so the
-# drawer and setup wizard can persist edits from inside the container.
-RUN chown -R sandbox:sandbox /opt/protoagent/config
-
-# Declare config as a volume so setup completion (``.setup-complete``
-# marker + any YAML / SOUL.md edits) survives ``docker run`` without
-# a -v flag.
-#
-# Lifecycle note: without an explicit mount, Docker creates an
-# ANONYMOUS volume on every ``docker run``. Those accumulate and the
-# volume is NOT removed when the container is removed unless you pass
-# ``--rm -v``. For long-lived deployments, use a named volume or a
-# host mount so upgrades don't silently carry stale config forward:
-#
-#   docker run -v my-agent-config:/opt/protoagent/config my-agent:latest
-#
-# or a bind mount:
-#
-#   docker run -v /srv/my-agent/config:/opt/protoagent/config my-agent:latest
-VOLUME ["/opt/protoagent/config"]
 
 ENV PYTHONPATH=/opt/protoagent
 # UI tier baked from the build arg (ADR 0010): the image runs `--ui $UI` (default

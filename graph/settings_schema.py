@@ -290,6 +290,20 @@ FIELDS: list[Field] = [
         restart=True,
     ),
     Field(
+        "knowledge.image_describe_model",
+        "image_describe_model",
+        "Image description model",
+        "string",
+        "Knowledge",
+        "Vision-capable gateway model used to DESCRIBE attached images when the chat model "
+        "can't see them (text-only). The screenshot is sent to this model; its description + "
+        "any transcribed text is inlined as context. Blank disables image attachments on "
+        "non-vision models (they error with a clear message). Needs a vision model (e.g. "
+        "protolabs/smart); the chat model can stay text-only.",
+        options_source="models",
+        restart=True,
+    ),
+    Field(
         "knowledge.recall_preview_chars",
         "knowledge_recall_preview_chars",
         "Recall preview length",
@@ -519,10 +533,12 @@ FIELDS: list[Field] = [
         scope="host",
     ),
     # ── Identity / operator ──────────────────────────────────────────────────
-    # `identity.name` stays in FIELDS so it round-trips through the YAML writer, but
-    # it's ui_hidden: the dedicated Identity panel (Workspace ▸ Identity, POST
-    # /api/config) owns the agent name alongside its persona (SOUL.md). Surfacing it
-    # here too made the same field editable from two places with two write paths (#1076).
+    # `identity.name` stays in FIELDS so it round-trips through the YAML writer AND so it
+    # validates/cascades on save, but it's ui_hidden: the dedicated Identity panel (Agent ▸
+    # Identity) is its single editor, alongside the persona (SOUL.md). Surfacing it here too
+    # would make the same field editable from two places (#1076). The panel saves the name
+    # through the canonical /api/settings cascade (a ui_hidden key still saves fine — only
+    # build_schema rendering is gated); only SOUL goes via /api/config.
     Field("identity.name", "identity_name", "Agent name", "string", "Identity", ui_hidden=True),
     Field("identity.operator", "identity_operator", "Operator", "string", "Identity"),
     Field("identity.org", "identity_org", "Organization", "string", "Identity", scope="host"),
@@ -582,6 +598,23 @@ FIELDS: list[Field] = [
         "default); 0.0.0.0 = all interfaces (token-gate the A2A endpoint first). An "
         "explicit --host flag still wins. Env fallback: PROTOAGENT_HOST.",
         restart=True,
+        scope="host",
+    ),
+    # Outbound counterpart to the inbound bind interface (ADR 0008). Host-scoped +
+    # hot-reloaded (egress.set_allowed_hosts runs on save). string_list → the generic
+    # one-per-line editor; no bespoke console code.
+    Field(
+        "egress.allowed_hosts",
+        "egress_allowed_hosts",
+        "Outbound host allowlist",
+        "string_list",
+        "Network",
+        "Hosts the agent's fetch_url tool may reach — one per line; a leading `*.` matches "
+        "subdomains (e.g. `*.github.com`). Empty = off: any public host is reachable, with a "
+        "built-in SSRF guard still blocking private / loopback / cloud-metadata addresses. When "
+        "set it's deny-by-default (only these hosts) — your configured model gateway (Model ▸ API "
+        "base URL) is always permitted automatically, so you needn't list it. Also the source of "
+        "truth for the OpenShell sandbox network policy.",
         scope="host",
     ),
     Field(
@@ -653,6 +686,42 @@ FIELDS: list[Field] = [
     ),
 ]
 
+# Knowledge domain sub-sections (console grouping). The Knowledge fields are declared with
+# section "Knowledge" above for locality; here we split that one 22-field wall into three
+# scannable accordion groups — Recall (retrieval), Ingestion (import/chunking), History
+# (checkpoints) — all still under the Knowledge domain (see _SECTION_CATEGORY). One map, so
+# the split is reviewable in one place instead of scattered across 22 field definitions.
+_KNOWLEDGE_SUBSECTION = {
+    # Recall — what the agent retrieves into context, and how.
+    "knowledge.top_k": "Recall",
+    "knowledge.scope": "Recall",
+    "knowledge.embeddings": "Recall",
+    "knowledge.embed_model": "Recall",
+    "knowledge.recall_preview_chars": "Recall",
+    "knowledge.vector_k": "Recall",
+    "knowledge.rrf_k": "Recall",
+    "knowledge.min_score": "Recall",
+    "skills.top_k": "Recall",  # skills surfaced into context — a recall-count sibling
+    # Ingestion — bringing documents in (extraction, chunking, enrichment).
+    "knowledge.transcribe_model": "Ingestion",
+    "knowledge.image_describe_model": "Ingestion",
+    "knowledge.chunk_max_chars": "Ingestion",
+    "knowledge.chunk_overlap_chars": "Ingestion",
+    "knowledge.contextual_enrichment": "Ingestion",
+    "knowledge.attach_inline_budget": "Ingestion",
+    "knowledge.facts": "Ingestion",
+    # History — conversation checkpoints + retention/harvest.
+    "checkpoint.db_path": "History",
+    "checkpoint.keep_per_thread": "History",
+    "checkpoint.max_age_days": "History",
+    "checkpoint.prune_interval_hours": "History",
+    "checkpoint.harvest_enabled": "History",
+    "checkpoint.vacuum": "History",
+}
+for _f in FIELDS:
+    if _f.key in _KNOWLEDGE_SUBSECTION:
+        _f.section = _KNOWLEDGE_SUBSECTION[_f.key]
+
 _BY_KEY = {f.key: f for f in FIELDS}
 _SECRET_KEYS = {f.key for f in FIELDS if f.type == "secret"}
 _HOST_KEYS = {f.key for f in FIELDS if getattr(f, "scope", "agent") == "host"}
@@ -702,44 +771,44 @@ def _plugin_group(sch, spec) -> str:
     return spec.get("group") or sch.section.replace("_", " ").title()
 
 
-# Settings categories (ADR 0020) — fold the flat sections into a small,
-# navigable taxonomy so the surface isn't one long scroll. Order here is the
-# category the console routes each section to. Settings are decentralized: Agent +
-# Memory render in their home views (Agent → Settings, Knowledge → Settings), while
-# Plugins + System stay in the central Settings surface. Unknown sections (notably
-# plugin-contributed ones, ADR 0019) default to "Plugins".
-_CATEGORY_ORDER = ["Agent", "Memory", "Plugins", "System"]
+# Settings categories — the DOMAIN each flat section routes to (ADR 0048, ratified
+# 2026-06-28). The category IS the domain, so the data model and the console sidenav
+# speak the same axis (the earlier scope-vs-category disagreement is gone). Scope
+# (host vs agent) is a per-field badge (ADR 0047), NOT a category. Order here is the
+# domain order the console renders. Unknown sections (notably plugin-contributed ones,
+# ADR 0019) default to "Plugins" (the Integrations surface).
+_CATEGORY_ORDER = ["Identity", "Model", "Behavior", "Capabilities", "Knowledge", "Plugins", "Box"]
 _SECTION_CATEGORY = {
-    # Agent — who it is + how it behaves (rendered in the Agent view's Settings tab).
-    "Identity": "Agent",
-    "Model": "Agent",
-    "Routing": "Agent",
-    "Agent runtime": "Agent",
-    "Goal mode": "Agent",
-    "Tools": "Agent",
-    # Memory — knowledge/recall config (rendered in the Knowledge view's Settings tab).
-    "Knowledge": "Memory",
-    # Skills — the agent's skill-sharing tier + the box commons (ADR 0041). Agent
-    # category today (Agent ▸ Settings); folds into Workspace ▸ Skills, with
-    # commons.path (host-scoped) surfacing in Host/App (ADR 0048).
-    "Skills": "Agent",
-    # MCP — the agent's MCP-server sharing tier (ADR 0041), alongside Skills in the
-    # Agent category; the dedicated MCP panel (Settings ▸ MCP) is the primary home.
-    "MCP": "Agent",
-    # System — runtime + performance knobs (central Settings → System).
-    "Compaction": "System",
-    "Caching": "System",
-    "Middleware": "System",
-    "Runtime": "System",
-    "Telemetry": "System",
-    # Host box-runtime knobs (ADR 0047 D8), regrouped (bd-2zb) from one "Fleet" lump
-    # into Network / Discovery / Keep-warm. All System category so the host-scoped
-    # fields surface in Settings ▸ Host / App ▸ Host config (which renders the host
-    # fields of the Agent+System categories).
-    "Network": "System",
-    "Discovery": "System",
-    "Keep-warm": "System",
-    # Discord / Google / other plugin sections → "Plugins" (the default).
+    # Identity — who the agent is (name + persona live in the dedicated Identity panel;
+    # these are the operator/org/access fields rendered beneath it).
+    "Identity": "Identity",
+    # Model — the LLM connection, sampling, and cache (the real "Model & Routing").
+    "Model": "Model",
+    "Routing": "Model",
+    "Caching": "Model",
+    # Behavior — how the agent thinks, loops, and decides.
+    "Agent runtime": "Behavior",
+    "Goal mode": "Behavior",
+    "Compaction": "Behavior",
+    "Middleware": "Behavior",
+    "Runtime": "Behavior",
+    # Capabilities — the sharing/tier knobs for what the agent is wired to (the rich
+    # Tools/MCP/Skills/Subagents/Delegates managers are bespoke console panels).
+    "Skills": "Capabilities",
+    "MCP": "Capabilities",
+    # Knowledge — recall / RAG config, split into sub-sections (see _KNOWLEDGE_SUBSECTION).
+    "Recall": "Knowledge",
+    "Ingestion": "Knowledge",
+    "History": "Knowledge",
+    # Box — box-wide operational config (host console only): the telemetry store + the
+    # host box-runtime knobs (network / discovery / keep-warm, ADR 0047 D8). Host-scoped;
+    # a workspace-leaf override of these is a silent no-op (consumed by the host process).
+    "Telemetry": "Box",
+    "Network": "Box",
+    "Discovery": "Box",
+    "Keep-warm": "Box",
+    # Discord / Google / GitHub / other plugin sections → "Plugins" (the default), the
+    # Integrations surface.
 }
 
 
@@ -808,6 +877,10 @@ def build_schema(
             "default": _jsonable(getattr(defaults, f.attr, None)),
             "scope": f.scope,  # ADR 0047: "agent" | "host"
             "source": _source_for(f.key, agent_doc, host_doc),  # which layer set the live value
+            # Lets the console refresh a model-backed dropdown from a DIFFERENT gateway than the
+            # saved one (#1386): a "Get models" action probes the form's api_base/key and merges
+            # the result into every field whose options come from "models".
+            "options_source": f.options_source,
         }
         if f.type == "secret":
             entry["value"] = ""

@@ -29,6 +29,7 @@ import hmac
 import json
 import logging
 import os
+import re
 import time
 
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -39,6 +40,9 @@ logger = logging.getLogger(__name__)
 
 # Live-updatable bearer token (None = open mode for bearer).
 _BEARER: list[str | None] = [None]
+# Optional federation token (ADR 0066) — a second credential confined to the /a2a + /v1
+# consumer surfaces and DENIED the /api operator surface. None = no federation tier.
+_FEDERATION: list[str | None] = [None]
 # X-API-Key (env-seeded at install; constant for the process).
 _API_KEY: list[str] = [""]
 # Allowed origins: None = verification disabled; list = allowlist.
@@ -50,7 +54,6 @@ _ALLOWED_ORIGINS: list[list[str] | None] = [None]
 # ---------------------------------------------------------------------------
 _PUBLIC_PREFIXES = (
     "/healthz",
-    "/metrics",
     "/.well-known/",
     "/app",
     "/manifest.json",
@@ -61,13 +64,88 @@ _PUBLIC_PREFIXES = (
     "/_ds/",
 )
 
+# /metrics is CONDITIONALLY public — see ``_metrics_public``. It carries
+# operational data (model/tool inventory, cost, traffic) so it is exposed without
+# auth only in open mode (no token configured). Once a bearer / X-API-Key gates
+# the surface, the Prometheus scraper must authenticate too — set
+# ``PROTOAGENT_PUBLIC_METRICS=1`` to keep it anonymous behind a network boundary.
+
+# Plugin-declared auth-exempt prefixes. Set once at startup (and on reload) from
+# enabled plugins' manifest ``public_paths`` — each already validated to the
+# plugin's own ``/plugins/<id>/`` namespace by the manifest parser. This lets a
+# plugin serve an inbound webhook (no bearer — verified by its own HMAC) or a
+# public view page even when a bearer gates everything else. A plugin can ONLY
+# exempt its own routes; ``set_public_prefixes`` rejects anything else as
+# defence-in-depth.
+_PLUGIN_PUBLIC: list[str] = []
+
 # SSE token lifetime (seconds).
 _SSE_TOKEN_LIFETIME = 30
+
+# A plugin public-prefix must be a real SUBTREE of its own namespace —
+# ``/plugins/<id>/…`` or ``/api/plugins/<id>/…`` with a trailing slash after the
+# id segment — so a bare core route like ``/api/plugins/install`` can never be
+# prefix-matched into the exempt set (defence-in-depth behind the manifest
+# parser, which applies the same boundary).
+_PLUGIN_NS_RE = re.compile(r"^/(?:api/)?plugins/[^/]+/")
+
+
+def set_public_prefixes(prefixes) -> None:
+    """Replace the plugin-declared public-prefix set (idempotent + reload-safe).
+
+    Each prefix must live under a ``/plugins/<id>/`` namespace — a plugin can
+    exempt its own routes, never a core path. Non-conforming entries are dropped
+    with a warning."""
+    cleaned: list[str] = []
+    for p in prefixes or []:
+        s = str(p).strip()
+        if not s:
+            continue
+        if _PLUGIN_NS_RE.match(s):
+            cleaned.append(s)
+        else:
+            logger.warning(
+                "[a2a] ignoring plugin public prefix %r — must be under /plugins/<id>/ or /api/plugins/<id>/", s
+            )
+    _PLUGIN_PUBLIC[:] = cleaned
+    if cleaned:
+        logger.info("[a2a] %d plugin-declared auth-exempt path(s): %s", len(cleaned), ", ".join(cleaned))
+
+
+def _metrics_public() -> bool:
+    """Whether ``/metrics`` is reachable without auth.
+
+    Default: only in open mode (no bearer AND no X-API-Key configured), where the
+    whole surface is already unauthenticated. When any token gates the surface,
+    ``/metrics`` is gated too — unless ``PROTOAGENT_PUBLIC_METRICS=1`` keeps it
+    open for an anonymous Prometheus scraper fenced by a network boundary.
+    """
+    if os.environ.get("PROTOAGENT_PUBLIC_METRICS", "").strip().lower() in ("1", "true", "yes"):
+        return True
+    return _BEARER[0] is None and not _API_KEY[0]
 
 
 def _is_public(path: str) -> bool:
     """Return True when ``path`` is on the public allowlist (no auth needed)."""
-    return any(path.startswith(p) for p in _PUBLIC_PREFIXES)
+    if any(path.startswith(p) for p in _PUBLIC_PREFIXES):
+        return True
+    if any(path.startswith(p) for p in _PLUGIN_PUBLIC):
+        return True
+    if path.startswith("/metrics") and _metrics_public():
+        return True
+    return False
+
+
+def _requires_operator(path: str) -> bool:
+    """Paths that require the OPERATOR credential (ADR 0066 R1 ceiling).
+
+    The ``/api`` operator/console surface — plugin install+enable (host code-exec),
+    config/SOUL rewrite, subagent runs, the operator goal set-path — is operator-only; a
+    configured federation token is denied it (403). ``/a2a`` + ``/v1`` are the
+    federation/consumer surfaces and are NOT operator-only. Public + SSE-token paths never
+    reach the ceiling (handled earlier in dispatch). The substring form also catches the
+    fleet-proxy variants (``/active/<slug>/api/…``, ``/agents/<slug>/api/…``)."""
+    return "/api/" in path or path == "/api" or path.endswith("/api")
 
 
 def set_bearer_token(token: str | None) -> None:
@@ -75,7 +153,14 @@ def set_bearer_token(token: str | None) -> None:
     _BEARER[0] = (token or "").strip() or None
 
 
-def configure(*, bearer_token: str | None, api_key: str, allowed_origins_raw: str) -> None:
+def set_federation_token(token: str | None) -> None:
+    """Update the federation token at runtime (wizard/drawer reload). None = no federation tier."""
+    _FEDERATION[0] = (token or "").strip() or None
+
+
+def configure(
+    *, bearer_token: str | None, api_key: str, allowed_origins_raw: str, federation_token: str | None = None
+) -> None:
     """Seed the guard at route-registration time.
 
     Args:
@@ -94,6 +179,14 @@ def configure(*, bearer_token: str | None, api_key: str, allowed_origins_raw: st
     _BEARER[0] = seed or None
     if _BEARER[0] is None:
         logger.warning("[a2a] A2A auth token not configured — endpoint is open")
+
+    # Federation token (ADR 0066) — same authoritative-vs-env-fallback rule as the bearer.
+    raw_fed = federation_token if federation_token is not None else os.environ.get("A2A_FEDERATION_TOKEN", "")
+    _FEDERATION[0] = (raw_fed or "").strip() or None
+    if _FEDERATION[0] is not None and _BEARER[0] is None:
+        logger.warning("[a2a] federation_token set but no operator bearer — federation tier is inert (open mode)")
+    if _FEDERATION[0] is not None and _FEDERATION[0] == _BEARER[0]:
+        logger.warning("[a2a] federation_token equals the operator token — federation tier collapses to operator")
 
     _API_KEY[0] = api_key or ""
 
@@ -185,17 +278,39 @@ class A2AAuthMiddleware(BaseHTTPMiddleware):
 
         # X-API-Key (legacy) — enforced only when configured.
         api_key = _API_KEY[0]
-        if api_key and request.headers.get("x-api-key") != api_key:
+        if api_key and not hmac.compare_digest(request.headers.get("x-api-key", "") or "", api_key):
             return _unauthorized("Unauthorized")
 
-        # Bearer — enforced only when configured.
+        # Bearer — enforced only when configured. Classify which credential matched
+        # (ADR 0066): the operator token → full access; a configured federation token →
+        # the /a2a + /v1 consumer surfaces only (the /api ceiling below denies it the
+        # operator surface). Open mode + single-token mode resolve to operator (R3
+        # backward-compat: unset federation_token ⇒ this is the old single-token check).
         active = _BEARER[0]
+        fed = _FEDERATION[0]
+        tier = "operator"
         if active:
             header = request.headers.get("Authorization", "")
             if not header.startswith("Bearer "):
                 return _unauthorized("Unauthorized: expected 'Authorization: Bearer <token>'")
-            if not hmac.compare_digest(header[len("Bearer ") :], active):
+            token = header[len("Bearer ") :]
+            # Constant-time compare against each configured secret; classify by which
+            # matched. Trust = the matched secret, never the path/Origin/loopback (R5).
+            is_operator = hmac.compare_digest(token, active)
+            is_federation = fed is not None and hmac.compare_digest(token, fed)
+            if is_operator:
+                tier = "operator"
+            elif is_federation:
+                tier = "federation"
+            else:
                 return _unauthorized("Unauthorized: invalid bearer token")
+
+        # R1 path ceiling (ADR 0066): a federation credential is denied the /api operator
+        # surface — otherwise the token split is cosmetic (it has RCE via
+        # /api/plugins/install anyway). /a2a + /v1 stay open to either tier.
+        if tier == "federation" and _requires_operator(path):
+            return JSONResponse({"detail": "Forbidden: operator credential required"}, status_code=403)
+        request.state.trust_tier = tier
 
         # Origin — enforced only when an allowlist is set AND an Origin is
         # present. Origin is a browser-only header; server-to-server callers
@@ -210,12 +325,15 @@ class A2AAuthMiddleware(BaseHTTPMiddleware):
         return await call_next(request)
 
 
-def install(app, *, bearer_token: str | None, api_key: str, allowed_origins_raw: str) -> None:
+def install(
+    app, *, bearer_token: str | None, api_key: str, allowed_origins_raw: str, federation_token: str | None = None
+) -> None:
     """Configure the guard and add the middleware to ``app``."""
     configure(
         bearer_token=bearer_token,
         api_key=api_key,
         allowed_origins_raw=allowed_origins_raw,
+        federation_token=federation_token,
     )
     app.add_middleware(A2AAuthMiddleware)
 

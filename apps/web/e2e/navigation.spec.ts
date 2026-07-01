@@ -77,7 +77,7 @@ test("settings dialog: Identity, then Tools and MCP sections", async ({ page }) 
 test("plugins section: Installed / Discover (config + advanced install folded in)", async ({ page }) => {
   // Plugins is a Settings dialog section now (2026-06), opened from the utility-bar pill.
   await page.getByTestId("settings-widget").click();
-  await page.locator(".pl-sidenav").getByRole("tab", { name: "Plugins", exact: true }).click();
+  await page.locator(".pl-sidenav").getByRole("tab", { name: "Integrations", exact: true }).click();
 
   // Two sections only now (ADR 0059 D4) — no separate "Install URL" tab.
   await expect(page.locator(".pl-tabs").getByRole("tab", { name: "Install URL", exact: true })).toHaveCount(0);
@@ -87,12 +87,16 @@ test("plugins section: Installed / Discover (config + advanced install folded in
   await expect(page.getByText("Zzz Disabled", { exact: false })).toBeVisible();
   await page.locator(".subagent-row", { hasText: "Zzz Disabled" })
     .getByRole("button", { name: "Enable" }).click();
-  await expect(page.locator(".plugin-hint")).toContainText("Zzz Disabled enabled");
+  await expect(page.locator(".pl-toast", { hasText: "Zzz Disabled" })).toBeVisible();
 
-  // Config folded in (ADR 0059, bd-23a.3) — Demo Plugin's row exposes Configure → fields inline.
+  // Configure opens a per-plugin settings DIALOG now (2026-06) — not an inline row expander.
+  // The (icon-only) Configure button is labelled "Configure <name>"; the dialog is
+  // role="dialog" named by the plugin.
   const demoRow = page.locator(".plugin-row-wrap", { hasText: "Demo Plugin" });
   await demoRow.getByRole("button", { name: "Configure" }).click();
-  await expect(demoRow.locator('.plugin-row-config .setting-row[data-key="demo.greeting"]')).toBeVisible();
+  const configDialog = page.getByRole("dialog", { name: "Demo Plugin" });
+  await expect(configDialog.locator('.setting-row[data-key="demo.greeting"]')).toBeVisible();
+  await configDialog.locator(".pl-dialog__close").click(); // close so it doesn't overlay later steps
 
   // Install-from-URL is a dialog opened from the Installed toolbar (2026-06 consolidation).
   // The DS Dialog title is role="dialog" (not a heading); assert via the URL field, which
@@ -179,6 +183,25 @@ test("right-click → Move to bottom dock docks the surface at the bottom", asyn
   await expect(rightRail.getByRole("button", { name: "Work", exact: true })).toHaveCount(0);
   // Its panel renders — the Work hub's Tabs strip is present in the bottom dock.
   await expect(page.locator(".pl-appshell__bottom .pl-tabs").getByRole("tab", { name: "Overview", exact: true })).toBeVisible();
+});
+
+test("right-click a core surface → Hide removes it; Chat offers no Hide (ADR 0035/0036)", async ({ page }) => {
+  await page.goto("/app/", { waitUntil: "load" });
+  const leftRail = page.locator(".pl-rail:not(.pl-rail--right)");
+
+  // Knowledge can be hidden off the rail (enabled-but-not-shown — no plugin to disable here).
+  await expect(leftRail.getByRole("button", { name: "Knowledge", exact: true })).toBeVisible();
+  await leftRail.getByRole("button", { name: "Knowledge", exact: true }).click({ button: "right" });
+  await page.locator(".pl-menu").getByText("Hide", { exact: true }).click();
+  await expect(leftRail.getByRole("button", { name: "Knowledge", exact: true })).toHaveCount(0);
+
+  // Chat mounts unconditionally on its dock, so it must NOT offer Hide (a hidden chat would
+  // render with no rail icon). Its menu still has the move actions.
+  await leftRail.getByRole("button", { name: "Chat", exact: true }).click({ button: "right" });
+  const menu = page.locator(".pl-menu");
+  await expect(menu).toBeVisible();
+  await expect(menu.getByText("Move to right rail")).toBeVisible();
+  await expect(menu.getByText("Hide", { exact: true })).toHaveCount(0);
 });
 
 test("mobile shell: bottom quick-bar + unified header drawer (ADR 0035 S4)", async ({ page }) => {

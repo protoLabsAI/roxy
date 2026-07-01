@@ -170,7 +170,7 @@ class _TaskStoreAdapter:
 def register_operator_routes(
     app,
     *,
-    runtime_status: Callable[[], dict[str, Any]],
+    runtime_status: Callable[[], dict[str, Any] | Awaitable[dict[str, Any]]],
     subagent_list: Callable[[], list[dict[str, Any]]],
     tools_list: Callable[[], dict[str, Any]] = lambda: {"tools": [], "count": 0},
     subagent_run: Callable[[dict[str, Any]], Awaitable[str]],
@@ -184,6 +184,9 @@ def register_operator_routes(
     goal_list: Callable[[], Awaitable[dict[str, Any]]] | None = None,
     goal_clear: Callable[[str], Awaitable[dict[str, Any]]] | None = None,
     goal_set: Callable[[dict[str, Any]], Awaitable[dict[str, Any]]] | None = None,
+    watch_list: Callable[[], Awaitable[dict[str, Any]]] | None = None,
+    watch_clear: Callable[[str], Awaitable[dict[str, Any]]] | None = None,
+    watch_set: Callable[[dict[str, Any]], Awaitable[dict[str, Any]]] | None = None,
     chat_commands: Callable[[], dict[str, Any]] | None = None,
     events_subscribe: Callable[..., AsyncIterator[dict[str, Any]]] | None = None,
     events_publish: Callable[[str, dict[str, Any]], None] | None = None,
@@ -205,7 +208,11 @@ def register_operator_routes(
 
     @app.get("/api/runtime/status")
     async def _runtime_status():
-        return runtime_status()
+        # The console handler is async (it offloads the per-poll `ps` co-location
+        # probe off the loop, #875); accept a plain dict too so sync test doubles
+        # and forks that wire a sync accessor keep working.
+        res = runtime_status()
+        return await res if asyncio.iscoroutine(res) else res
 
     @app.get("/api/subagents")
     async def _subagents():
@@ -418,6 +425,38 @@ def register_operator_routes(
         async def _goal_set(body: dict):
             try:
                 res = await goal_set(body or {})
+            except Exception as exc:
+                raise _http_error(exc) from exc
+            if not res.get("ok"):
+                raise HTTPException(status_code=400, detail=res.get("error") or res.get("message"))
+            return res
+
+    # Watch surface (ADR 0067): read + clear + operator create. POST accepts ANY verifier —
+    # safe because /api is operator-tier by the ADR 0066 path ceiling.
+    if watch_list is not None:
+
+        @app.get("/api/watches")
+        async def _watches():
+            try:
+                return await watch_list()
+            except Exception as exc:
+                raise _http_error(exc) from exc
+
+    if watch_clear is not None:
+
+        @app.delete("/api/watches/{watch_id}")
+        async def _watch_clear(watch_id: str):
+            try:
+                return await watch_clear(watch_id)
+            except Exception as exc:
+                raise _http_error(exc) from exc
+
+    if watch_set is not None:
+
+        @app.post("/api/watches")
+        async def _watch_set(body: dict):
+            try:
+                res = await watch_set(body or {})
             except Exception as exc:
                 raise _http_error(exc) from exc
             if not res.get("ok"):

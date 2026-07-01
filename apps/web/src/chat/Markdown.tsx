@@ -1,29 +1,16 @@
-import type { ComponentPropsWithoutRef } from "react";
-import ReactMarkdown, { type Components } from "react-markdown";
-import rehypeHighlight from "rehype-highlight";
-import remarkGfm from "remark-gfm";
+import { Markdown as DSMarkdown } from "@protolabsai/ui/markdown";
 
-// GitHub-flavored markdown (tables, strikethrough, task lists, autolinks) +
-// syntax-highlighted code blocks. No raw-HTML plugin — LLM output is untrusted,
-// so we never render embedded HTML (XSS guard).
-const REMARK = [remarkGfm];
-const REHYPE = [rehypeHighlight];
-
-const components: Components = {
-  // External links open in a new tab; never let markdown navigate the app. Strip react-markdown's
-  // `node` prop before spreading so it doesn't reach the DOM <a>.
-  a: ({ node: _node, ...props }) => (
-    <a {...(props as ComponentPropsWithoutRef<"a">)} target="_blank" rel="noreferrer noopener" />
-  ),
-};
-
-/** Render assistant message text as markdown. Wrapped in `.markdown` for theming. */
+/**
+ * Assistant message markdown — the DS `<Markdown>` (`@protolabsai/ui/markdown`, ≥0.48),
+ * which owns the brand styling for streamdown's prose AND its interactive chrome (code /
+ * table action buttons, themed + re-pinned), wires KaTeX math + GFM, and renders ```mermaid
+ * as a themed code block (live diagrams are an opt-in `renderMermaid`). Chrome defaults to
+ * copy-only — download/fullscreen are off for a chat bubble. Replaces the console's
+ * hand-rolled streamdown usage (protoContent#298).
+ *
+ * `className="markdown"` rides the same element the DS scopes as `.pl-markdown`, so existing
+ * `.markdown` selectors (e2e + message-layout) keep matching.
+ */
 export function Markdown({ children }: { children: string }) {
-  return (
-    <div className="markdown">
-      <ReactMarkdown remarkPlugins={REMARK} rehypePlugins={REHYPE} components={components}>
-        {children}
-      </ReactMarkdown>
-    </div>
-  );
+  return <DSMarkdown className="markdown">{children}</DSMarkdown>;
 }

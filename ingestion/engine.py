@@ -23,6 +23,9 @@ _FETCH_UA = "protoAgent/0.1 (+https://github.com/protoLabsAI/protoAgent)"
 # ffmpeg audio-extraction (video → audio) is bounded so a pathological file can't
 # wedge an ingest thread.
 _FFMPEG_TIMEOUT_S = 600.0
+# Cap redirect chains so a fetched URL can't bounce us toward an internal target
+# after the initial egress check — every hop is re-checked. See _http_fetch.
+_MAX_REDIRECTS = 5
 
 
 class IngestionError(Exception):
@@ -60,6 +63,10 @@ _PDF_EXTS = {".pdf"}
 _AUDIO_EXTS = {".mp3", ".wav", ".m4a", ".flac", ".ogg", ".oga", ".opus", ".aac", ".wma", ".aiff", ".aif"}
 # Video → audio track extracted with ffmpeg, then transcribed.
 _VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v", ".mpeg", ".mpg", ".wmv"}
+# Image → described by a vision model (gateway), gated on an injected describe fn. Not in
+# SUPPORTED_EXTENSIONS: support is conditional (needs knowledge.image_describe_model), so a
+# bare extractor without a describe fn still rejects images with a clear message.
+_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tiff", ".tif", ".heic", ".heif"}
 
 SUPPORTED_EXTENSIONS = sorted(_TEXT_EXTS | _MD_EXTS | _HTML_EXTS | _PDF_EXTS | _AUDIO_EXTS | _VIDEO_EXTS)
 SUPPORTED_DESCRIPTION = "text, Markdown, HTML, PDF, audio + video files, and web/YouTube URLs"
@@ -270,16 +277,35 @@ def _transcribe_media(data: bytes, filename: str, transcribe, *, video: bool) ->
 # ── public entry points ──────────────────────────────────────────────────────
 
 
+def _describe_image(data: bytes, filename: str, mime: str, describe) -> str:
+    """Turn image bytes into a text description via the injected describe fn (a gateway
+    vision model). Lets a text-only chat model "see" an attached screenshot (#1381)."""
+    if describe is None:
+        raise UnsupportedSource(
+            "this model can't see images — set knowledge.image_describe_model to a "
+            "vision-capable gateway model to attach screenshots, or switch to a vision model"
+        )
+    try:
+        text = describe(data, mime, filename or "image")
+    except IngestionError:
+        raise
+    except Exception as exc:  # noqa: BLE001 — gateway/transport error → clean failure
+        raise ExtractionError(f"image description failed: {exc}") from exc
+    return text or ""
+
+
 def extract_bytes(
     filename: str,
     data: bytes,
     content_type: str | None = None,
     *,
     transcribe=None,
+    describe=None,
 ) -> ExtractResult:
     """Extract text from an uploaded file's bytes, dispatched by extension then
     content-type. ``filename`` provides the extension + a default title.
-    ``transcribe`` (bytes, filename) -> text powers audio/video (gateway STT)."""
+    ``transcribe`` (bytes, filename) -> text powers audio/video (gateway STT);
+    ``describe`` (bytes, mime, filename) -> text powers images (gateway vision)."""
     ext = Path(filename or "").suffix.lower()
     ct = (content_type or "").split(";")[0].strip().lower()
     title = (Path(filename).stem if filename else None) or None
@@ -294,6 +320,8 @@ def extract_bytes(
         text, source_type = _transcribe_media(data, filename, transcribe, video=False), "audio"
     elif ext in _VIDEO_EXTS or ct.startswith("video/"):
         text, source_type = _transcribe_media(data, filename, transcribe, video=True), "video"
+    elif ext in _IMAGE_EXTS or ct.startswith("image/"):
+        text, source_type = _describe_image(data, filename, ct or f"image/{(ext[1:] or 'png')}", describe), "image"
     elif ext in _TEXT_EXTS or ct.startswith("text/"):
         text, source_type = _decode(data), "text"
     elif not ext and not ct and _looks_textual(data):
@@ -364,10 +392,28 @@ def _media_filename(url: str, url_ext: str, default_ext: str) -> str:
 def _http_fetch(url: str) -> tuple[bytes, str]:
     import httpx
 
-    with httpx.Client(follow_redirects=True, timeout=_FETCH_TIMEOUT_S, headers={"User-Agent": _FETCH_UA}) as client:
-        resp = client.get(url)
-        resp.raise_for_status()
-        content = resp.content
-        if len(content) > _MAX_FETCH_BYTES:
-            raise ExtractionError(f"document too large ({len(content)} bytes > {_MAX_FETCH_BYTES})")
-        return content, resp.headers.get("content-type", "")
+    from security import egress
+
+    # SSRF guard: ingestion fetches an operator/user-supplied URL server-side and
+    # persists the response, so it gets the same destination policy as the
+    # ``fetch_url`` tool — reject private/loopback/link-local/cloud-metadata hosts
+    # (unless egress-allowlisted), and re-check every redirect hop manually so a
+    # public URL can't 30x-bounce us onto an internal target.
+    err = egress.check_url(url)
+    if err:
+        raise UnsupportedSource(err)
+    with httpx.Client(follow_redirects=False, timeout=_FETCH_TIMEOUT_S, headers={"User-Agent": _FETCH_UA}) as client:
+        for _ in range(_MAX_REDIRECTS + 1):
+            resp = client.get(url)
+            if resp.is_redirect:
+                url = str(resp.url.join(resp.headers.get("location", "")))
+                err = egress.check_url(url)
+                if err:
+                    raise UnsupportedSource(err)
+                continue
+            resp.raise_for_status()
+            content = resp.content
+            if len(content) > _MAX_FETCH_BYTES:
+                raise ExtractionError(f"document too large ({len(content)} bytes > {_MAX_FETCH_BYTES})")
+            return content, resp.headers.get("content-type", "")
+    raise ExtractionError(f"too many redirects (> {_MAX_REDIRECTS}) fetching {url}")

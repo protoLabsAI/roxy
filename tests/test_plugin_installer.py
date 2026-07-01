@@ -31,12 +31,15 @@ def _make_plugin_repo(root: Path, pid: str = "demo_ext", manifest_extra: str = "
 
 @pytest.fixture
 def env(tmp_path, monkeypatch):
-    """Point the installer's lock + install dir + config dir at a temp area (never
-    the real repo)."""
-    monkeypatch.setattr(installer, "LOCK_PATH", tmp_path / "plugins.lock")
+    """Point the installer's lock + install dir + config/secrets at a temp area
+    (never the real repo)."""
+    import graph.config_io as cio
+
+    monkeypatch.setattr(installer, "lock_path", lambda: tmp_path / "plugins.lock")
     monkeypatch.setenv("PROTOAGENT_PLUGINS_DIR", str(tmp_path / "installed"))
     (tmp_path / "cfg").mkdir()
-    monkeypatch.setenv("PROTOAGENT_CONFIG_DIR", str(tmp_path / "cfg"))
+    monkeypatch.setattr(cio, "config_yaml_path", lambda: tmp_path / "cfg" / "langgraph-config.yaml")
+    monkeypatch.setattr(cio, "secrets_yaml_path", lambda: tmp_path / "cfg" / "secrets.yaml")
     return tmp_path
 
 
@@ -180,7 +183,26 @@ def test_install_deps_runs_pip_with_declared_deps(env, monkeypatch):
     deps = installer.install_deps("demo_ext")
     assert deps == ["requests>=2", "rich"]
     assert calls and calls[0][1:4] == ["-m", "pip", "install"]
-    assert calls[0][4:] == ["requests>=2", "rich"]
+    # `--` ends pip option parsing so a manifest dep can't be read as a flag.
+    assert calls[0][4:] == ["--", "requests>=2", "rich"]
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "--index-url=https://evil.example/simple",
+        "-e .",
+        "git+https://evil.example/pkg.git",
+        "foo @ https://evil.example/foo.whl",
+        "https://evil.example/foo.tar.gz",
+    ],
+)
+def test_install_deps_rejects_non_pep508_requires_pip(env, bad):
+    """A plugin manifest can't smuggle pip options / VCS+URL refs through requires_pip."""
+    repo = _make_plugin_repo(env, manifest_extra=f"requires_pip: ['{bad}']\n")
+    installer.install(str(repo))
+    with pytest.raises(installer.InstallError):
+        installer.install_deps("demo_ext")
 
 
 def test_uninstall_removes_enabled_ref_keeps_config(env):
@@ -217,10 +239,12 @@ def _enabled_list(yaml_text: str) -> str:
 
 
 def test_configured_allowlist_reads_config(tmp_path, monkeypatch):
+    import graph.config_io as cio
+
     cfg_dir = tmp_path / "cfg"
     cfg_dir.mkdir()
     (cfg_dir / "langgraph-config.yaml").write_text("plugins:\n  sources:\n    allow: [github.com/protoLabsAI/*]\n")
-    monkeypatch.setenv("PROTOAGENT_CONFIG_DIR", str(cfg_dir))
+    monkeypatch.setattr(cio, "config_yaml_path", lambda: cfg_dir / "langgraph-config.yaml")
     assert installer.configured_allowlist() == ["github.com/protoLabsAI/*"]
 
 
@@ -267,6 +291,35 @@ def test_install_bundle_fans_out_and_records_provenance(env):
     bundles = lock.get("bundles") or []
     assert bundles and bundles[0]["id"] == "demo_stack"
     assert set(bundles[0]["plugins"]) == {"demo_a", "demo_b"}
+    # the curated turn-on list is persisted in the lock (#1346) so a lock-only consumer
+    # (the fleet new-agent path) can auto-enable exactly what the author intended.
+    assert bundles[0]["enabled"] == ["delegates", "demo_a", "demo_b"]
+    # ...and the recommended config defaults too (#1350), for the same consumer.
+    assert bundles[0]["config"] == {"demo_a": {"k": "v"}}
+
+
+def test_bundle_config_overlay_fills_only_unset_keys():
+    """Defaults overlay: a key the operator already set is left untouched; only the
+    unset keys are filled, and a fully-set section is dropped (#1350)."""
+    bundle_config = {
+        "agent_browser": {"panel_mode": "full", "timeout": 30},
+        "board": {"theme": "dark"},
+    }
+    current = {
+        "agent_browser": {"panel_mode": "compact"},  # operator already chose this — keep it
+        "board": {"theme": "light"},  # fully set → section dropped
+    }
+    overlay = installer.bundle_config_overlay(bundle_config, current)
+    assert overlay == {"agent_browser": {"timeout": 30}}  # only the unset key; operator value wins
+
+
+def test_bundle_config_overlay_empty_and_malformed():
+    assert installer.bundle_config_overlay(None, {}) == {}
+    assert installer.bundle_config_overlay({}, None) == {}
+    # a non-dict section value is skipped, not crashed on
+    assert installer.bundle_config_overlay({"x": "notadict"}, {}) == {}
+    # no current → every key is unset, so all fill
+    assert installer.bundle_config_overlay({"x": {"a": 1}}, {}) == {"x": {"a": 1}}
 
 
 def test_install_bundle_member_missing_url_errors(env):

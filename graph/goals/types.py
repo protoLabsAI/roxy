@@ -41,25 +41,23 @@ class GoalState:
     ``verifier`` is a free-form spec dict whose ``type`` selects an entry in
     ``graph/goals/verifiers.VERIFIERS`` and whose other keys are that verifier's
     parameters (e.g. ``{"type": "command", "command": "pytest -q"}``).
-    ``checklist`` holds the model-authored ``<goal_plan>`` text, carried forward
-    across iterations so the agent keeps a running plan.
+    ``checklist`` holds the running plan the agent records with the
+    ``update_goal_plan`` tool, carried forward across iterations.
     """
 
     session_id: str
     condition: str
     verifier: dict = field(default_factory=lambda: {"type": "llm"})
     status: str = "active"
-    # Disposition (ADR 0030): "drive" = the agent does the work (bounded
-    # continuation loop); "monitor" = an external process drives the metric, the
-    # agent only supervises (verifier-only, out-of-band, no exhaustion).
-    mode: str = "drive"
     # Fresh-context mode (Ralph loop): each continuation turn starts a NEW
     # LangGraph thread so the model sees a clean slate — no accumulated
     # transcript from prior iterations. Durable state (plan artifact) lives
     # on disk. Opt-in only; short goals benefit from transcript continuity.
     fresh_context: bool = False
-    last_checked: float | None = None  # last out-of-band verifier check (monitor)
     checklist: str = ""
+    # Set by the agent's ``abandon_goal`` tool mid-turn; ``evaluate`` finishes the goal
+    # ``unachievable`` after the verifier runs (retired the ``<goal_unachievable/>`` tag).
+    abandon_reason: str = ""
     iteration: int = 0
     max_iterations: int = 8
     # Per-goal patience (ADR 0030 D4); None → the config goal_no_progress_limit.
@@ -86,14 +84,9 @@ class GoalState:
     def status_line(self) -> str:
         """One-line human summary for /goal status + continuation footers."""
         vt = self.verifier.get("type", "llm")
-        # Monitor goals have no iteration budget — show the disposition instead.
-        progress = "monitor" if self.mode == "monitor" else f"iteration {self.iteration}/{self.max_iterations}"
-        # mode_tag: only shown when it adds info beyond the progress field.
-        # "fresh-context" is always worth noting; "drive" is the default for
-        # non-monitor goals (shown for clarity); monitor mode is redundant with
-        # the progress label so it's omitted.
-        mode_tag = "fresh-context" if self.fresh_context else ("drive" if self.mode == "drive" else "")
-        base = f"goal [{self.status}] via {vt}: {self.condition!r} ({progress}{', ' + mode_tag if mode_tag else ''})"
+        progress = f"iteration {self.iteration}/{self.max_iterations}"
+        tag = ", fresh-context" if self.fresh_context else ""
+        base = f"goal [{self.status}] via {vt}: {self.condition!r} ({progress}{tag})"
         if self.last_reason:
             base += f" — {self.last_reason}"
         return base

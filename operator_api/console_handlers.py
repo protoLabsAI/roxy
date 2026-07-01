@@ -16,6 +16,7 @@ imported under the same alias names the bodies use, and the one captured local
 
 from __future__ import annotations
 
+import hmac
 import logging
 import os
 
@@ -47,24 +48,30 @@ def _operator_allowed_dirs() -> list[str]:
     return list(dict.fromkeys(roots))
 
 
-def _operator_runtime_status():
+async def _operator_runtime_status():
+    import asyncio
+
     # Live co-location check (#706) — re-evaluated per poll so the shell banner
     # appears/clears as siblings come and go. Quiet (empty `.instances/`) costs one
     # is_dir(); the `ps` guard only runs when sibling heartbeats actually exist.
+    # The probe shells out to `ps` per sibling, so it's offloaded off the event
+    # loop (#875) — matching the startup-path co-location check in server._main.
     from infra.paths import colocation_warning, instance_uid, package_version
 
     try:
-        warnings = [w for w in (colocation_warning(),) if w]
+        warn = await asyncio.to_thread(colocation_warning)
+        warnings = [warn] if warn else []
     except Exception:  # noqa: BLE001 — status must never raise
         warnings = []
     # Fleet version skew (version-coherence P2) — also live + self-clearing: a
     # member that survived an app update keeps running the OLD binary until
     # restarted; banner it the same way as a co-located sibling. Inside a member
-    # the scoped fleet.json is empty, so this no-ops.
+    # the scoped fleet.json is empty, so this no-ops. It probes sibling liveness
+    # (a `ps` shell-out under the hood), so it's offloaded off the loop too (#875).
     try:
         from graph.fleet import supervisor as _sup
 
-        skew = _sup.version_skew_warning()
+        skew = await asyncio.to_thread(_sup.version_skew_warning)
         if skew:
             warnings.append(skew)
     except Exception:  # noqa: BLE001 — status must never raise
@@ -99,55 +106,77 @@ def _operator_subagent_list():
     return _operator_list_subagents(STATE.graph_config)
 
 
-# Group the flat tool inventory by subsystem (matches get_all_tools' sections) so the
-# console can section the list instead of showing a wall of 30. Name → category;
-# unknown core names fall back to "General", plugin/mcp tools to their source.
+# Group the CORE tool inventory by subsystem so the console sections the list instead
+# of a wall of 30 (the old single "General" bucket held filesystem + skills + the long
+# tail). Name → subsystem. Plugin tools group by their OWNING PLUGIN (not a flat
+# "Plugin"); MCP tools by "MCP". Unmapped core names fall back to "General".
 _TOOL_CATEGORY = {
-    "current_time": "General",
-    "calculator": "General",
-    "web_search": "General",
-    "fetch_url": "General",
-    "ask_human": "General",
-    "request_user_input": "General",
-    "github_get_pr": "GitHub",
-    "github_get_issue": "GitHub",
-    "github_list_issues": "GitHub",
-    "github_get_commit_diff": "GitHub",
-    "read_note": "Notes",
-    "write_note": "Notes",
-    "append_note": "Notes",
+    # Filesystem / operator workspace
+    "list_dir": "Filesystem",
+    "read_file": "Filesystem",
+    "find_files": "Filesystem",
+    "search_files": "Filesystem",
+    "write_file": "Filesystem",
+    "edit_file": "Filesystem",
+    "run_command": "Filesystem",
+    "list_projects": "Filesystem",
+    # Skills
+    "load_skill": "Skills",
+    "list_skills": "Skills",
+    "save_skill": "Skills",
+    # Web & research
+    "web_search": "Web & research",
+    "fetch_url": "Web & research",
+    # Memory
     "memory_ingest": "Memory",
+    "knowledge_ingest": "Memory",
     "memory_recall": "Memory",
     "memory_list": "Memory",
     "memory_stats": "Memory",
+    "forget_memory": "Memory",
+    # Scheduler
     "schedule_task": "Scheduler",
     "list_schedules": "Scheduler",
     "cancel_schedule": "Scheduler",
+    # Inbox
     "check_inbox": "Inbox",
+    # Tasks
     "task_create": "Tasks",
     "task_list": "Tasks",
     "task_update": "Tasks",
     "task_close": "Tasks",
+    # Goals
     "set_goal": "Goals",
+    # Delegation (subagents)
     "task": "Delegation",
     "task_batch": "Delegation",
+    "task_output": "Delegation",
+    "stop_task": "Delegation",
+    # Workflows
     "run_workflow": "Workflows",
     "save_workflow": "Workflows",
+    # Discovery
     "search_tools": "Discovery",
 }
 
 
-def _tool_category(name: str, source: str) -> str:
-    # Known tools group by subsystem regardless of source — so first-party plugin
-    # tools (e.g. GitHub) keep their subsystem group instead of a generic "Plugin".
-    known = _TOOL_CATEGORY.get(name)
-    if known:
-        return known
+def _tool_category(
+    name: str, source: str, plugin_owner: str | None = None, mcp_servers: list[str] | None = None
+) -> str:
+    # Plugin tools group by the plugin that contributed them (its display name), so the
+    # console organizes by plugin instead of one flat "Plugin" dump.
     if source == "plugin":
-        return "Plugin"
+        return plugin_owner or "Plugin"
     if source == "mcp":
-        return "MCP"
-    return "General"
+        # MCP tools are namespaced "<server>__<tool>" (tool_name_prefix=True), so group by
+        # the originating server — match the known server names first (handles a name that
+        # itself contains "__"), else fall back to the prefix before the first "__".
+        for s in mcp_servers or []:
+            if name.startswith(f"{s}__"):
+                return s
+        return name.split("__", 1)[0] if "__" in name else "MCP"
+    # Core tools group by subsystem; the long tail falls back to "General".
+    return _TOOL_CATEGORY.get(name, "General")
 
 
 def _operator_tools_list():
@@ -166,6 +195,11 @@ def _operator_tools_list():
     # everything else bound to the graph is core.
     plugin_names = {getattr(t, "name", None) for t in (getattr(STATE, "plugin_tools", None) or [])}
     mcp_names = {getattr(t, "name", None) for t in (getattr(STATE, "mcp_tools", None) or [])}
+    # tool name -> owning plugin display name (Tools tab grouping), stamped by the loader.
+    plugin_owner = getattr(STATE, "plugin_tool_owner", None) or {}
+    # Configured MCP server names (mcp_meta = [{name, transport, tool_count}]) → group MCP
+    # tools by the server that serves them, mirroring the plugin grouping.
+    mcp_servers = [m.get("name") for m in (getattr(STATE, "mcp_meta", None) or []) if m.get("name")]
 
     def add(tool, source=None):
         name = getattr(tool, "name", None)
@@ -179,7 +213,7 @@ def _operator_tools_list():
                 "name": name,
                 "description": desc,
                 "source": src,
-                "category": _tool_category(name, src),
+                "category": _tool_category(name, src, plugin_owner.get(name), mcp_servers),
             }
         )
 
@@ -320,18 +354,63 @@ async def _operator_goals_clear(session_id: str) -> dict:
 
 
 async def _operator_goals_set(body: dict) -> dict:
-    """Programmatic goal-set (ADR 0028 D3) — plugin-verifier goals only; the route
-    maps ok=False to 400."""
+    """Operator goal-set (ADR 0066) — the trusted operator channel. This route lives on the
+    ``/api`` operator surface, which the auth path ceiling restricts to the operator
+    credential, so it accepts ANY verifier type (command/test/ci/data included) — unlike the
+    plugin-only programmatic ``set_goal_safe``. The route maps ok=False to 400."""
     if STATE.goal_controller is None:
         return {"ok": False, "error": "goal mode is not enabled"}
-    sid = str((body or {}).get("session_id") or "").strip()
+    body = body or {}
+    sid = str(body.get("session_id") or "").strip()
     if not sid:
         return {"ok": False, "error": "session_id is required"}
-    ok, msg = STATE.goal_controller.set_goal_safe(
+    ok, msg = STATE.goal_controller.set_goal_operator(
         sid,
-        (body or {}).get("condition"),
-        (body or {}).get("verifier") or {},
-        (body or {}).get("max_iterations"),
+        body.get("condition"),
+        body.get("verifier") or {},
+        max_iterations=body.get("max_iterations"),
+        no_progress_limit=body.get("no_progress_limit"),
+    )
+    return {"ok": ok, "message": msg} if ok else {"ok": False, "error": msg}
+
+
+async def _operator_watches_list() -> dict:
+    import asyncio
+
+    if STATE.watch_controller is None:
+        return {"watches": [], "enabled": False}
+    watches = await asyncio.to_thread(STATE.watch_controller.list_watches)
+    return {"watches": [w.to_dict() for w in watches], "enabled": True}
+
+
+async def _operator_watches_clear(watch_id: str) -> dict:
+    import asyncio
+
+    if STATE.watch_controller is None:
+        return {"cleared": False, "enabled": False}
+    cleared = await asyncio.to_thread(STATE.watch_controller.clear, watch_id)
+    return {"cleared": bool(cleared)}
+
+
+async def _operator_watches_set(body: dict) -> dict:
+    """Operator watch-create (ADR 0067) — the trusted operator channel on the ``/api`` surface
+    (operator-tier by the ADR 0066 ceiling), so it accepts ANY verifier type (command/test/ci/
+    data), unlike the plugin-only agent/SDK path. Maps ok=False → 400."""
+    if STATE.watch_controller is None:
+        return {"ok": False, "error": "watch mode is not available"}
+    body = body or {}
+    from graph.watches.controller import WatchController
+
+    ok, msg, _w = STATE.watch_controller.create(
+        condition=body.get("condition"),
+        verifier=body.get("verifier") or {},
+        watch_id=body.get("watch_id"),
+        interval_s=body.get("interval_s"),
+        deadline=WatchController._parse_deadline(body.get("deadline")),
+        stall_after=WatchController._parse_stall_after(body.get("stall_after")),
+        run_prompt=body.get("run_prompt") or "",
+        run_session=body.get("run_session") or "",
+        trusted=True,
     )
     return {"ok": ok, "message": msg} if ok else {"ok": False, "error": msg}
 
@@ -341,7 +420,13 @@ async def _operator_activity_list() -> dict:
     with origin/trigger/priority — plus the thread's message history from the
     checkpointer (for the continue view). The console renders the feed and
     opens the thread on demand."""
-    entries = STATE.activity_log.recent(limit=100) if STATE.activity_log is not None else []
+    import asyncio
+
+    # recent() is sync sqlite — offload it off the loop (#875), mirroring the
+    # scheduler/goals handlers above.
+    entries = (
+        await asyncio.to_thread(STATE.activity_log.recent, 100) if STATE.activity_log is not None else []
+    )
     messages: list[dict] = []
     if STATE.checkpointer is not None:
         thread_id = f"a2a:{ACTIVITY_CONTEXT}"
@@ -374,7 +459,7 @@ def _inbox_authorized(token: str | None) -> bool:
     ).strip()
     if not active:
         return True
-    return (token or "") == active
+    return hmac.compare_digest(token or "", active)
 
 
 async def _fire_activity_from_inbox(item: dict) -> bool:
@@ -439,9 +524,13 @@ async def _fire_activity_from_inbox(item: dict) -> bool:
 async def _operator_inbox_add(payload: dict) -> dict:
     """Ingest an inbound item (ADR 0003). now-priority fires an Activity turn;
     others queue for check_inbox. Dedup is handled by the store."""
+    import asyncio
+
     if STATE.inbox_store is None:
         raise RuntimeError("inbox not loaded; finish setup first")
-    item = STATE.inbox_store.add(
+    # add() is sync sqlite — offload it off the loop (#875).
+    item = await asyncio.to_thread(
+        STATE.inbox_store.add,
         payload.get("text", ""),
         priority=payload.get("priority", "next") or "next",
         source=payload.get("source", "") or "",
@@ -449,32 +538,49 @@ async def _operator_inbox_add(payload: dict) -> dict:
     )
     if item is None:
         return {"ok": True, "deduped": True}
-    _event_bus.publish(
-        "inbox.item",
-        {
-            "id": item["id"],
-            "priority": item["priority"],
-            "source": item.get("source") or "",
-            "text": item["text"],
-        },
-    )
-    fired = await _fire_activity_from_inbox(item) if item["priority"] == "now" else False
-    if fired:
-        # A now-item that fired has been delivered to the agent (its Activity turn
-        # ran) — mark it delivered so it doesn't linger as pending and get
-        # re-surfaced by the next check_inbox (bd-jus). A FAILED fire stays pending
-        # so check_inbox remains the fallback delivery path for it.
+
+    fired = False
+    if item["priority"] == "now":
+        # Deliver-BEFORE-fire (#1375): mark the now-item delivered before its Activity turn
+        # runs, so the fired turn can't re-read its own trigger via check_inbox (double
+        # processing). If the fire never happens (storm-blocked / failed), restore it to
+        # pending so it isn't lost — check_inbox stays the fallback delivery path.
         try:
-            STATE.inbox_store.mark_delivered([item["id"]])
-        except Exception:  # noqa: BLE001 — best-effort; a missed mark just re-surfaces
-            log.warning("[inbox] could not mark fired now-item %s delivered", item.get("id"))
+            await asyncio.to_thread(STATE.inbox_store.mark_delivered, [item["id"]])
+        except Exception:  # noqa: BLE001 — best-effort; a missed mark just means a double-read
+            log.warning("[inbox] could not pre-mark now-item %s delivered", item.get("id"))
+        fired = await _fire_activity_from_inbox(item)
+        if not fired:
+            try:
+                await asyncio.to_thread(STATE.inbox_store.mark_pending, [item["id"]])
+            except Exception:  # noqa: BLE001 — restore is best-effort
+                log.warning("[inbox] could not restore unfired now-item %s to pending", item.get("id"))
+
+    # Badge dedup (#1375): publish `inbox.item` ONLY for items that actually LAND in the queue
+    # — next/later items, or a now-item whose fire failed (now pending again). A fired now-item
+    # is an Activity event (the `activity.message` push covers it), not an inbox arrival, so it
+    # no longer double-bumps both the Inbox and Activity widget badges.
+    if not fired:
+        _event_bus.publish(
+            "inbox.item",
+            {
+                "id": item["id"],
+                "priority": item["priority"],
+                "source": item.get("source") or "",
+                "text": item["text"],
+            },
+        )
     return {"ok": True, "item": item, "fired": fired}
 
 
 async def _operator_inbox_list(floor: str, include_delivered: bool) -> dict:
+    import asyncio
+
     if STATE.inbox_store is None:
         return {"items": []}
-    items = STATE.inbox_store.list(
+    # list() is sync sqlite — offload it off the loop (#875).
+    items = await asyncio.to_thread(
+        STATE.inbox_store.list,
         priority_floor=floor or "later",
         include_delivered=include_delivered,
         limit=200,
@@ -483,18 +589,23 @@ async def _operator_inbox_list(floor: str, include_delivered: bool) -> dict:
 
 
 async def _operator_inbox_deliver(item_id: int) -> dict:
+    import asyncio
+
     if STATE.inbox_store is None:
         raise RuntimeError("inbox not loaded; finish setup first")
-    return {"ok": True, "delivered": STATE.inbox_store.mark_delivered([item_id])}
+    # mark_delivered() is sync sqlite — offload it off the loop (#875).
+    delivered = await asyncio.to_thread(STATE.inbox_store.mark_delivered, [item_id])
+    return {"ok": True, "delivered": delivered}
 
 
 def _operator_chat_commands() -> dict:
     """Slash commands the chat understands — drives the composer autocomplete.
 
-    The workflow/subagent/skill inventory + precedence comes from the SAME
-    resolver the chat dispatcher uses (``server.chat.resolve_slash_commands``), so
-    the palette can't drift from what actually runs. ``/goal`` (a server-handled
-    control command) is surfaced here when goal mode is loaded."""
+    The workflow/subagent/skill/plugin-command inventory + precedence comes from
+    the SAME resolver the chat dispatcher uses (``server.chat.resolve_slash_commands``),
+    so the palette can't drift from what actually runs. ``/goal`` (a core
+    server-handled control command) is surfaced here; ``/issue`` is now owned by the
+    github plugin and arrives via the resolver as a ``plugin_command``."""
     from graph.slash_commands import resolve_slash_commands
 
     commands = []

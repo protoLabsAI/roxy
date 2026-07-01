@@ -82,6 +82,8 @@ export default defineConfig({
           collapsed: false,
           items: [
             { text: "Goal mode", link: "/guides/goal-mode" },
+            { text: "Watches", link: "/guides/watches" },
+            { text: "File GitHub issues (/issue)", link: "/guides/file-github-issues" },
             { text: "Schedule future work", link: "/guides/scheduler" },
             { text: "Middleware", link: "/guides/middleware" },
             { text: "Run on a coding agent (ACP runtime)", link: "/guides/acp-runtime" },
@@ -111,6 +113,7 @@ export default defineConfig({
           items: [
             { text: "Delegates (agents & endpoints)", link: "/guides/delegates" },
             { text: "Spawn CLI coding agents (ACP)", link: "/guides/coding-agents" },
+            { text: "Verifier-grounded coder (coder_solve)", link: "/guides/coder" },
             { text: "Fleet (many agents on one host)", link: "/guides/fleet" },
             { text: "Portfolio (one PM across boards)", link: "/guides/portfolio" },
           ],
@@ -133,6 +136,7 @@ export default defineConfig({
           items: [
             { text: "Operator console (React/Tauri)", link: "/guides/react-tauri-ui" },
             { text: "Command palette (⌘K)", link: "/guides/command-palette" },
+            { text: "Access from your phone (LAN / Tailscale)", link: "/guides/phone-access" },
             { text: "Run headless (API + A2A)", link: "/guides/headless" },
           ],
         },
@@ -141,6 +145,7 @@ export default defineConfig({
           collapsed: true,
           items: [
             { text: "Deploy via GHCR", link: "/guides/deploy" },
+            { text: "Deploy in Docker (seed + UI override)", link: "/guides/deploy-docker" },
             { text: "Releasing", link: "/guides/releasing" },
             { text: "Run multiple instances", link: "/guides/multi-instance" },
             { text: "Sandboxing & egress", link: "/guides/sandboxing" },

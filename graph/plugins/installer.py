@@ -27,13 +27,23 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-from graph.config_io import _BUNDLE_CONFIG_DIR, _live_config_dir
+from infra.paths import instance_paths
+
 from graph.plugins.manifest import PluginManifest, load_manifest
 
 log = logging.getLogger(__name__)
 
-REPO_ROOT = _BUNDLE_CONFIG_DIR.parent
-LOCK_PATH = Path(os.environ.get("PROTOAGENT_PLUGINS_LOCK", str(REPO_ROOT / "plugins.lock")))
+
+def bundled_plugins_dir() -> Path:
+    """In-tree bundled (built-in) plugins root — ``app_root/plugins``. Resolved at
+    call time so the env (PyInstaller _MEIPASS) is honored, never import-time."""
+    return instance_paths().app_root / "plugins"
+
+
+def lock_path() -> Path:
+    """The ``plugins.lock`` for THIS instance — ``instance_paths().plugins_lock``
+    (honors ``PROTOAGENT_PLUGINS_LOCK``)."""
+    return instance_paths().plugins_lock
 
 _SHA_RE = re.compile(r"^[0-9a-f]{7,40}$", re.IGNORECASE)
 # A git ref we'll accept from a caller — branch/tag/sha shapes only. Keeps a ref
@@ -48,6 +58,10 @@ _ALLOWED_SCHEMES = ("https://", "http://", "git://", "ssh://", "git@", "file://"
 # (source_url, ref) so repeated polls don't ls-remote the same source every call.
 _LSREMOTE_TIMEOUT_S = 5.0
 _LSREMOTE_TTL_S = 300.0  # ~5 min
+# A git clone of a slow/large remote is bounded so it can't hang an install thread
+# indefinitely (the operator install/update routes offload to a thread, so this
+# caps the worst case rather than wedging a pool worker forever).
+_CLONE_TIMEOUT_S = 600.0
 _lsremote_cache: dict[tuple[str, str], tuple[float, str]] = {}
 
 
@@ -56,9 +70,9 @@ class InstallError(RuntimeError):
 
 
 def live_plugins_dir() -> Path:
-    """Where git-installed plugins land — the live dir the loader discovers."""
-    override = os.environ.get("PROTOAGENT_PLUGINS_DIR", "")
-    return Path(override).expanduser() if override else (_live_config_dir() / "plugins")
+    """Where git-installed plugins land — the live dir the loader discovers
+    (``instance_paths().plugins_dir``, honoring ``PROTOAGENT_PLUGINS_DIR``)."""
+    return instance_paths().plugins_dir
 
 
 def _git(*args: str, cwd: Path | None = None, timeout: float | None = None) -> str:
@@ -98,17 +112,20 @@ def _source_allowed(url: str, allow: list[str] | None) -> bool:
 
 
 def _read_lock() -> dict:
-    if LOCK_PATH.exists():
+    lock = lock_path()
+    if lock.exists():
         try:
-            return json.loads(LOCK_PATH.read_text())
+            return json.loads(lock.read_text())
         except (json.JSONDecodeError, OSError):
-            log.warning("[plugins] %s is unreadable — starting a fresh lock", LOCK_PATH)
+            log.warning("[plugins] %s is unreadable — starting a fresh lock", lock)
     return {"plugins": []}
 
 
 def _write_lock(data: dict) -> None:
     data["plugins"].sort(key=lambda e: e.get("id", ""))
-    LOCK_PATH.write_text(json.dumps(data, indent=2) + "\n")
+    lock = lock_path()
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    lock.write_text(json.dumps(data, indent=2) + "\n")
 
 
 def _audit(action: str, args: dict, summary: str, *, success: bool = True) -> None:
@@ -134,7 +151,9 @@ def configured_allowlist() -> list[str] | None:
     try:
         import yaml
 
-        cfg_path = _live_config_dir() / "langgraph-config.yaml"
+        from graph.config_io import config_yaml_path
+
+        cfg_path = config_yaml_path()
         if not cfg_path.exists():
             return None
         data = yaml.safe_load(cfg_path.read_text()) or {}
@@ -174,13 +193,13 @@ def _clone(url: str, ref: str | None, dest: Path) -> str:
     if ref and _SHA_RE.match(ref):
         # A specific commit: full clone (shallow can't reliably check out an
         # arbitrary SHA), then check it out.
-        _git("clone", "--no-recurse-submodules", url, str(dest))
+        _git("clone", "--no-recurse-submodules", url, str(dest), timeout=_CLONE_TIMEOUT_S)
         _git("checkout", ref, cwd=dest)
     elif ref:
         # A tag or branch: shallow clone of just that ref.
-        _git("clone", "--depth", "1", "--no-recurse-submodules", "--branch", ref, url, str(dest))
+        _git("clone", "--depth", "1", "--no-recurse-submodules", "--branch", ref, url, str(dest), timeout=_CLONE_TIMEOUT_S)
     else:
-        _git("clone", "--depth", "1", "--no-recurse-submodules", url, str(dest))
+        _git("clone", "--depth", "1", "--no-recurse-submodules", url, str(dest), timeout=_CLONE_TIMEOUT_S)
     return _git("rev-parse", "HEAD", cwd=dest)
 
 
@@ -370,7 +389,7 @@ def install(
         pid = manifest.id
 
         # No silent shadowing of a built-in (repo) plugin.
-        if (REPO_ROOT / "plugins" / pid).exists():
+        if (bundled_plugins_dir() / pid).exists():
             raise InstallError(f"plugin id {pid!r} is a built-in — cannot install over it.")
 
         # Frozen runtime (desktop): no pip — a plugin can only run if its declared
@@ -435,6 +454,26 @@ def load_bundle(repo: Path) -> dict | None:
     return doc
 
 
+def bundle_config_overlay(bundle_config: dict | None, current: dict | None) -> dict:
+    """Reduce a bundle's recommended ``config:`` ({section: {key: val}}) to a DEFAULTS
+    overlay: only the keys the operator hasn't already set in ``current`` (the live
+    config sections). Per-section, per-leaf — an operator value always wins and a
+    present key is left untouched, so applying this never clobbers existing settings.
+    Empty sections are dropped. Shared by the console install route and the fleet
+    create path so both apply bundle defaults identically (#1350)."""
+    overlay: dict = {}
+    cur = current if isinstance(current, dict) else {}
+    for section, values in (bundle_config or {}).items():
+        if not isinstance(values, dict):
+            continue
+        existing = cur.get(section)
+        existing = existing if isinstance(existing, dict) else {}
+        fill = {k: v for k, v in values.items() if k not in existing}
+        if fill:
+            overlay[str(section)] = fill
+    return overlay
+
+
 def _install_bundle(
     bundle: dict, bundle_url: str, bundle_sha: str, ref: str | None, *, force: bool, by: str, allow: list[str] | None
 ) -> dict:
@@ -466,6 +505,15 @@ def _install_bundle(
             "requested_ref": ref or "",
             "resolved_sha": bundle_sha,
             "plugins": [s["id"] for s in installed],
+            # The bundle's curated turn-on list (a subset of `plugins`). Cached here so a
+            # consumer that only sees the lock — e.g. the fleet new-agent path, which
+            # installs via a CLI subprocess and never sees the live install summary — can
+            # auto-enable exactly what the bundle author intended. Empty = enable all members.
+            "enabled": list(bundle.get("enabled") or []),
+            # The bundle's recommended per-plugin config defaults ({section: {key: val}}).
+            # Cached for the same lock-only consumer; applied as DEFAULTS (operator values
+            # win, present keys are never clobbered — see `bundle_config_overlay`).
+            "config": dict(bundle.get("config") or {}),
             # Archetype metadata (ADR 0042) cached here so the new-agent picker can offer
             # this bundle as a starter type without re-reading its manifest.
             "archetype": bundle.get("archetype") or {},
@@ -497,9 +545,9 @@ def _clean_config_refs(plugin_id: str, section: str, purge: bool) -> bool:
     always the `plugins.enabled`/`disabled` entry (a dangling enabled entry is just
     broken); with ``purge`` also the plugin's `config_section` block. Comment-safe
     (ruamel). Returns True if anything changed."""
-    from graph.config_io import load_yaml_doc, save_yaml_doc
+    from graph.config_io import config_yaml_path, load_yaml_doc, save_yaml_doc
 
-    cfg = _live_config_dir() / "langgraph-config.yaml"
+    cfg = config_yaml_path()
     if not cfg.exists():
         return False
     doc = load_yaml_doc(cfg)
@@ -524,9 +572,9 @@ def _clean_config_refs(plugin_id: str, section: str, purge: bool) -> bool:
 
 def _clean_secrets(section: str) -> bool:
     """Remove the plugin's section from the live secrets.yaml overlay (purge only)."""
-    from graph.config_io import load_yaml_doc, save_yaml_doc
+    from graph.config_io import load_yaml_doc, save_yaml_doc, secrets_yaml_path
 
-    sec = _live_config_dir() / "secrets.yaml"
+    sec = secrets_yaml_path()
     if not sec.exists():
         return False
     doc = load_yaml_doc(sec)
@@ -543,7 +591,7 @@ def uninstall(plugin_id: str, *, purge: bool = False) -> dict:
     With ``purge=True`` ALSO removes the plugin's config section + its secrets.
     Built-ins are refused; pip deps are NEVER auto-removed (shared venv) — they're
     returned for the operator to remove. Returns a report dict."""
-    if (REPO_ROOT / "plugins" / plugin_id).exists():
+    if (bundled_plugins_dir() / plugin_id).exists():
         raise InstallError(f"{plugin_id!r} is a built-in plugin — not removable via uninstall.")
     target = live_plugins_dir() / plugin_id
     # Read the manifest BEFORE deleting — purge needs the config section + we report
@@ -574,11 +622,34 @@ def uninstall(plugin_id: str, *, purge: bool = False) -> dict:
     return {"id": plugin_id, "removed": removed, "deps_left": deps_left, "purged": purge}
 
 
+def _validate_pip_specs(plugin_id: str, deps: list[str]) -> None:
+    """Reject ``requires_pip`` entries that aren't plain package requirements — a
+    pip option (``--index-url``/``-e``), a VCS/URL/direct reference, or junk — so a
+    plugin manifest can't inject pip flags (index hijack) or arbitrary build code
+    beyond the named packages an operator reviewed. ``--`` before the specs in the
+    pip argv is the belt to this suspenders."""
+    for d in deps:
+        s = str(d).strip()
+        low = s.lower()
+        if not s or s.startswith("-"):
+            raise InstallError(
+                f"plugin {plugin_id!r}: requires_pip entry {d!r} looks like a pip option, not a package."
+            )
+        if "://" in s or "@" in s or low.startswith(("git+", "hg+", "svn+", "bzr+", "file:")):
+            raise InstallError(
+                f"plugin {plugin_id!r}: requires_pip entry {d!r} is a VCS/URL/direct reference, which is not allowed."
+            )
+        if not _PKG_NAME_RE.match(s):
+            raise InstallError(
+                f"plugin {plugin_id!r}: requires_pip entry {d!r} is not a valid PEP 508 package requirement."
+            )
+
+
 def install_deps(plugin_id: str) -> list[str]:
     """Pip-install a plugin's declared ``requires_pip`` — the explicit code-exec
     step that ``install`` deliberately skips (ADR 0027 D4). Returns the deps."""
     manifest = None
-    for base in (live_plugins_dir(), REPO_ROOT / "plugins"):
+    for base in (live_plugins_dir(), bundled_plugins_dir()):
         if (base / plugin_id / "protoagent.plugin.yaml").exists():
             manifest = load_manifest(base / plugin_id)
             break
@@ -587,6 +658,7 @@ def install_deps(plugin_id: str) -> list[str]:
     deps = list(manifest.requires_pip)
     if not deps:
         return []
+    _validate_pip_specs(plugin_id, deps)
     # Frozen runtime (desktop): no pip. The deps must already be bundled — confirm
     # (nothing to install) or refuse with a clear message (ADR 0058 D2).
     if _frozen_like():
@@ -599,7 +671,7 @@ def install_deps(plugin_id: str) -> list[str]:
         log.info("[plugins] %s deps already in the runtime — nothing to install", plugin_id)
         return deps
     proc = subprocess.run(
-        [sys.executable, "-m", "pip", "install", *deps],
+        [sys.executable, "-m", "pip", "install", "--", *deps],
         capture_output=True,
         text=True,
     )

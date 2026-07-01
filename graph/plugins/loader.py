@@ -27,20 +27,26 @@ log = logging.getLogger("protoagent.plugins")
 @dataclass
 class PluginLoadResult:
     tools: list = field(default_factory=list)
+    # tool name -> the owning plugin's display name, so the console Tools tab can group
+    # plugin tools by the plugin that contributed them instead of one flat "Plugin" bucket.
+    tool_plugins: dict = field(default_factory=dict)
     skill_dirs: list = field(default_factory=list)
     workflow_dirs: list = field(default_factory=list)  # *.yaml recipe dirs (ADR 0027)
     goal_verifiers: dict = field(default_factory=dict)  # name -> verifier fn (ADR 0028)
     goal_hooks: list = field(default_factory=list)  # {on_achieved, on_failed} (ADR 0028)
+    watch_hooks: list = field(default_factory=list)  # {on_met, on_expired, on_stalled} (ADR 0067)
     knowledge_stores: dict = field(default_factory=dict)  # name -> backend factory (ADR 0031)
     embedders: dict = field(default_factory=dict)  # name -> embed_fn factory (ADR 0031)
     a2a_skills: list = field(default_factory=list)  # A2A card skill specs (#570)
     routers: list = field(default_factory=list)  # {plugin_id, router, prefix} (ADR 0018)
+    public_paths: list = field(default_factory=list)  # manifest-declared auth-exempt prefixes
     surfaces: list = field(default_factory=list)  # {plugin_id, name, start, stop}
     subagents: list = field(default_factory=list)  # SubagentConfig
     middleware: list = field(default_factory=list)  # factories: (config) -> AgentMiddleware|None (ADR 0032)
     late_tool_factories: list = field(default_factory=list)  # (all_tools, config) -> tool|list (late seam)
     mcp_servers: list = field(default_factory=list)  # factories: config -> entry|None (ADR 0019)
     thread_id_resolver: object = None  # (request_metadata, session_id) -> str (#571); last plugin wins
+    chat_commands: dict = field(default_factory=dict)  # token -> handler; user-only chat control commands
     meta: list[dict] = field(default_factory=list)
 
 
@@ -126,9 +132,10 @@ def run_plugin_mcp_main(plugin_id: str) -> None:
     the module does NOT call ``register`` — only defines its functions — so this
     is side-effect-free apart from running the server.
     """
-    from graph.config_io import _BUNDLE_CONFIG_DIR, _live_config_dir
+    from infra.paths import instance_paths
 
-    roots = [_BUNDLE_CONFIG_DIR.parent / "plugins", _live_config_dir() / "plugins"]
+    ip = instance_paths()
+    roots = [ip.app_root / "plugins", ip.plugins_dir]
     for manifest in discover_plugins(roots):
         if manifest.id != plugin_id:
             continue
@@ -161,9 +168,9 @@ def _host_version() -> str:
     except ImportError:  # pragma: no cover - importlib.metadata always present on 3.11+
         pass
 
-    from graph.config_io import _BUNDLE_CONFIG_DIR
+    from infra.paths import instance_paths
 
-    pyproject = _BUNDLE_CONFIG_DIR.parent / "pyproject.toml"
+    pyproject = instance_paths().app_root / "pyproject.toml"
     try:
         m = re.search(r'^version\s*=\s*"([^"]+)"', pyproject.read_text(), re.MULTILINE)
         if m:
@@ -313,7 +320,7 @@ def load_plugins(config, *, core_tool_names: set[str] | None = None) -> PluginLo
             # Resolved config section (ADR 0019) — defaults if not in plugin_config.
             section = manifest.config_section or manifest.id
             pconf = (getattr(config, "plugin_config", {}) or {}).get(section) or dict(manifest.config or {})
-            registry = PluginRegistry(manifest.id, manifest.path, config=pconf)
+            registry = PluginRegistry(manifest.id, manifest.path, config=pconf, config_section=section)
             register(registry)
         except Exception as exc:  # noqa: BLE001 — a bad plugin must not break boot
             # Clear diagnostic when an enabled plugin's declared deps aren't
@@ -338,6 +345,9 @@ def load_plugins(config, *, core_tool_names: set[str] | None = None) -> PluginLo
             kept.append(tool)
 
         result.tools.extend(kept)
+        # Attribute each kept tool to this plugin (display name, id fallback) for the Tools tab.
+        for tool in kept:
+            result.tool_plugins[tool.name] = manifest.name or manifest.id
         result.skill_dirs.extend(registry.skill_dirs)
         result.workflow_dirs.extend(registry.workflow_dirs)
         # Full-bundle auto-discovery (ADR 0027): a plugin repo can ship SKILL.md
@@ -359,6 +369,10 @@ def load_plugins(config, *, core_tool_names: set[str] | None = None) -> PluginLo
         # the server can namespace + report them.
         for r in registry.routers:
             result.routers.append({"plugin_id": manifest.id, **r})
+        # Manifest-declared auth-exempt prefixes (already namespace-scoped by the
+        # parser) — the server hands these to the auth middleware so an inbound
+        # webhook / public view page works under a token gate.
+        result.public_paths.extend(manifest.public_paths)
         # Cross-check: every declared view must be served by one of this plugin's
         # routers, else the iframe renders blank/404. Catches "declared a view but
         # forgot register_router" / a path typo that fails silently today.
@@ -374,6 +388,7 @@ def load_plugins(config, *, core_tool_names: set[str] | None = None) -> PluginLo
                 continue
             result.goal_verifiers[name] = fn
         result.goal_hooks.extend(registry.goal_hooks)  # ADR 0028 D4
+        result.watch_hooks.extend(registry.watch_hooks)  # ADR 0067
         for name, factory in registry.knowledge_stores.items():  # ADR 0031
             if name in result.knowledge_stores:
                 log.warning("[plugins] %s: knowledge backend %s collides — skipped", manifest.id, name)
@@ -386,6 +401,11 @@ def load_plugins(config, *, core_tool_names: set[str] | None = None) -> PluginLo
             result.embedders[name] = factory
         for f in registry.mcp_servers:
             result.mcp_servers.append({"plugin_id": manifest.id, "factory": f})
+        for token, handler in registry.chat_commands.items():  # user-only chat control commands
+            if token in result.chat_commands:
+                log.warning("[plugins] %s: chat command /%s collides — skipped", manifest.id, token)
+                continue
+            result.chat_commands[token] = handler
         entry["loaded"] = True
         entry["tools"] = [t.name for t in kept]
         entry["skills"] = len(registry.skill_dirs)
@@ -393,6 +413,7 @@ def load_plugins(config, *, core_tool_names: set[str] | None = None) -> PluginLo
         entry["surfaces"] = len(registry.surfaces)
         entry["subagents"] = [getattr(c, "name", "?") for c in registry.subagents]
         entry["mcp_servers"] = len(registry.mcp_servers)
+        entry["chat_commands"] = [f"/{t}" for t in registry.chat_commands]
         result.meta.append(entry)
         log.info(
             "[plugins] loaded %s: %d tool(s), %d skill dir(s), %d route(s), "
@@ -410,9 +431,9 @@ def load_plugins(config, *, core_tool_names: set[str] | None = None) -> PluginLo
 
 
 def _plugin_roots(config) -> list[Path]:
-    from graph.config_io import _BUNDLE_CONFIG_DIR, _live_config_dir
+    from infra.paths import instance_paths
 
-    repo_root = _BUNDLE_CONFIG_DIR.parent
+    ip = instance_paths()
     live_override = getattr(config, "plugins_dir", "") or ""
-    live_root = Path(live_override).expanduser() if live_override else (_live_config_dir() / "plugins")
-    return [repo_root / "plugins", live_root]  # bundle first, live overrides
+    live_root = Path(live_override).expanduser() if live_override else ip.plugins_dir
+    return [ip.app_root / "plugins", live_root]  # bundle first, live overrides

@@ -2,10 +2,9 @@
 
 A **goal** is a testable outcome you attach to the agent — a *condition* plus a **verifier** that ground-truths whether it's met (a shell command's exit code, a test run, a CI status, a data assertion, a plugin check, or an LLM judgment as the fallback). Goals turn "please do X" into "keep going / watch until X is provably true."
 
-There are **two kinds**, and the difference is *who moves the needle*:
+A goal is **agent-driven**: *the agent's own turns* do the work. After each turn the verifier runs; if not met, the agent is re-invoked with a continuation prompt until it passes, the iteration budget is spent, or it's flagged unachievable. Use for "make the tests pass," "finish the README."
 
-- **Drive** (default) — *the agent's own turns* do the work. After each turn the verifier runs; if not met, the agent is re-invoked with a continuation prompt until it passes, the iteration budget is spent, or it's flagged unachievable. Use for "make the tests pass," "finish the README."
-- **Monitor** (ADR 0030) — *an external process* moves the needle (a background engine, a training run, a deployment, a market). The agent only starts/supervises; the goal is checked **out-of-band on a cadence** and never re-invokes the agent. Use for "treasury ≥ 1,000,000," "rollout reaches 100%."
+> **Watching a metric someone else moves** (a background engine, a training run, a deploy — "treasury ≥ 1,000,000," "rollout reaches 100%") is a **watch**, not a goal (ADR 0067): it's checked out-of-band on a cadence, never re-invokes the agent, and you can hold **many** at once. Create one with `sdk.create_watch(...)`, `POST /api/watches`, or the agent's `create_watch` tool. (Goals used to carry a `monitor` disposition; ADR 0067 split it into its own primitive.)
 
 When a goal reaches a terminal state it **broadcasts on the event bus** (`goal.achieved` / `goal.failed`, ADR 0039) — so the console, or any plugin, can react without writing code (see [Reacting to a goal](#reacting-to-a-goal)).
 
@@ -16,8 +15,8 @@ It's modelled on protocli's goal system but deliberately more rigorous for a lon
 | | protocli | protoAgent goal mode |
 |---|---|---|
 | Completion check | small-LLM judgment | **pluggable verifier** (command / test / CI / data), LLM only as fallback |
-| Drive-to-done | continuation prompt | continuation prompt **+ persisted `<goal_plan>` checklist** |
-| Give-up path | user sets "stop after N" in the text | **iteration budget + no-progress streak + model `<goal_unachievable>`** |
+| Drive-to-done | continuation prompt | continuation prompt **+ a persisted plan** (the `update_goal_plan` tool) |
+| Give-up path | user sets "stop after N" in the text | **iteration budget + no-progress streak + the `abandon_goal` tool** |
 | State | in-memory, per session | **disk-persisted** per session (survives restart/reload) |
 
 ## How it works
@@ -25,8 +24,8 @@ It's modelled on protocli's goal system but deliberately more rigorous for a lon
 1. You set a goal for a session (`/goal …`). Nothing else changes — the next message runs normally.
 2. When the agent produces a final answer (no more tool calls), the controller runs the goal's **verifier**.
 3. **Met** → the goal is marked `achieved` and the run ends.
-4. **Not met** → the controller extracts/refreshes the agent's `<goal_plan>` checklist, then re-invokes the agent on the same thread (history preserved) with a continuation prompt that includes the verifier's reason + evidence and the current plan.
-5. This repeats until met, the **iteration budget** (`goal.max_iterations`) is spent (`exhausted`), the verifier returns the **same evidence too many times** (`goal.no_progress_limit` → `unachievable`), or the agent itself emits `<goal_unachievable reason="…"/>` (`unachievable`).
+4. **Not met** → the agent records its running plan with the `update_goal_plan` tool, then the controller re-invokes it on the same thread (history preserved) with a continuation prompt that includes the verifier's reason + evidence and the current plan.
+5. This repeats until met, the **iteration budget** (`goal.max_iterations`) is spent (`exhausted`), the verifier returns the **same evidence too many times** (`goal.no_progress_limit` → `unachievable`), or the agent itself calls the `abandon_goal` tool with a reason (`unachievable`).
 
 The loop wraps graph invocation in `server/chat.py` (both the A2A streaming path and the non-streaming chat path); the graph itself is unchanged.
 
@@ -38,19 +37,20 @@ Send a control message through any channel (A2A, the React console chat, OpenAI-
   ```
   /goal the README documents every config block
   ```
-- **Testable goal** (JSON spec):
+- **Testable goal** (JSON spec) — from a chat message you can use the *declarative*
+  verifiers (`plugin`, or `data` with a `contains` substring):
   ```
-  /goal {"condition": "unit tests pass", "verifier": {"type": "test", "command": "python -m pytest -q"}}
+  /goal {"condition": "migration recorded", "verifier": {"type": "data", "path": "/sandbox/state.json", "contains": "migration complete"}}
   ```
-- **Monitor goal** (ADR 0030) — for a metric driven by an *external* process (a
-  background engine, a training run, a deployment), not the agent's turns. Add
-  `"mode": "monitor"`: the agent **isn't** re-invoked, the goal **never exhausts**,
-  and it's checked **out-of-band** on a cadence (`goal.monitor_interval`, default 60s),
-  firing the verifier's `on_achieved` hook when it passes.
-  ```
-  /goal {"condition": "treasury ≥ 1,000,000", "mode": "monitor", "verifier": {"type": "plugin", "check": "spacetraders:credits", "args": {"min": 1000000}}}
-  ```
-  (Default is `"mode": "drive"` — the agent *is* the work, the bounded loop above.)
+
+  > **Shell/eval verifiers are operator-only.** `command`, `test`, `ci`, and `data`+`expr`
+  > execute on the host or hit a restricted-eval sink, so they are **refused from a `/goal`
+  > chat message** (a federation peer / API client shares the operator bearer today, #1407).
+  > A dedicated operator set-channel is the Phase 2 plan.
+  (To *watch* a metric an external process moves — "treasury ≥ 1,000,000", "rollout
+  reaches 100%" — use a **watch** (ADR 0067), not a goal: `POST /api/watches` or the
+  `create_watch` tool. Watches poll out-of-band, react via `run_in_session`/hooks, support
+  `deadline`/`stall_after`, and you can hold many at once.)
 - **Per-goal patience:** add `"no_progress_limit": N` to widen/narrow one goal's
   no-progress tolerance without changing the global default.
 - **Status:** `/goal`
@@ -64,7 +64,7 @@ Programmatic status/clear is also available: `GET /api/goal/{session_id}` and `D
 
 ## Manage from the console
 
-The React console's **Goals** surface (right sidebar) lists every session's goal — its condition, status (`active` / `achieved` / `exhausted` / `unachievable`), a **`monitor` badge** for monitor goals, the verifier type, and either the drive **iteration count** or (for monitor) **when it was last checked** — plus the latest verifier reason. You can **clear** any of them. When a goal finishes, the console shows a **toast** (`goal.achieved` → success, `goal.failed` → error), driven by the bus events below.
+The React console's **Goals** surface (right sidebar) lists every session's goal — its condition, status (`active` / `achieved` / `exhausted` / `unachievable`), the verifier type, the **iteration count**, and the latest verifier reason. You can **clear** any of them. When a goal finishes, the console shows a **toast** (`goal.achieved` → success, `goal.failed` → error), driven by the bus events below.
 
 Goals are still *set* in chat with `/goal` (setting can run shell/test verifiers, so it stays an explicit operator action); the panel is a read-and-clear view. Backed by:
 
@@ -86,7 +86,26 @@ A terminal goal is a **trigger**, not just a checkbox. Every finish publishes on
 Two ways to react:
 
 - **No code (any plugin / the console).** Subscribe to the topic — `registry.on("goal.achieved", …)` in a plugin, or `protoagent:subscribe` from a sandboxed view. The built-in console toast is exactly this. Because it's the bus, **nobody imports the goal system** to listen.
-- **Plugin code (richer).** `register_goal_hook(on_achieved=…, on_failed=…)` hands your plugin the terminal `GoalState` to run arbitrary logic — set the next goal (phase progression), kick a follow-up agent turn via `host.invoke`, stop a background engine, alert. This is how a fork drives an autonomous loop: *set a monitor goal → external engine runs → the cadence tick verifies → the hook advances.*
+- **Plugin code (richer).** `register_goal_hook(on_achieved=…, on_failed=…)` hands your plugin the terminal `GoalState` to run arbitrary logic — set the next goal (phase progression), **prompt the agent with a follow-up turn** (`sdk.run_in_session`, below), stop a background engine, alert. This is how a plugin drives an autonomous loop: *a terminal goal fires the hook → set the next goal, or prompt the agent.* (To watch an external metric on a cadence, use a **watch** instead — ADR 0067.)
+
+### Goal fires → run a follow-up agent turn
+
+To have the agent *act* when a goal fires — not just record a status — call `sdk.run_in_session(session_id, prompt)` from a hook. It enqueues the prompt as a **one-shot agent turn in the goal's own session** (that session's memory + full tools), runs it on the normal scheduler fire path, and returns immediately — so it's safe to call from a hook without blocking:
+
+```python
+from graph import sdk
+
+def register(registry):
+    async def on_achieved(goal):                # terminal GoalState
+        sdk.run_in_session(
+            goal.session_id,
+            f"The goal '{goal.condition}' just completed. Evidence: {goal.last_evidence}. "
+            f"Summarize the outcome and start the follow-up work.",
+        )
+    registry.register_goal_hook(on_achieved=on_achieved)
+```
+
+Pass `job_id=` to make the re-arm idempotent, or `delay_seconds=` to defer the turn. This is the *reaction* half of the self-improving loop: `sdk.start_goal_loop` **drives** a goal; a hook + `run_in_session` **reacts** when it lands.
 
 ## Verifier types
 
@@ -109,9 +128,9 @@ Examples:
 {"type": "data", "path": "/sandbox/state.json", "expr": "data['open_tickets'] == 0"}
 ```
 
-## The `<goal_plan>` checklist
+## The running plan (`update_goal_plan`)
 
-Continuation prompts ask the agent to keep a running plan inside a `<goal_plan>…</goal_plan>` block and update it each turn. The controller extracts that block, persists it with the goal state, and feeds it back into the next continuation — so the agent maintains a coherent plan across iterations instead of re-planning from scratch.
+Continuation prompts ask the agent to keep a running plan and record it each turn by calling the **`update_goal_plan`** tool. The controller persists that plan with the goal state (fresh-context goals write it to a durable plan artifact) and feeds it back into the next continuation — so the agent maintains a coherent plan across iterations instead of re-planning from scratch. To stop early when the goal is impossible or out of scope, the agent calls **`abandon_goal`** with a reason (honoured only after the verifier runs, so a goal the world already satisfies still finishes `achieved`). Both tools are bound whenever goal mode is on and are harmless no-ops outside a goal.
 
 ## Configuration
 

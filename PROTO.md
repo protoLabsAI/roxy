@@ -31,12 +31,26 @@ Everything below is the shared protoAgent runtime — unchanged.
   was retired in ADR 0023 and CI fails on it). Console is served from
   `apps/web/dist`; `/healthz` is the readiness probe.
 - **Isolated dev instance (don't stomp prod data):** `scripts/dev.sh` runs a
-  sandboxed instance via `PROTOAGENT_INSTANCE=dev` (ADR 0004 scoping) on `:7871` —
-  its own `config/dev/` + `~/.protoagent/{dev,*/dev}` data, **seeded from your
-  default config** (boots with your gateway, no re-setup) but with fresh, separate
-  chat/tasks/knowledge. The default instance (`config/` + `~/.protoagent`, `:7870`)
-  is untouched. `scripts/dev-reset.sh` wipes just the sandbox. Use this for feature
+  sandboxed instance via `PROTOAGENT_INSTANCE=dev` (ADR 0065 two-tier paths) on
+  `:7871` — its whole root is `~/.protoagent/dev/` (config + every store under it),
+  and it inherits the machine-wide **box** layer (`~/.protoagent/host-config.yaml`,
+  gateway/model defaults) so it boots configured with fresh, separate
+  chat/tasks/knowledge. The default instance is `~/.protoagent/default/` on `:7870`,
+  untouched. `scripts/dev-reset.sh` wipes just the sandbox. Use this for feature
   testing instead of the default instance.
+- **Factory-reset the default instance:** `scripts/reset.sh` wipes the **prod**
+  instance back to a clean slate (next boot runs the setup wizard) — for testing the
+  fresh-user flow via CLI (there is no in-app reset). **Always `--dry-run` first** to
+  read the plan. It's safe on a multi-instance machine: every *other* instance
+  (`~/.protoagent/<name>`, the dev sandbox, fleet members) and the machine-wide **box**
+  layer (`host-config.yaml`, `commons/`) are preserved. Flags: `--yes`, `--backup`,
+  `--keep-secrets` (keep gateway creds), `--include-dev`, `--force` (stop a bound
+  server first). *(Reset-script rewrite for the ADR-0065 single-subtree layout is a
+  follow-up; see [the env-vars gotcha](#house-rules--gotchas-that-bite).)*
+- **See where state lives:** `python -m server config explain` (or
+  `GET /api/config/explain`) prints this instance's id, both roots (box + instance),
+  every resolved path, and the per-field settings cascade with provenance (secrets
+  redacted) — the way to answer "where is my config / where did my key go".
 - **Python deps:** managed with `uv` (`pyproject.toml [project.dependencies]` is
   the source of truth; `uv.lock` is tracked). `uv sync` to install.
 - **Console deps:** `npm ci` at the repo root (npm workspaces; the web app is
@@ -59,11 +73,33 @@ before the PR, not after. CI is the merge gate; a red PR is wasted cycles.
 If a change is genuinely test-free (docs, config, pure refactor), say so
 explicitly in the PR description — but that is the exception, not the default.
 
+## Filing issues
+
+Issues are gated too — but only **flagged**, never blocked. The silent
+`issue-gate` workflow (`.github/workflows/issue-gate.yml`) labels any issue
+missing the required structure with **`needs-info`** (no comment) and removes it
+once you edit the issue to conform. Use the **Bug** / **Enhancement** issue forms
+— their required fields match the gate; a free-form issue needs at least a
+*Problem / What's-wrong* section, plus repro + evidence (bugs) or a
+proposed-direction / acceptance (enhancements). Intentional free-form → add the
+`gate-exempt` label. Full checklist: **[CONTRIBUTING.md](./CONTRIBUTING.md)**.
+
 ---
 
 ## House rules & gotchas that bite
 
 These are the failures that actually recur — read them before you edit.
+
+- **Instance paths are two-tier (box / instance) — one rule, resolve once (ADR 0065).**
+  Every on-disk location comes from `infra.paths.instance_paths()` (a frozen
+  `InstancePaths`): the **box** tier (`box_root` = `~/.protoagent` or `/sandbox`) holds
+  machine-shared state (`host-config.yaml`, `commons/`, heartbeats); the **instance**
+  tier (`instance_root`) holds this agent's config + every store. `instance_root =
+  PROTOAGENT_HOME | box_root/PROTOAGENT_INSTANCE | box_root/default`. **Don't** compute
+  store paths by hand or reach for the deleted `scope_leaf` / `PROTOAGENT_CONFIG_DIR`
+  (both retired — desktop/Docker/fleet now set `PROTOAGENT_HOME`); add a per-store
+  accessor or use `instance_paths().store("<name>")`. Identity comes from env only —
+  never config-file content. `config explain` prints the resolved layout.
 
 - **No unused variables.** ruff selects `F` (pyflakes); `F841` (assigned-but-
   unused) **fails CI** and `ruff check --fix` does **not** auto-fix it. Don't

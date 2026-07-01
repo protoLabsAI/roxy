@@ -1,46 +1,35 @@
 import "./chat.css";
-import { Empty } from "@protolabsai/ui/primitives";
+import { Badge, Button, Empty } from "@protolabsai/ui/primitives";
 import { Switch } from "@protolabsai/ui/forms";
-import {
-  Conversation,
-  Message,
-  MessageAction,
-  MessageActions,
-  PromptInput,
-  Reasoning,
-} from "@protolabsai/ui/ai";
+import { Conversation, Message, PromptInput } from "@protolabsai/ui/ai";
 import { TabBar } from "@protolabsai/ui/navigation";
-import {
-  Check,
-  Copy,
-  GitBranch,
-  Loader2,
-  RotateCcw,
-  TerminalSquare,
-} from "lucide-react";
+import { Check, TerminalSquare } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
+import type { MouseEvent as ReactMouseEvent } from "react";
 import { useQuery } from "@tanstack/react-query";
 
+import { openContextMenu } from "../contextMenu";
+import { useKbIntents } from "../keybindings/intents";
 import { api } from "../lib/api";
 import { errMsg } from "../lib/format";
 import { runtimeStatusQuery } from "../lib/queries";
 import { ConfirmDialog } from "@protolabsai/ui/overlays";
-import type { ChatMessage, HitlPayload, SlashCommand, ToolCall } from "../lib/types";
+import type { ChatMessage, ChatPart, HitlPayload, SlashCommand, SystemNoteTone, ToolCall } from "../lib/types";
 import { HitlForm } from "./HitlForm";
 import { notifyIfHidden } from "../lib/notify";
 import {
   chatStore,
   useChatState,
-  DEFAULT_REASONING_EFFORT,
-  REASONING_EFFORTS,
   effectiveReasoningEffort,
 } from "./chat-store";
-import { ChatComponent } from "./ChatComponent";
+import "./coreSlashCommands"; // registers /new, /clear, /effort via the slash-command seam (ADR 0061)
+import { findSlashCommand, registeredSlashCommands } from "../ext/slashRegistry";
+import { registeredComposerActions } from "../ext/composerRegistry";
+import { ChatMessageView } from "./ChatMessageView";
 import { ComposerModelSelect } from "./ComposerModelSelect";
-import { Markdown } from "./LazyMarkdown";
 import { filesFromTransfer, isLargePaste, pastedTextFile } from "./paste";
-import { ToolCalls } from "./ToolCalls";
-import { addToolRef, appendReasoning, appendText, toolsForGroup } from "./parts";
+import { inputHistory, pushInputHistory } from "./inputHistory";
+import { addComponent, addToolRef, appendReasoning, appendText } from "./parts";
 
 function messageId() {
   return `msg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
@@ -134,32 +123,91 @@ export function ChatSurface({
     chatStore.deleteSession(id);
   }
 
+  // Quick-delete: Shift+click a tab's ✕ → delete with NO confirm dialog and NO harvest.
+  // While Shift is held the ✕ shows as a red trashcan (the `--del` class → CSS) to signal it.
+  const [shiftDel, setShiftDel] = useState(false);
+  useEffect(() => {
+    const sync = (e: KeyboardEvent) => setShiftDel(e.shiftKey);
+    const clear = () => setShiftDel(false);
+    window.addEventListener("keydown", sync);
+    window.addEventListener("keyup", sync);
+    window.addEventListener("blur", clear);
+    return () => {
+      window.removeEventListener("keydown", sync);
+      window.removeEventListener("keyup", sync);
+      window.removeEventListener("blur", clear);
+    };
+  }, []);
+  // The DS TabBar's onClose always opens the confirm dialog, so intercept the close-button
+  // click in the CAPTURE phase (before the DS button's own onClick) when Shift is down and
+  // delete directly. Maps the clicked ✕ to its session by sibling index (DOM = sessions order).
+  function onTabBarClickCapture(e: ReactMouseEvent) {
+    if (!e.shiftKey) return;
+    const closeBtn = (e.target as HTMLElement).closest(".pl-tabbar__close");
+    if (!closeBtn) return;
+    const tabEl = closeBtn.closest(".pl-tabbar__tab") as HTMLElement | null;
+    if (!tabEl) return;
+    const tabs = Array.from((e.currentTarget as HTMLElement).querySelectorAll(".pl-tabbar__tab"));
+    const session = chat.sessions[tabs.indexOf(tabEl)];
+    if (!session) return;
+    e.preventDefault();
+    e.stopPropagation(); // beat the DS close button's onClick → no confirm dialog
+    closeSession(session.id, false); // false = no knowledge harvest
+  }
+
+  // Right-click a chat tab → context menu (ADR 0036). The DS TabBar exposes no per-tab
+  // context-menu hook, so we delegate from the tab-bar wrapper and map the clicked tab to its
+  // session by sibling index (DOM order tracks the `items` = sessions order). Close reuses the
+  // confirm dialog; Rename fires the TabBar's inline editor via a synthetic dblclick on the tab.
+  function onTabBarContextMenu(e: ReactMouseEvent) {
+    const tabEl = (e.target as HTMLElement).closest(".pl-tabbar__tab") as HTMLElement | null;
+    if (!tabEl) {
+      openContextMenu("chat-tab", e, { onNew: () => chatStore.createSession() });
+      return;
+    }
+    const tabs = Array.from((e.currentTarget as HTMLElement).querySelectorAll(".pl-tabbar__tab"));
+    const session = chat.sessions[tabs.indexOf(tabEl)];
+    if (!session) return;
+    openContextMenu("chat-tab", e, {
+      sessionId: session.id,
+      onNew: () => chatStore.createSession(),
+      onRename: () => tabEl.dispatchEvent(new MouseEvent("dblclick", { bubbles: true })),
+      onClose: () => setPendingClose(session.id),
+    });
+  }
+
   return (
-    <section className="panel stage-panel chat-stage" style={active ? undefined : { display: "none" }} aria-hidden={!active}>
+    <section className="panel stage-panel chat-stage" style={active ? undefined : { display: "none" }} aria-hidden={!active} data-kb-scope="chat">
       {/* DS TabBar (#832): a tab per session (status dot · title · close) + "+".
           Double-click a title to rename (TabBar owns the inline EditableText).
           `responsive` collapses to a DS-native <select> + add in a narrow panel
           (container query). The status dot rides the `icon` slot — wide-strip only:
           the collapsed <option> can't host markup, matching the old behavior. */}
-      <TabBar
-        ariaLabel="Chat sessions"
-        responsive
-        activeId={chat.currentSessionId ?? ""}
-        items={chat.sessions.map((session) => {
-          const status = chat.sessionStatusMap[session.id] || "idle";
-          return {
-            id: session.id,
-            label: session.title,
-            icon: <span className={`session-dot ${status}`} title={status} />,
-          };
-        })}
-        onSelect={(id) => chatStore.switchSession(id)}
-        onClose={(id) => setPendingClose(id)}
-        onRename={(id, label) => chatStore.renameSession(id, label)}
-        onReorder={(next) => chatStore.reorderSessions(next.map((t) => t.id))}
-        onAdd={() => chatStore.createSession()}
-        addLabel="New chat"
-      />
+      <div
+        className={`chat-tabbar-wrap${shiftDel ? " chat-tabbar-wrap--del" : ""}`}
+        onContextMenu={onTabBarContextMenu}
+        onClickCapture={onTabBarClickCapture}
+      >
+        <TabBar
+          ariaLabel="Chat sessions"
+          responsive
+          activeId={chat.currentSessionId ?? ""}
+          items={chat.sessions.map((session) => {
+            const status = chat.sessionStatusMap[session.id] || "idle";
+            return {
+              id: session.id,
+              label: session.title,
+              icon: <span className={`session-dot ${status}`} title={status} />,
+            };
+          })}
+          onSelect={(id) => chatStore.switchSession(id)}
+          onClose={(id) => setPendingClose(id)}
+          onRename={(id, label) => chatStore.renameSession(id, label)}
+          onReorder={(next) => chatStore.reorderSessions(next.map((t) => t.id))}
+          onAdd={() => chatStore.createSession()}
+          addLabel="New chat"
+        />
+      </div>
 
       <div className="chat-session-pool">
         {chat.activeSessions.map((sessionId) => (
@@ -242,6 +290,11 @@ function ChatSessionSlot({
   // Forwarded into the DS PromptInput (inputRef) — for slash-completion focus and
   // the Ctrl/⌘+Enter caret insert. The DS component owns the auto-grow.
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
+  // Terminal-style ↑/↓ history nav (#1496): position in the shared submitted-message ring
+  // (null = not navigating), and the live draft stashed when nav began (restored on ↓ past
+  // the newest). Refs, not state — they change alongside a setDraft, no separate re-render.
+  const histIndexRef = useRef<number | null>(null);
+  const histStashRef = useRef<string>("");
   // Autofocus the composer when this becomes the active session AND the chat surface is
   // the active rail surface — so clicking the Chat rail item (or switching tabs) lands
   // focus in the composer without a click. (`visible` alone is the active tab, which
@@ -249,6 +302,13 @@ function ChatSessionSlot({
   useEffect(() => {
     if (visible && surfaceActive) textareaRef.current?.focus();
   }, [visible, surfaceActive]);
+  // The global "focus composer" keybinding (ADR 0063 — `/`) bumps this nonce; only the
+  // VISIBLE + active slot grabs focus (others no-op), same gate as the autofocus above.
+  const composerFocusNonce = useKbIntents((s) => s.composerFocusNonce);
+  useEffect(() => {
+    if (composerFocusNonce && visible && surfaceActive) textareaRef.current?.focus();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [composerFocusNonce]);
   const status = chat.sessionStatusMap[sessionId] || "idle";
 
   // Pending file attachments. Each is uploaded to /api/knowledge/attach on pick;
@@ -260,11 +320,26 @@ function ChatSessionSlot({
   // straight to the model as multimodal parts; otherwise they take the pipeline.
   const { data: runtime } = useQuery(runtimeStatusQuery());
   const visionModel = Boolean(runtime?.model?.vision);
+  // A configured vision model can DESCRIBE images for a text-only chat model (#1381), so an
+  // image attaches via the pipeline instead of erroring.
+  const imageDescribe = Boolean(runtime?.model?.image_describe);
 
   async function uploadAttachment(file: File) {
     const id = messageId();
     const kind: "file" | "image" = file.type.startsWith("image/") ? "image" : "file";
     setAttachments((a) => [...a, { id, name: file.name, kind, status: "uploading" }]);
+
+    // An image on a text-only model with NO describe model can't be read at all (the file
+    // pipeline extracts text — no OCR) — so short-circuit with a clear, actionable error
+    // instead of a cryptic "unsupported file type" (#1374). When a describe model IS
+    // configured (#1381), the image falls through to the pipeline, which describes it.
+    if (kind === "image" && !visionModel && !imageDescribe) {
+      const msg =
+        "This model can't see images. Switch to a vision-capable model — or set an image-description model in Settings ▸ Knowledge — to send a screenshot.";
+      setAttachments((a) => a.map((x) => (x.id === id ? { ...x, status: "error", error: msg } : x)));
+      onError(msg);
+      return;
+    }
 
     // Native vision: a vision model sees the image directly — base64 it and send
     // it as a multimodal part, no pipeline round-trip.
@@ -325,11 +400,11 @@ function ChatSessionSlot({
   const slashMatches = useMemo(() => {
     if (slashQuery === null) return [];
     const q = slashQuery.toLowerCase();
-    // Deterministic client-side commands (ADR 0057) surface first, then server skills.
+    // Client-side commands (ADR 0061) surface first, then server skills. The client set
+    // comes from the slash-command registry — core (/new, /clear, /effort) AND any fork-
+    // registered commands — so neither is hardcoded here.
     const all: SlashCommand[] = [
-      { name: "new", description: "Open a new chat tab" },
-      { name: "clear", description: "Clear this chat's history" },
-      { name: "effort", description: "Reasoning effort: low | medium | high | max | off" },
+      ...registeredSlashCommands().map((c) => ({ name: c.name, description: c.description, usage: c.usage })),
       ...commands,
     ];
     return all.filter(
@@ -340,52 +415,38 @@ function ChatSessionSlot({
   const slashActive = slashMatches.length > 0;
   const slashSel = slashActive ? Math.min(slashIndex, slashMatches.length - 1) : 0;
 
-  // A local-only system note in the thread (e.g. /effort confirmation) — never sent
-  // to the agent, just shown so the operator sees the command took effect.
-  function noteToThread(text: string) {
+  // Post a local SYSTEM NOTE to the thread (e.g. a /effort confirmation, a status line, a
+  // warning) — never sent to the agent, just shown so the operator sees a local action took
+  // effect. role "system" so it renders distinctly and never gets the answer action row
+  // (copy/fork/regenerate). `tone` colours it (info/warning/danger/success). This is the reusable
+  // seam for any non-agent in-thread notice — exposed to forks via the slash/composer registries.
+  function noteToThread(text: string, opts?: { tone?: SystemNoteTone }) {
     if (!session) return;
     const base = chatStore.getSnapshot().sessions.find((s) => s.id === session.id)?.messages ?? [];
     chatStore.updateMessages(session.id, [
       ...base,
-      { id: messageId(), role: "assistant", content: text, createdAt: Date.now(), status: "done" },
+      { id: messageId(), role: "system", content: text, noteTone: opts?.tone, createdAt: Date.now(), status: "done" },
     ]);
   }
 
-  // Deterministic client-side commands (ADR 0057) — run locally, never sent to the
-  // agent. `/new` opens + focuses a fresh tab; `/clear` wipes THIS tab's history
-  // (server checkpoint + transcript), keeping the tab; `/effort <level>` sets this
-  // tab's reasoning effort (sent with each turn). `raw` is the command minus the
-  // slash, e.g. "effort high". Returns true if handled.
+  // Dispatch a CLIENT-SIDE slash command through the registry (ADR 0061) — run locally,
+  // never sent to the agent. A registered `/<verb>` CLAIMS the token (the frontend twin of
+  // the backend's `register_chat_command`): we build the SlashContext from local state +
+  // invoke its handler. `raw` is the command minus the slash, e.g. "effort high". Returns
+  // true if a command handled it (caller clears the draft + skips the send); false ⇒ not a
+  // client command (fall through to the server / draft path). Core commands (/new, /clear,
+  // /effort) and any fork-registered commands flow through here identically.
   function runClientSlash(raw: string): boolean {
     const [verb, ...rest] = raw.split(/\s+/);
-    const arg = rest.join(" ").trim().toLowerCase();
-    if (verb === "new") {
-      chatStore.createSession();
-      textareaRef.current?.focus();
-      return true;
-    }
-    if (verb === "clear" && session) {
-      void api.deleteChatSession(session.id, false).catch(() => {});
-      chatStore.updateMessages(session.id, []);
-      textareaRef.current?.focus();
-      return true;
-    }
-    if (verb === "effort" && session) {
-      const opts = REASONING_EFFORTS.join(" · ");
-      if (!arg) {
-        const cur = session.reasoningEffort ?? `${DEFAULT_REASONING_EFFORT} (default)`;
-        noteToThread(`⚙ Reasoning effort: **${cur}**. Set it with \`/effort ${REASONING_EFFORTS.join("|")}\`.`);
-      } else if ((REASONING_EFFORTS as readonly string[]).includes(arg)) {
-        chatStore.setSessionReasoningEffort(session.id, arg);
-        const off = arg === "off" ? " — reasoning disabled for this tab" : "";
-        noteToThread(`⚙ Reasoning effort set to **${arg}**${off}. Applies to the next message.`);
-      } else {
-        noteToThread(`⚠ Unknown effort \`${arg}\`. Options: ${opts}.`);
-      }
-      textareaRef.current?.focus();
-      return true;
-    }
-    return false;
+    const cmd = findSlashCommand(verb);
+    if (!cmd) return false;
+    return cmd.run({
+      rest: rest.join(" ").trim(),
+      sessionId: session?.id ?? null,
+      noteToThread,
+      setDraft,
+      focusComposer: () => textareaRef.current?.focus(),
+    });
   }
 
   function completeCommand(cmd: SlashCommand) {
@@ -426,6 +487,53 @@ function ChatSessionSlot({
         event.preventDefault();
         setSlashDismissed(true);
         return;
+      }
+    }
+    // Terminal-style input history (#1496): ↑ recalls the previous submitted message when the
+    // caret is on the FIRST line; ↓ walks back toward the live draft when on the LAST line — so
+    // multi-line editing keeps normal caret movement and history only triggers at the edges.
+    // (Bare arrows only — a modifier means a tab-jump / caret combo, not history.)
+    if (
+      (event.key === "ArrowUp" || event.key === "ArrowDown") &&
+      !event.metaKey && !event.ctrlKey && !event.altKey && !event.shiftKey
+    ) {
+      const ta = textareaRef.current;
+      const hist = inputHistory();
+      if (ta && hist.length) {
+        const caret = ta.selectionStart ?? 0;
+        const onFirstLine = draft.slice(0, caret).indexOf("\n") === -1;
+        const onLastLine = draft.slice(ta.selectionEnd ?? caret).indexOf("\n") === -1;
+        const recall = (val: string) => {
+          setDraft(val);
+          // caret to end so the next keystroke edits the recalled text (readline behaviour)
+          requestAnimationFrame(() => {
+            const t = textareaRef.current;
+            if (t) t.selectionStart = t.selectionEnd = val.length;
+          });
+        };
+        if (event.key === "ArrowUp" && onFirstLine) {
+          event.preventDefault();
+          if (histIndexRef.current === null) {
+            histStashRef.current = draft; // remember the in-progress draft
+            histIndexRef.current = hist.length - 1;
+          } else if (histIndexRef.current > 0) {
+            histIndexRef.current -= 1;
+          }
+          recall(hist[histIndexRef.current]);
+          return;
+        }
+        if (event.key === "ArrowDown" && histIndexRef.current !== null && onLastLine) {
+          event.preventDefault();
+          histIndexRef.current += 1;
+          if (histIndexRef.current > hist.length - 1) {
+            histIndexRef.current = null; // walked past the newest → restore the stashed draft
+            recall(histStashRef.current);
+            histStashRef.current = "";
+          } else {
+            recall(hist[histIndexRef.current]);
+          }
+          return;
+        }
       }
     }
     if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) {
@@ -524,6 +632,9 @@ function ChatSessionSlot({
   async function send() {
     if (!session || !canSend) return;
     const text = draft.trim();
+    pushInputHistory(text); // record for ↑/↓ recall, then reset nav to the newest
+    histIndexRef.current = null;
+    histStashRef.current = "";
     setDraft("");
     // Deterministic client-side slash commands (ADR 0057) — handled locally, not sent.
     if (text.startsWith("/") && runClientSlash(text.slice(1).trim())) return;
@@ -540,7 +651,7 @@ function ChatSessionSlot({
     // user bubble shows only the typed text + a 📎 list (never a raw doc/data dump).
     const sent = [...piped.map((a) => a.context as string), text].join("\n\n").trim();
     const names = [...piped, ...nativeImgs].map((a) => a.name).join(", ");
-    const display = text ? `${text}\n\n📎 ${names}` : `📎 ${names}`;
+    const display = text ? `${text}\n\nAttached: ${names}` : `Attached: ${names}`;
     setAttachments([]);
     void runTurn(display, { sendAs: sent, images });
   }
@@ -551,6 +662,9 @@ function ChatSessionSlot({
   async function queueSteer() {
     const text = draft.trim();
     if (!session || !text) return;
+    pushInputHistory(text); // steered messages join the same recall ring
+    histIndexRef.current = null;
+    histStashRef.current = "";
     const id = messageId();
     setDraft("");
     setSteerQueue([...steerQueueRef.current, { id, text }]);
@@ -722,12 +836,40 @@ function ChatSessionSlot({
     // just noise. A form/question answer IS meaningful content, so those stay visible.
     const silent = hitl?.kind === "approval";
     setHitl(null);
-    void runTurn(typeof response === "string" ? response : JSON.stringify(response), { hidden: silent });
+    // For an approval resume, CONTINUE the original assistant message (the one that paused) so the
+    // pre- and post-approval tool cards live in ONE bubble / one WorkBlock — otherwise they split
+    // across two message bubbles with a gap between them. Forms/questions keep the new-bubble path
+    // (their answer is meaningful conversation).
+    void runTurn(
+      typeof response === "string" ? response : JSON.stringify(response),
+      silent ? { hidden: true, resumeMessageId: lastAssistantId } : {},
+    );
+  }
+
+  // Dismiss a paused (input-required) form/question WITHOUT answering it. Clearing the card
+  // alone would leave the task parked in input-required forever — that state is exempt from
+  // the server TTL sweep, so the LangGraph thread would never settle. Instead RESUME the turn
+  // with an explicit "dismissed" sentinel so the agent continues and the task reaches a
+  // terminal state. A dismissal isn't conversation content, so resume silently and continue
+  // the paused assistant message (matching the approval-resume path) rather than minting a
+  // new bubble.
+  async function dismissHitl() {
+    setHitl(null);
+    void runTurn(
+      "[dismissed] The operator dismissed this request without providing input. Continue " +
+        "without it — proceed using your best judgment, or stop and explain what you need.",
+      { hidden: true, resumeMessageId: lastAssistantId },
+    );
   }
 
   async function runTurn(
     content: string,
-    opts: { hidden?: boolean; sendAs?: string; images?: { b64: string; mime: string; name: string }[] } = {},
+    opts: {
+      hidden?: boolean;
+      sendAs?: string;
+      images?: { b64: string; mime: string; name: string }[];
+      resumeMessageId?: string;
+    } = {},
   ) {
     if (!session || !content) return;
     // `sendAs` (attachment context prepended) is what the MODEL receives; `content`
@@ -740,7 +882,11 @@ function ChatSessionSlot({
       createdAt: Date.now(),
       status: "done",
     };
-    const assistantId = messageId();
+    // On an approval resume, CONTINUE the original assistant message (`resumeMessageId`) instead of
+    // minting a fresh bubble — so the pre- and post-approval tool cards extend ONE message / one
+    // WorkBlock with no inter-bubble gap. Otherwise mint a new assistant message as usual.
+    const resuming = opts.resumeMessageId != null;
+    const assistantId = opts.resumeMessageId ?? messageId();
     const assistant: ChatMessage = {
       id: assistantId,
       role: "assistant",
@@ -758,9 +904,14 @@ function ChatSessionSlot({
       chatStore.getSnapshot().sessions.find((s) => s.id === session.id)?.messages ?? messages;
     // `hidden` (an approval resume, or a regenerate) sends `content` to the server but
     // omits the user bubble — the agent still receives it, the chat just doesn't show it.
+    // A resume flips the SAME assistant message back to streaming (keeping its parts/toolCalls).
     chatStore.updateMessages(
       session.id,
-      opts.hidden ? [...base, assistant] : [...base, userMessage, assistant],
+      resuming
+        ? base.map((m) => (m.id === assistantId ? { ...m, status: "streaming" } : m))
+        : opts.hidden
+          ? [...base, assistant]
+          : [...base, userMessage, assistant],
     );
     chatStore.setSessionStatus(session.id, "streaming");
     onError("");
@@ -850,6 +1001,10 @@ function ChatSessionSlot({
           );
         },
         onToolCall: (evt) => {
+          // `show_component` is a render directive, not a real action — its output IS the
+          // inline component (delivered via onComponent / message.components). Suppress its
+          // tool card so it doesn't add noise to the collapsed work timeline (#1323).
+          if (evt.name === "show_component") return;
           const latest = chatStore.getSnapshot().sessions.find((item) => item.id === session.id);
           if (!latest) return;
           chatStore.updateMessages(
@@ -864,9 +1019,10 @@ function ChatSessionSlot({
               // so they don't get their own block.
               let nextParts = message.parts;
               if (evt.phase === "start") {
-                // A tool that starts while a `task` is still running is a child
-                // of that subagent delegation — nest it. (Last open task wins,
-                // so nested task() calls group correctly.)
+                // Nest a subagent's own tool under its `task` card. The server tags the
+                // child frame with the parent delegation's id (authoritative — works even
+                // though the task's end races AHEAD of the child); fall back to "last open
+                // task wins" only for older servers that don't send it.
                 const openTask = [...calls]
                   .reverse()
                   .find((c) => c.name === "task" && c.status === "running" && c.id !== evt.id);
@@ -876,7 +1032,7 @@ function ChatSessionSlot({
                   input: evt.input,
                   status: "running",
                   startedAt: now,
-                  parentId: openTask?.id,
+                  parentId: evt.parentId ?? openTask?.id,
                 };
                 if (idx >= 0) calls[idx] = { ...calls[idx], ...card };
                 else calls.push(card);
@@ -901,16 +1057,45 @@ function ChatSessionSlot({
           );
         },
         onComponent: (spec) => {
-          // A renderable component (ADR 0051) — append to the assistant message; the
-          // registry renders it inline after the text.
+          // A renderable component (ADR 0051) — add it as an ORDERED part at its emission
+          // point so it renders ABOVE the answer text that streams in after (#1323). `components`
+          // is kept as the history/persistence fallback for messages without ordered parts.
           const latest = chatStore.getSnapshot().sessions.find((item) => item.id === session.id);
           if (!latest) return;
           chatStore.updateMessages(
             session.id,
             latest.messages.map((message) =>
               message.id === assistantId
-                ? { ...message, components: [...(message.components || []), spec] }
+                ? {
+                    ...message,
+                    parts: addComponent(message.parts, spec),
+                    components: [...(message.components || []), spec],
+                  }
                 : message,
+            ),
+          );
+        },
+        onCost: (usage) => {
+          // This turn's token/cost readout (terminal cost-v1) — pin it to the assistant
+          // message so the per-turn footer survives reload with the rest of the message.
+          const latest = chatStore.getSnapshot().sessions.find((item) => item.id === session.id);
+          if (!latest) return;
+          chatStore.updateMessages(
+            session.id,
+            latest.messages.map((message) =>
+              message.id === assistantId ? { ...message, usage } : message,
+            ),
+          );
+        },
+        onContext: (contextWindow) => {
+          // This turn's context-window fill + compaction threshold (terminal context-v1) —
+          // pinned to the message so the footer meter persists with history.
+          const latest = chatStore.getSnapshot().sessions.find((item) => item.id === session.id);
+          if (!latest) return;
+          chatStore.updateMessages(
+            session.id,
+            latest.messages.map((message) =>
+              message.id === assistantId ? { ...message, contextWindow } : message,
             ),
           );
         },
@@ -939,7 +1124,14 @@ function ChatSessionSlot({
             }),
           );
         },
-      }, { images: opts.images, model: session.model, reasoningEffort: effectiveReasoningEffort(session) });
+      }, {
+        images: opts.images,
+        model: session.model,
+        reasoningEffort: effectiveReasoningEffort(session),
+        // Read live (not the render-closure session) so an "Approve & don't ask again" that
+        // flips bypass on right before this resume turn is carried by it.
+        bypassPermissions: chatStore.getSnapshot().sessions.find((s) => s.id === session.id)?.bypassPermissions,
+      });
       chatStore.setSessionStatus(session.id, "idle");
       setStatusMessage("idle");
       void reconcileSteer();
@@ -993,92 +1185,19 @@ function ChatSessionSlot({
           <Empty icon={<TerminalSquare />} description="No messages in this session." />
         ) : (
           messages.map((message) => (
-            <Message
+            <ChatMessageView
               key={message.id || `${message.role}-${message.createdAt}`}
-              role={message.role}
-              streaming={message.status === "streaming"}
-            >
-              {message.reasoning && !(message.parts && message.parts.length) ? (
-                // History-loaded turns have no ordered parts — fall back to the flat
-                // collapsible "thinking" block (open while still reasoning, auto-collapses
-                // once the answer starts). Live turns render reasoning inline via parts.
-                <Reasoning surface="subtle" streaming={message.status === "streaming" && !message.content}>
-                  {message.reasoning}
-                </Reasoning>
-              ) : null}
-              {message.parts && message.parts.length ? (
-                // Live turns: reasoning, text runs and tool groups in emission order, so a
-                // pre-tool preamble renders above the cards, the answer below them, and
-                // "thinking" inline next to the step it precedes.
-                message.parts.map((part, i, arr) =>
-                  part.kind === "tools" ? (
-                    <ToolCalls key={i} calls={toolsForGroup(part.ids, message.toolCalls)} onCancelDelegation={cancelDelegation} />
-                  ) : part.kind === "reasoning" ? (
-                    part.text.trim() ? (
-                      // Stream the animation only on the trailing run (thinking in progress).
-                      <Reasoning key={i} surface="subtle" streaming={message.status === "streaming" && i === arr.length - 1}>
-                        {part.text}
-                      </Reasoning>
-                    ) : null
-                  ) : part.text.trim() ? (
-                    message.role === "user" ? (
-                      <span className="chat-user-text" key={i}>{part.text}</span>
-                    ) : (
-                      // assistant + system carry markdown; only the user's own input stays literal.
-                      <Markdown key={i}>{part.text}</Markdown>
-                    )
-                  ) : null,
-                )
-              ) : (
-                // History-loaded messages have no ordered parts — keep the grouped layout
-                // (tool cards above the text; order isn't recoverable from storage).
-                <>
-                  {message.toolCalls && message.toolCalls.length > 0 ? (
-                    <ToolCalls calls={message.toolCalls} onCancelDelegation={cancelDelegation} />
-                  ) : null}
-                  {message.content ? (
-                    message.role === "user" ? (
-                      <span className="chat-user-text">{message.content}</span>
-                    ) : (
-                      <Markdown>{message.content}</Markdown>
-                    )
-                  ) : null}
-                </>
-              )}
-              {message.status === "streaming"
-                && !(message.parts && message.parts.length)
-                && !message.content
-                && !(message.toolCalls && message.toolCalls.length)
-                && !(message.components && message.components.length)
-                && !message.reasoning
-                ? <Loader2 className="spin" size={15} />
-                : null}
-              {message.components && message.components.length > 0
-                ? message.components.map((spec, i) => <ChatComponent key={i} spec={spec} />)
-                : null}
-              {message.role === "assistant" && message.status !== "streaming" && message.content ? (
-                <MessageActions>
-                  <MessageAction
-                    label={copiedId === message.id ? "Copied" : "Copy"}
-                    icon={copiedId === message.id ? <Check size={14} /> : <Copy size={14} />}
-                    onClick={() => copyMessage(message)}
-                  />
-                  <MessageAction
-                    label="Fork from here"
-                    icon={<GitBranch size={14} />}
-                    onClick={() => forkAtMessage(message)}
-                  />
-                  {message.id === lastAssistantId ? (
-                    <MessageAction
-                      label="Regenerate"
-                      icon={<RotateCcw size={14} />}
-                      disabled={status === "streaming"}
-                      onClick={() => regenerate(message.id)}
-                    />
-                  ) : null}
-                </MessageActions>
-              ) : null}
-            </Message>
+              message={message}
+              onCancelDelegation={cancelDelegation}
+              actions={{
+                copiedId,
+                onCopy: copyMessage,
+                onFork: forkAtMessage,
+                onRegenerate: regenerate,
+                lastAssistantId,
+                regenDisabled: status === "streaming",
+              }}
+            />
           ))
         )}
         {steerQueue.map((q) => (
@@ -1103,7 +1222,15 @@ function ChatSessionSlot({
           payload={hitl}
           busy={status === "streaming"}
           onSubmit={resumeHitl}
-          onCancel={() => setHitl(null)}
+          onCancel={dismissHitl}
+          onApproveAlways={
+            hitl.kind === "approval" && session
+              ? () => {
+                  chatStore.setSessionBypassPermissions(session.id, true); // turn bypass on for this tab
+                  void resumeHitl("approved"); // …and approve the pending command
+                }
+              : undefined
+          }
         />
       )}
 
@@ -1133,6 +1260,7 @@ function ChatSessionSlot({
           onChange={(v) => {
             setDraft(v);
             setSlashDismissed(false); // re-open the menu when the input changes
+            histIndexRef.current = null; // typing detaches from history nav (readline)
           }}
           // Idle → send. While a turn streams (`busy`), the field stays live: Enter
           // queues a steer into the running turn (onQueue) without stopping it, and
@@ -1144,7 +1272,7 @@ function ChatSessionSlot({
           placeholder={
             status === "streaming"
               ? "Steer the agent — your message folds into its work at the next step (Enter to queue)"
-              : "Message protoAgent  (/ for commands · Enter to send · ⌘/Ctrl+Enter for newline)"
+              : "Message protoAgent  (/ for commands · Enter to send · ↑ history · ⌘/Ctrl+Enter for newline)"
           }
           inputRef={textareaRef}
           onKeyDown={onComposerKeyDown}
@@ -1170,7 +1298,42 @@ function ChatSessionSlot({
           onAttach={() => fileInputRef.current?.click()}
           // The model picker lives in the DS composer's actions slot (ADR 0048 / the
           // ComposerWithAttachments DS pattern) — replaces the separate chip below.
-          actions={<ComposerModelSelect />}
+          // Fork-registered composer actions (ADR 0061) render alongside it.
+          actions={
+            <>
+              {registeredComposerActions().map((a) => (
+                <Button
+                  key={a.id}
+                  type="button"
+                  variant="ghost"
+                  size="sm"
+                  aria-label={a.label}
+                  title={a.label}
+                  onClick={() =>
+                    a.run({
+                      sessionId: session?.id ?? null,
+                      setDraft,
+                      focusComposer: () => textareaRef.current?.focus(),
+                      noteToThread,
+                    })
+                  }
+                >
+                  {a.icon}
+                </Button>
+              ))}
+              <ComposerModelSelect />
+              {session?.bypassPermissions ? (
+                <button
+                  type="button"
+                  className="composer-bypass-toggle"
+                  title="Bypass permissions is ON for this tab — run_command runs WITHOUT approval. Click to turn it off."
+                  onClick={() => chatStore.setSessionBypassPermissions(session.id, false)}
+                >
+                  <Badge status="warning">bypass on</Badge>
+                </button>
+              ) : null}
+            </>
+          }
           attachments={attachments.map((a) => ({
             id: a.id,
             name: a.name,

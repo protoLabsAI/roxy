@@ -172,6 +172,14 @@ SDK** directly — `from graph.sdk import …`, the *stable* surface plugins cal
   completion (vs `host.invoke`, which runs a full lead-agent *chat turn*).
 - `subagent_types()` — the configured subagent ids.
 - `config()` — the live `LangGraphConfig`.
+- `run_in_session(session_id, prompt, *, delay_seconds=0, job_id=None)` — enqueue a
+  **non-blocking one-shot agent turn** in a session (that session's memory + full tools).
+  The primitive behind "when a goal fires, prompt the agent" — call it from a
+  `register_goal_hook` reaction. See [Goal mode ▸ Reacting to a goal](/guides/goal-mode#reacting-to-a-goal).
+- `create_watch(*, condition, verifier, run_prompt=…, …)` — register a **watch** (ADR 0067):
+  poll `condition` on a cadence, and on met run `run_prompt` as a follow-up turn
+  (`run_in_session`) + fire `on_met` hooks. Plugin-verifier only; hold **many** at once (unlike
+  a monitor goal). Pair with `registry.register_watch_hook(on_met/on_expired/on_stalled=…)`.
 
 The **workflows plugin** (`plugins/workflows`) is the reference consumer: its engine
 injects `run_subagent` as the per-step runner. This is the pattern for plugins that tap

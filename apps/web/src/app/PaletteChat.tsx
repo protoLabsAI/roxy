@@ -4,37 +4,45 @@
 // handlers. ONE preserved thread per agent (stable contextId + persisted transcript,
 // see paletteChatStore) — `/clear` wipes it (transcript + server checkpoint).
 import { useEffect, useRef, useState } from "react";
-import { Loader2 } from "lucide-react";
-import { Conversation, Message, PromptInput, Reasoning } from "@protolabsai/ui/ai";
-import { Markdown } from "../chat/LazyMarkdown";
-import { ToolCalls } from "../chat/ToolCalls";
-import { ChatComponent } from "../chat/ChatComponent";
+import { Conversation, Message, PromptInput } from "@protolabsai/ui/ai";
+import { ChatMessageView } from "../chat/ChatMessageView";
+import { addToolRef, appendReasoning, appendText } from "../chat/parts";
 import { api } from "../lib/api";
 import { chatStore, effectiveReasoningEffort } from "../chat/chat-store";
 import type { ChatMessage, ToolCall, ToolEvent } from "../lib/types";
 import { freshPaletteThread, loadPaletteThread, savePaletteThread } from "./paletteChatStore";
 import "../chat/chat.css"; // .markdown / .tool-calls / .chat-user-text / .slash-menu styles
 
-// Upsert a streaming tool event onto a message's toolCalls (mirrors ChatSurface's
-// onToolCall): start → a running card (nested under the last open `task`); end → flip
-// the matching card to done/error and stamp elapsed.
+// Upsert a streaming tool event onto a message's toolCalls AND its ordered `parts`
+// (mirrors ChatSurface's onToolCall): start → a running card (nested under its parent
+// `task` — authoritative `evt.parentId`, else last-open-task), and a top-level tool
+// opens/extends a `tools` part in emission order so text↔tool interleave renders live;
+// end → flip the matching card to done/error and stamp elapsed.
 function upsertTool(message: ChatMessage, evt: ToolEvent): ChatMessage {
   const calls = [...(message.toolCalls || [])];
   const idx = calls.findIndex((c) => c.id === evt.id);
   const now = Date.now();
+  let nextParts = message.parts;
   if (evt.phase === "start") {
     const openTask = [...calls].reverse().find((c) => c.name === "task" && c.status === "running" && c.id !== evt.id);
-    const card: ToolCall = { id: evt.id, name: evt.name, input: evt.input, status: "running", startedAt: now, parentId: openTask?.id };
+    const parentId = evt.parentId ?? openTask?.id;
+    const card: ToolCall = { id: evt.id, name: evt.name, input: evt.input, status: "running", startedAt: now, parentId };
     if (idx >= 0) calls[idx] = { ...calls[idx], ...card };
     else calls.push(card);
+    // Children (parentId set) nest under their parent's card — only top-level tools get a block.
+    if (parentId == null) nextParts = addToolRef(message.parts, evt.id);
   } else {
     const startedAt = idx >= 0 ? calls[idx].startedAt : undefined;
     const durationMs = startedAt !== undefined ? now - startedAt : undefined;
     const endStatus: ToolCall["status"] = evt.error ? "error" : "done";
-    if (idx >= 0) calls[idx] = { ...calls[idx], output: evt.output, status: endStatus, durationMs };
-    else calls.push({ id: evt.id, name: evt.name, output: evt.output, status: endStatus });
+    if (idx >= 0) {
+      calls[idx] = { ...calls[idx], output: evt.output, status: endStatus, durationMs };
+    } else {
+      calls.push({ id: evt.id, name: evt.name, output: evt.output, status: endStatus });
+      nextParts = addToolRef(message.parts, evt.id);
+    }
   }
-  return { ...message, toolCalls: calls };
+  return { ...message, toolCalls: calls, parts: nextParts };
 }
 
 // Finalize a completed turn — no tool can still be "running" (mirrors onDone).
@@ -59,16 +67,68 @@ export function PaletteChat({ agentName }: { agentName: string }) {
   const abortRef = useRef<AbortController | null>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const contextRef = useRef(boot.contextId); // stable A2A contextId (= thread_id server-side)
+  const messagesRef = useRef(messages); // latest, for the unmount flush + self-heal
+  messagesRef.current = messages;
 
   // Focus the composer on open AND after each turn settles (streaming → false).
   useEffect(() => {
     if (!streaming) inputRef.current?.focus();
   }, [streaming]);
-  useEffect(() => () => abortRef.current?.abort(), []);
+  // On close (unmount) the palette abandons the live stream, but the backend turn keeps
+  // running (durable A2A task). Flush the transcript IMMEDIATELY so the in-flight
+  // assistant message + its taskId are on disk before the debounce would fire — the
+  // self-heal below reconnects to it on reopen. Abort last (it can't race the flush).
+  useEffect(
+    () => () => {
+      savePaletteThread({ contextId: contextRef.current, messages: messagesRef.current }, true);
+      abortRef.current?.abort();
+    },
+    [],
+  );
   // Preserve the thread (debounced) — survives close/reopen and reload.
   useEffect(() => {
     savePaletteThread({ contextId: contextRef.current, messages });
   }, [messages]);
+
+  // Reconnect an interrupted turn (ADR 0057 durability). Runs once per open: if the last
+  // assistant message is stuck "streaming" with a durable taskId — the palette was closed
+  // mid-turn — reconcile it against the server's A2A task (tasks/get), finalizing when
+  // terminal and polling briefly while it's genuinely still running. Mirrors ChatSurface's
+  // self-heal so a reopened palette shows the turn still running, or its finished result.
+  useEffect(() => {
+    if (abortRef.current) return; // a live turn in this session owns the stream
+    const last = messagesRef.current[messagesRef.current.length - 1];
+    if (!last || last.role !== "assistant" || last.status !== "streaming" || !last.taskId) return;
+    const taskId = last.taskId;
+    const TERMINAL = /completed|failed|canceled|cancelled/i;
+    let cancelled = false;
+    let polls = 0;
+    const MAX_POLLS = 40; // ~2 min at 3s, then unlock and let the next open re-poll
+    setStreaming(true); // lock the composer like a live turn while we reconcile
+    async function tick() {
+      if (cancelled) return;
+      let res: { state: string; text: string };
+      try {
+        res = await api.getTask(taskId);
+      } catch {
+        return; // best-effort — leave it for the next open to retry
+      }
+      if (cancelled) return;
+      if (!res.state || TERMINAL.test(res.state)) {
+        const failed = /fail|cancel/i.test(res.state);
+        update((m) => ({ ...finalize(m), content: res.text || m.content, status: failed ? "error" : "done" }));
+        setStreaming(false);
+        return;
+      }
+      if (++polls < MAX_POLLS) setTimeout(tick, 3000);
+      else setStreaming(false);
+    }
+    void tick();
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const update = (fn: (m: ChatMessage) => ChatMessage) =>
     setMessages((ms) => {
@@ -98,7 +158,7 @@ export function PaletteChat({ agentName }: { agentName: string }) {
     setMessages((ms) => [
       ...ms,
       { role: "user", content },
-      { role: "assistant", content: "", status: "streaming", toolCalls: [], components: [], reasoning: "" },
+      { role: "assistant", content: "", status: "streaming", toolCalls: [], components: [], reasoning: "", parts: [] },
     ]);
     setDraft("");
     setStreaming(true);
@@ -113,18 +173,24 @@ export function PaletteChat({ agentName }: { agentName: string }) {
         contextRef.current,
         {
           signal: controller.signal,
-          onText: (t, append) => update((m) => ({ ...m, content: append ? m.content + t : t })),
-          onReasoning: (d) => update((m) => ({ ...m, reasoning: (m.reasoning ?? "") + d })),
+          // Pin the server task id to the streaming message so a palette closed mid-turn
+          // can reconnect to it on reopen (the self-heal above). Persisted via the messages
+          // effect + the unmount flush.
+          onTaskId: (id) => update((m) => ({ ...m, taskId: id })),
+          onText: (t, append) =>
+            update((m) => ({ ...m, content: append ? m.content + t : t, parts: appendText(m.parts, t, append) })),
+          onReasoning: (d) =>
+            update((m) => ({ ...m, reasoning: (m.reasoning ?? "") + d, parts: appendReasoning(m.parts, d) })),
           onToolCall: (evt) => update((m) => upsertTool(m, evt)),
           onComponent: (spec) => update((m) => ({ ...m, components: [...(m.components ?? []), spec] })),
-          onFailed: (detail) => update((m) => ({ ...m, content: m.content || `⚠️ ${detail}`, status: "error" })),
+          onFailed: (detail) => update((m) => ({ ...m, content: m.content || detail, status: "error" })),
           onDone: () => update(finalize),
         },
         { model, reasoningEffort: effectiveReasoningEffort(sess) },
       );
     } catch (e) {
       if (!controller.signal.aborted) {
-        update((m) => ({ ...m, content: m.content || `⚠️ ${(e as Error).message || "Chat failed."}`, status: "error" }));
+        update((m) => ({ ...m, content: m.content || (e as Error).message || "Chat failed.", status: "error" }));
       }
     } finally {
       setStreaming(false);
@@ -135,8 +201,6 @@ export function PaletteChat({ agentName }: { agentName: string }) {
 
   const stop = () => abortRef.current?.abort();
   const empty = messages.length === 0;
-  const last = messages.length - 1;
-
   // Minimal slash menu — `/clear` hint while the draft starts with "/".
   const slashMatches = draft.startsWith("/")
     ? SLASH.filter((c) => c.name.startsWith(draft.slice(1).toLowerCase()))
@@ -153,28 +217,12 @@ export function PaletteChat({ agentName }: { agentName: string }) {
             <span style={{ color: "var(--pl-color-fg-muted)" }}>Ask {agentName} anything. /clear wipes this thread.</span>
           </Message>
         ) : null}
-        {messages.map((m, i) => {
-          const isStreaming = m.status === "streaming" && i === last;
-          if (m.role === "user") {
-            return (
-              <Message key={i} role="user">
-                <span className="chat-user-text">{m.content}</span>
-              </Message>
-            );
-          }
-          return (
-            <Message key={i} role={m.role} streaming={isStreaming}>
-              {m.reasoning ? <Reasoning surface="subtle" streaming={isStreaming && !m.content}>{m.reasoning}</Reasoning> : null}
-              {m.toolCalls && m.toolCalls.length ? <ToolCalls calls={m.toolCalls} /> : null}
-              {m.content ? (
-                <Markdown>{m.content}</Markdown>
-              ) : isStreaming && !m.toolCalls?.length && !m.reasoning ? (
-                <Loader2 className="spin" size={16} />
-              ) : null}
-              {m.components?.map((s, j) => <ChatComponent key={j} spec={s} />)}
-            </Message>
-          );
-        })}
+        {messages.map((m, i) => (
+          // Shared renderer (ADR 0035) — the SAME message tree as the main chat (reasoning,
+          // tools, content, components, the report card), so the ⌘K chat never drifts. No
+          // per-message action row (transient quick-chat). Streaming is read from m.status.
+          <ChatMessageView key={i} message={m} />
+        ))}
       </Conversation>
       <PromptInput
         value={draft}

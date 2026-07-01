@@ -11,7 +11,624 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Chat composer: terminal-style input history** (#1496). Press **↑** to recall previously-sent
+  messages into the composer (newest first), **↓** to walk back toward your in-progress draft — just
+  like a shell. Recalled messages are editable before resending; history only triggers at the top/bottom
+  line so multi-line editing keeps normal caret movement. The last 100 messages persist across reloads
+  (localStorage), shared across chat slots.
+- **Artifact panel: pan & zoom for diagrams** (#1495, artifact plugin v0.14.0). Mermaid **and** SVG
+  artifacts now render into a transform-driven viewport — scroll-wheel / pinch to zoom (cursor-anchored),
+  click-drag to pan, and a **Reset** control that re-fits the diagram. Large flowcharts and architecture
+  views are finally explorable; mermaid re-fits automatically after its async render.
+- **`registerKeybinding` on the fork extension seam** (#1457, ADR 0063) — the keybinding registry is
+  now re-exported from `src/ext/index.ts` alongside `registerSlashCommand` / `registerComposerAction` /
+  `registerPaletteCommand`, so a fork binds its own default shortcut through the same seam core uses.
+  Registered binds already appear in **Settings ▸ Keyboard** (rebindable, with conflict detection) and
+  fire through the global host — this just completes the discoverable public surface, with a README example.
+- **Watch primitive — supervise many external conditions at once** (#1505, #1507, #1508, ADR 0067). A
+  *watch* polls a condition on a cadence and, when it trips, runs a follow-up agent turn (via
+  `run_in_session`) and/or fires hooks — the passive counterpart to a goal (which the agent *drives*).
+  Unlike a goal you can hold **many** at once. Create one from the agent (`create_watch` / `list_watches`
+  / `clear_watch` tools, plugin-verifier only), a plugin (`sdk.create_watch` + `registry.register_watch_hook`),
+  or the operator (`GET` / `POST` / `DELETE /api/watches`). A console **Watches** panel lists them.
+  Supports `deadline` (→ `expired`) and `stall_after` (→ `on_stalled`).
+- **`sdk.run_in_session(session_id, prompt)`** (#1494) — enqueue a **non-blocking one-shot agent turn**
+  into a session (its memory + full tools). The reaction primitive behind "when a goal/watch fires,
+  prompt the agent"; call it from a hook.
+- **Two-credential auth: `auth.federation_token`** (#1503, ADR 0066) — an optional second token for
+  semi-trusted A2A peers, confined to the `/a2a` + `/v1` consumer surfaces and **denied the `/api`
+  operator surface** (plugin install, config rewrite, subagent runs, goal/watch set-paths) with `403`.
+  Opt-in — unset ⇒ single-token mode, unchanged.
+- **Console set-goal form** (#1510) and **live `goal.iteration` progress** in the Goals panel (#1498).
+
+### Changed
+- **Knowledge panel: Upload / Add now open in a dialog** (#1502) instead of expanding inline in the
+  narrow sidebar. The source-ingest and add-entry forms get room to breathe and the knowledge list
+  stays in view behind the modal; per-row edit stays inline where it belongs.
+- **Goal mode is now drive-only; the `monitor` disposition is retired** (#1511, ADR 0030 superseded by
+  ADR 0067) — watching a metric an external process moves is a **watch**, not a goal. **BREAKING:**
+  `sdk.start_goal_loop` / `stop_goal_loop` are removed (use `sdk.create_watch`), `register_goal_hook` no
+  longer takes `on_stalled` (watches have it), the `mode` / `deadline` / `stall_after` fields on goals /
+  `/api/goals` / `/goal` are gone, and config `goal.monitor_interval` is removed.
+- **Goal continuation protocol → tools** (#1491) — the `<goal_plan>` / `<goal_unachievable>` XML the model
+  had to emit is retired for the `update_goal_plan` / `abandon_goal` tools.
+- The A2A-streaming and non-streaming **goal drive loops are unified** (#1497), fixing a fresh-context
+  thread-id drift.
+
+### Security
+- **RCE-via-chat closed** (#1492) — a `/goal` chat message can no longer arm a `command` / `test` / `ci`
+  / `data`+`expr` verifier (which shell out or hit a restricted-eval sink); chat accepts only the
+  declarative verifiers (`plugin`, `llm`, `data`+`contains`). Dangerous verifiers move to the operator
+  `POST /api/goals` channel behind the federation-token `/api` ceiling (#1503).
+
 ### Fixed
+- **Watch evaluation is serialized per watch id** (#1509) — the cadence tick and an event-driven
+  `evaluate_now` no longer race a read-mutate-write on the same watch; watch-store filenames are
+  hash-disambiguated so distinct ids can't collide on one file.
+
+### Docs
+- New **ADR 0066** (federation token + operator channel) and **ADR 0067** (watch primitive); **ADR 0030**
+  marked superseded. New **Watches** guide; the goal-mode + plugins guides updated for the drive-only model.
+
+## [0.77.0] - 2026-07-01
+
+### Added
+- **Cross-machine fleet hardening — A2A federation is fault-transparent** (#1468, #1476) — a peer
+  delegate (`delegate_to` over A2A) no longer cuts off a long-running task at a fixed 30s: the poll
+  loop runs to a configurable `poll_timeout_s` (default 300s) so the delegator waits while the peer
+  keeps working. Transport + protocol failures now map to a legible cause — *unreachable* vs *timed
+  out* vs a clear `VERSION_NOT_SUPPORTED` (instead of an opaque `-32009`) — and the agent card
+  advertises its A2A `protocolVersion` / `supportedVersions` so a delegate pre-checks compatibility
+  and fails fast on a version mismatch.
+- **Remote fleet members surface their health immediately** (#1470) — registering a remote
+  (`POST /api/fleet/remotes`) now probes its agent card on the spot and returns reachability +
+  version (an unreachable peer is reported, not silently accepted), the running-state probe TTL
+  tightened to match the console poll, and the delegate health prober backs off exponentially so a
+  flaky peer degrades gracefully instead of ping-ponging.
+- **Discovery auto-sweeps on hub boot** (#1471) — the hub kicks off a background discovery sweep at
+  startup (mDNS + tailnet + local) and caches the peers it finds, so the first console *Add to
+  fleet* is instant instead of waiting for a manual scan. Best-effort; peers are only surfaced,
+  never auto-added.
+- **`config explain` diagnostic** (#1475) — `python -m server config explain` (and
+  `GET /api/config/explain`) print this instance's id, both roots, every resolved on-disk path, and
+  the per-field settings cascade with provenance (App → Host → Agent), secrets redacted. The
+  supported way to answer "where is my config / where did my key go".
+- **Real multi-instance fleet test harness** (#1467, #1472) — a real-subprocess integration harness
+  (opt-in `PA_RUN_INTEGRATION=1`) boots an actual hub + members and exercises the proxy round-trip,
+  cross-instance A2A delegation, instance isolation, and member crash → detect → restart — the live
+  multi-agent coverage the fleet previously had none of.
+- **Artifact is now a bundled core plugin, on by default** (#1443) — the generative-UI surface
+  (`show_artifact` — charts, diagrams, Mermaid, Markdown, or live React rendered into a sandboxed
+  panel; ADR 0038) is vendored in-tree under `plugins/artifact/` and ships with the agent enabled,
+  a first-party surface like notes/docs (turn off per-instance via `plugins.disabled: [artifact]`).
+  Folds in a pointer-lock fix so game/canvas artifacts can capture the pointer.
+- **Artifact render errors feed back to the agent** (#1458, artifact plugin 0.12.0) — when a React
+  (or other) artifact throws at render time or never mounts, the sandbox now reports the error up,
+  and `show_artifact` / `update_artifact` / `rewrite_artifact` surface it inline in their reply
+  (*"⚠ But it FAILED to render: Icon is not defined"*) when the panel is open. A new
+  `check_artifact` tool returns the latest render verdict on demand. Closes the code→render→fix
+  loop so the agent self-corrects instead of guessing. The wait is gated on a live panel, so
+  headless/closed-panel runs never block.
+- **Multi-step wizard + choice-card HITL forms** (#1464) — `request_user_input` now renders
+  multiple `steps` as a real sequential **Back/Next wizard** (step indicator, per-step
+  required-field validation) instead of one scrollable form, and supports AskUserQuestion-style
+  **option cards** — a field with `oneOf: [{const, title, description}]` renders as selectable
+  cards (single-select; `type: "array"` for multi-select), alongside the existing
+  text/number/boolean/enum fields. See [Starter tools](/reference/starter-tools).
+- **The agent can ingest documents & media into its knowledge base** (#1479, #1485) — a new
+  `knowledge_ingest(source, …)` tool pulls a URL (a web article or a **YouTube** link), a PDF, or a
+  local audio/video/image file through the full ingestion pipeline (transcripts, gateway STT,
+  extraction) and chunks + embeds it for recall — so handing the agent a link or a recording
+  actually processes it instead of falling back to a web search. Anything that fetches over the
+  network or transcribes media runs in the **background** (ADR 0050) so a long video never blocks the
+  chat; a small local text file ingests inline. See [Ingest documents & media](/guides/ingestion).
+
+### Changed
+- **Two-tier instance paths (box / instance) — one resolution rule, no more double-scoping**
+  (#1463, #1465) — every on-disk location is now resolved once from the environment into a single
+  injectable model (`infra.paths.InstancePaths`) with three tiers mirroring the settings cascade:
+  **App** (read-only bundle seed), **Box** (machine-shared: the Host config layer + commons), and
+  **Instance** (per-agent: config, secrets, plugins, every store). `PROTOAGENT_HOME` relocates an
+  instance's root; `PROTOAGENT_INSTANCE` names one under the box; neither → `default`.
+  `PROTOAGENT_CONFIG_DIR` is **retired** (desktop, Docker, and fleet members now set
+  `PROTOAGENT_HOME`), and live config is never written into the repo tree. This removes the
+  config-vs-data root split and the `PROTOAGENT_CONFIG_DIR`+`PROTOAGENT_INSTANCE` collision that
+  required a destructive self-heal. **Existing installs upgrade with no action** — a one-shot,
+  idempotent, non-destructive boot migration copies old-layout config + secrets (and the default
+  instance's data) into the new location. Use `config explain` to see the resolved layout.
+  Every data store (checkpoints, knowledge, memory, scheduler, inbox, activity, telemetry, audit,
+  tasks, a2a, workflows, …) now lives under the instance root; the Host config layer is box-shared
+  (one machine-wide `host-config.yaml`, the layer's intent); shared commons stay shared; and the
+  legacy `scope_leaf` scoping knob is removed. (ADR 0065; supersedes the path mechanics of ADR
+  0004/0041 and re-amends the host-file location in ADR 0047.)
+- **React artifacts are more forgiving + the render loop is proactive** (artifact plugin 0.13.0) —
+  the most common first-try mistake (defining a component but never calling `render()`) now just
+  works: name your top-level component `App` and the harness **auto-mounts** `<App/>` when nothing
+  mounted itself (an explicit `render()` still wins; it never double-mounts). `check_artifact` now
+  waits briefly for the verdict when the panel is live (so an immediate post-render check returns
+  the real result), and the skill instructs the agent to **verify the render after every create/
+  edit** and iterate until it's clean.
+
+### Fixed
+- **Docs reader: in-content cross-reference links route in-app instead of breaking the iframe**
+  (#1456) — clicking a cross-reference link inside a rendered doc page used to navigate *inside*
+  the embed frame, loading a bare page stripped of the docs nav/search in a cramped frame. The
+  reader now intercepts content-link clicks: a link that resolves to a bundled doc — relative
+  (`./adr.md`, `../guides/skills.md`) or VitePress abs-rooted (`/adr/0060-…`, `/guides/`) — opens
+  **in-panel** (carrying any `#anchor`, with client-side heading slugs so anchors land); anything
+  else (external, or a doc not in the bundle) opens at the live docs site in a new tab. In-page
+  `#section` links scroll the reader instead of reloading it.
+- **A crashed co-located fleet member is now detected and restartable** (#1474) — a member the hub
+  spawned is its child process, so a SIGKILL crash left it a zombie that `os.kill(pid, 0)` reported
+  as *alive*: `/api/fleet` kept showing it running and a restart no-op'd on the dead pid. `_alive()`
+  now reaps the zombie first (a targeted `waitpid`, so it never steals another child's exit status),
+  so the crash is detected passively and a restart spawns a fresh process. (Surfaced by the new
+  multi-instance crash→restart test.)
+- **Autonomous turns no longer deadlock on a human-input pause** (#1464, #1466) — a
+  `scheduler` / `inbox` / `webhook` / `background` turn that calls `ask_human` /
+  `request_user_input` has no operator to answer, so the task used to park in `input-required`
+  forever (a state exempt from the TTL sweep). It now auto-answers the pause with a "no
+  operator — proceed" sentinel (bounded), and past that budget **force-completes** the turn —
+  clearing the stray interrupt — rather than parking. Live operator and inbound-`a2a` turns
+  still park as before. Dismissing a HITL card now resolves the parked task instead of only
+  clearing it client-side.
+- **HITL tools are hard-denied to subagents** (#1469) — `ask_human` / `request_user_input`
+  (resumable only by the lead turn's runner) can no longer be bound to a subagent even if a
+  `SubagentConfig.tools` allowlist names one — enforced in `_subagent_tools`, not just
+  convention. `request_user_input` also rejects an empty `steps` list instead of silently
+  degrading to a free-text box.
+- **Settings surfaces when the agent config shadows a host-scoped field** (#1459) — when a
+  `scope="host"` field (e.g. `model.api_base`) is set in both `host-config.yaml` and the agent
+  leaf (`langgraph-config.yaml`), the agent value wins at runtime (ADR 0047) but the host console
+  used to badge it a plain "box default", hiding the override. It now shows an **"overridden by
+  agent config"** warning with Reset-to-inherited (which removes the agent override so the box
+  default applies), and config load logs a warning naming each shadowed key.
+- **The ⌘K command-palette chat survives being closed mid-turn** (#1487) — closing the palette used
+  to abort the turn and lose it; it now pins the server task id and, on reopen, reconnects to the
+  still-running turn (or shows its finished result) via the same durable `tasks/get` self-heal the
+  main chat uses.
+
+### Docs
+- **Knowledge: fleet/commons sharing + the reusable background-job primitive** (#1477, #1488) —
+  documented sharing a knowledge store across a fleet (the private/commons tiering + the console
+  Share/Unshare gesture), corrected the stale `knowledge.top_k` default (5 → 10), and added a
+  "Background jobs" guide covering `task(run_in_background=true)` and the
+  `BackgroundManager.spawn_work` primitive for detaching deterministic long work.
+
+## [0.76.0] - 2026-06-30
+
+### Added
+- **"Manage plugins…" in the rail context menus** (#1426) — right-clicking empty rail space or any
+  rail icon now offers **Manage plugins…**, which opens the plugin manager (Settings ▸
+  Integrations). It's the all-plugins counterpart to a plugin icon's per-plugin *Configure…*.
+- **Reveal toggle on secret fields** (#1442) — every masked secret/token input (settings secrets,
+  delegate auth tokens, the operator-token gate, MCP server secrets, the setup-wizard API key) now
+  carries an eye button to show what you typed or pasted, so you can verify a key before saving.
+
+### Changed
+- **Settings true-up — one canonical config system** (#1428, #1432–#1442; ADR 0048 §6) — the
+  console's settings, plus the Playbooks and Knowledge surfaces, were unified onto the canonical
+  `/api/settings` cascade and TanStack Query (no more bespoke `/api/config` writers or hand-rolled
+  fetches), and a wave of console controls moved to the shared `@protolabsai/ui` design system
+  (button loading states, toast positioning, icon search inputs, segmented category filters, secret
+  inputs). Mostly invisible, but settings and list surfaces now load, error, and behave consistently.
+
+### Fixed
+- **Settings surfaces no longer swallow load/save errors** (#1430, #1431) — the Skills, MCP,
+  Plugins, and Knowledge surfaces now report a failed load or save via a toast instead of failing
+  silently.
+- **Identity name and fleet delegates save through the canonical settings cascade** (#1428) —
+  retired the last two `/api/config` writers, so these fields persist like every other setting
+  (host/agent scoping, hot reload) instead of via a side path.
+
+## [0.75.0] - 2026-06-29
+
+### Added
+- **Egress allowlist in Settings** (#1422) — the outbound-host allowlist (`egress.allowed_hosts`,
+  ADR 0008) is now editable in **Settings ▸ Box ▸ Network**, the outbound counterpart to the
+  inbound *Bind interface*. Host-scoped and hot-reloading; previously YAML-only.
+
+### Fixed
+- **Custom model gateway no longer blocked on the connection test** (#1422) — pointing the *API
+  base URL* at a local gateway (Ollama / LM Studio / local vLLM / LiteLLM on `localhost`, or a
+  LAN/tailnet host) failed with "api_base host is blocked by the egress guard". The connection-test
+  probes now allow private/loopback hosts for the operator-configured gateway (still blocking
+  link-local / cloud-metadata / multicast / reserved), and when an egress allowlist *is* set the
+  configured gateway host is permitted automatically.
+- **Plugin config appears without a restart** (#1423) — a newly installed or enabled plugin's
+  configuration section now shows up in Settings immediately. The console refetches the settings
+  schema whenever the active plugin set changes (install / enable / disable / uninstall / sync /
+  update) instead of serving a stale cache until the next app restart.
+
+## [0.74.0] - 2026-06-29
+
+### Added
+- **Bypass-permissions mode** (#1418) — a per-tab toggle that auto-approves `run_command` so the
+  agent runs shell commands without the HITL approval prompt: `/bypass on|off`, a DS warning badge
+  in the composer while it's on, and an **"Approve & don't ask again"** button in the approval
+  dialog. Every bypassed command is audit-logged, and a host can forbid bypass entirely via
+  `filesystem.bypass_allowed: false`.
+
+### Changed
+- **`run_command` runs shell operators** (#1419) — the fenced `run_command` tool executes via
+  `/bin/sh -c`, so `&&`, `|`, `>`, and `$(…)` work instead of being literalized by argv-splitting.
+  No new capability (the agent could already nest `bash -c "…"`); still cwd-fenced and
+  approval/bypass-gated, and a timed-out command now kills its whole process group.
+
+### Fixed
+- **Slash-command notices render as system notes** (#1420) — local in-thread notices (e.g. the
+  `/effort` and `/bypass` confirmations) are now tone-aware `role:"system"` notes instead of fake
+  assistant messages, so they no longer carry the answer action row (copy/fork/regenerate).
+
+## [0.73.0] - 2026-06-29
+
+### Added
+- **Background batch delegation** (#1396) — `task_batch(run_in_background=True)` fans a whole batch
+  of subagents out detached, returning job ids immediately while you keep working, with each
+  completion notified back independently. A new background concurrency cap (default 3, override
+  `BACKGROUND_MAX_CONCURRENCY`) bounds how many background turns run at once so a wide fan-out can't
+  overload the gateway.
+- **Live tool-card feed for background agents** (#1402) — expanding a running background job in the
+  Background-agents dialog now follows its tool-by-tool activity live, each step shown as a tool card
+  with name, status, and output preview, instead of only the last-three collapsed pills.
+
+### Changed
+- **Settings ▸ Knowledge split into sub-sections** (#1408) — the 22-field Knowledge panel is
+  organized into **Recall · Ingestion · History** accordion groups instead of one wall, and
+  every settings panel now opens its first group by default (no more landing on a fully
+  collapsed panel).
+- **Tools view — MCP tools grouped by server** (#1405) — MCP tools (namespaced
+  `<server>__<tool>`) now group under the server that serves them, mirroring the plugin
+  grouping, instead of one flat "MCP" bucket; the group sorts after core + plugin groups
+  with an `mcp` source chip on its header.
+- **Settings IA — domain-first (ADR 0048)** (#1393) — the settings dialog is reorganized by what a
+  setting *does*: an **Agent** group (Identity · Operator & access · Model · Behavior · Knowledge ·
+  Integrations), a **Capabilities** group (Tools · MCP · Skills · Subagents · Delegates), a host-only
+  **Box** group (Overview · Fleet · Telemetry), and a device-local **This console** group (Theme ·
+  Chat · Keyboard). Scope (host vs agent) is a per-field inheritance badge, not a navigation axis;
+  sharing/box-runtime knobs are contextual chips on their managers rather than empty panels. Removes
+  the dead "two scope homes" axis and the unused Host-defaults panels, and folds Telemetry into the
+  single Settings door (no separate drawer shortcut).
+- **Tools view — grouped by plugin + subsystem** (#1397) — plugin tools now group under the plugin
+  that contributed them (Artifact, GitHub, …) instead of one flat "Plugin" bucket, and the core
+  "General" bucket is split into Filesystem / Skills / Web & research subsystems. Groups order
+  core → plugin → MCP, with the source shown once on each group header instead of on every row.
+- **Built-in subagents answer natively** (#1411) — the built-in subagents (researcher, antagonist,
+  verifier, synthesizer, dream, distill) no longer carry the retired `<scratch_pad>`/`<output>`
+  protocol directives; they deliberate with native reasoning and return plain answers, matching what
+  the lead agent already does. Prompt-text only — no behavior-contract change for fork callers.
+- **CI off the deprecated Node 20 action runtime** (#1391) — bumped every GitHub Actions pin across
+  the nine workflow files to the lowest major that runs natively on Node 24, so runs no longer log
+  GitHub's "Node.js 20 is deprecated" annotation. Notable non-`+1` jumps where the next major was
+  still Node 20: `upload-artifact` v4 → **v6**, `build-push-action` v5 → **v7**, and
+  `attest-build-provenance` v1 → **v3** (its v2 leaf `actions/attest` was still Node 20). All are
+  pure-runtime bumps for our usage — no input/behavior changes; the new majors need Actions Runner
+  ≥ 2.327.1, which GitHub-hosted runners (all we use) already satisfy.
+
+### Removed
+- **Structured-output parser retired** (#1412) — the dead `<scratch_pad>`/`<output>` XML parser is
+  deleted (`graph/output_format.py` shrinks 473→67 lines), completing the move to native model
+  reasoning. The lead agent and subagents already stopped emitting the protocol; this drops the
+  no-longer-used `<output>` extraction, the dropped-turn retry, the `<confidence>` self-report (and
+  its A2A DataPart / chat-stream event), and the streaming-view machinery. Forkers keep only a thin
+  leaked-reasoning strip plus the `<think>`/`<scratch_pad>` guards that stop reasoning from being
+  persisted (ADR-0021) or leaking into answers.
+
+### Fixed
+- **Concurrent same-conversation turns no longer corrupt chat history** (#1410) — two
+  near-simultaneous A2A messages on the same context now run one-at-a-time via a per-conversation
+  lock instead of racing and losing history, and a reasoning-only model that emits no answer now
+  surfaces its last tool output or a placeholder instead of a silently blank reply.
+- **Chat answers no longer truncated; A2A tasks return the real final answer** (#1409) — an answer
+  that mentions a protocol tag like `<scratch_pad>` in inline code is no longer cut off in the
+  stored / A2A / Discord copy; and when the canonical final answer diverges from the streamed text
+  (goal-outcome notes, retries, reshaping), the durable A2A task artifact is replaced with the true
+  answer instead of keeping stale streamed deltas, so `tasks/get` and delegating agents see the
+  correct result.
+- **Subagent token streams isolated from the live chat** (#1394) — running concurrent subagents
+  (`task` / `task_batch`) no longer garbles the chat stream or pollutes the lead's final answer;
+  subagent reasoning and draft output stay off the main turn and return only via the delegation tool
+  card, while tool-card nesting and cost accounting stay intact.
+- **Cross-tab chat no longer clobbers itself** (#1413) — two browser tabs of the same agent share one
+  chat-store key, and the last tab to write used to overwrite the other's chats, silently losing
+  conversations. Tabs now union-merge their sessions (newest edit wins; live-streaming and
+  just-deleted chats stay authoritative) and sync each other's chats live.
+- **ACP coding-agent eviction race closed** (#1406) — concurrent chat turns no longer corrupt the
+  per-thread ACP runtime cache, and idle/LRU eviction never tears down a runtime whose turn is still
+  streaming, so a long coding turn can outlive the 30-minute idle TTL without being killed by an
+  unrelated turn.
+- **Cross-context streaming guard** (#1399) — the console drops any streaming frame whose `contextId`
+  doesn't match the active chat turn, so a stray frame from a concurrent turn or a detached
+  background job can't render into the wrong message. Frames without a `contextId` pass through, so
+  older servers and the A2A 0.3 shape are unaffected.
+- **File uploads restore the token prompt on auth failure** (#1404) — `requestForm` read the response
+  body twice in its error path, throwing "body stream already read" — which masked the real HTTP
+  error (e.g. "file too large") and, on token-gated deployments, skipped the 401 AuthGate so uploads
+  never prompted for a token. The body is read once now, surfacing the true error and re-enabling the
+  sign-in prompt.
+
+### Security
+- **Secure defaults for metrics and MCP secrets** (#1395) — `/metrics` is no longer unconditionally
+  public: on a token-gated deploy it requires `Authorization: Bearer <token>` (or
+  `PROTOAGENT_PUBLIC_METRICS=1` to keep anonymous scraping), and stdio MCP subprocesses no longer
+  inherit credential-looking env vars by default. **Breaking (token-gated deploys only):** Prometheus
+  scrapers must authenticate, and an MCP server relying on an implicitly-inherited secret must set
+  `inherit_env: true` or pass it via a per-server `env:` block. Local tokenless deploys are
+  unaffected.
+- **Backend launch-hardening — ingestion SSRF guard + credential hardening** (#1398) — web/file
+  ingestion now runs the same egress allowlist as `fetch_url` (redirects disabled and re-checked per
+  hop), closing server-side fetches of cloud-metadata and internal hosts into the knowledge base;
+  plus constant-time API-key/inbox-token comparison, PEP 508 validation of plugin pip deps to block
+  flag/VCS injection, HITL pauses preserved through the TTL sweep, and SQLite `busy_timeout` on the
+  knowledge / scheduler stores.
+- **Plugin auth-bypass and event-loop hardening** (#1401) — a plugin can no longer strip the bearer
+  gate off core routes (including the install/RCE route): `public_paths` match on namespace subtrees
+  and plugin IDs are validated against a reserved-name denylist. The `data` goal-verifier's `eval()`
+  is AST-guarded against attribute-traversal sandbox escapes, and plugin install/update/sync run off
+  the asyncio loop so one operator install no longer freezes all chat / A2A / scheduler traffic.
+- **Fail-safe plugin secret redaction** (#1403) — when plugin config discovery hits a transient
+  failure, the server fails safe instead of fail-open: `GET /api/config` blanks the entire affected
+  plugin section rather than echoing its secrets, and cached secret paths are preserved so a plugin
+  secret can't be written into the exportable main YAML in plaintext.
+- **Operator-token storage guidance** (#1414) — documents where the console's operator bearer lives:
+  the server env (`A2A_AUTH_TOKEN`) is the recommended home. The browser console caches a copy in
+  `localStorage`, an accepted residual bounded by the localhost-default bind, default-deny bearer
+  gate, and sanitized-markdown-only rendering — rotate the token on compromise and don't expose the
+  console beyond localhost without a fronting proxy.
+
+## [0.72.0] - 2026-06-28
+
+### Added
+- **Context-window meter + per-turn cost/time** (#1372) — the chat header shows a live
+  context-window usage meter, and each completed turn reports its token cost and wall-clock time,
+  so you can see how close a conversation is to the model's window and what each turn spent.
+- **Vision-describe pass for text-only models** (#1381) — attach images to a chat whose model has no
+  native vision: a describe pass turns each image into a text description the model can reason over,
+  instead of dropping the attachment.
+- **"Get models"** (#1386) — a Settings action that pulls a gateway's advertised model list and
+  populates the Primary model dropdown, so you pick from what the gateway actually serves instead of
+  typing model ids by hand.
+- **Inline components re-enabled** (#1323) — an extensible registry with clean, deterministic
+  ordering replaces the disabled inline-component path, so plugins can contribute inline chat
+  components again.
+- **Per-stimulus Activity attribution** (#1375) — each Activity response is attributed to the
+  specific stimulus it replies to, so the reactive thread reads as paired stimulus → response
+  instead of an undifferentiated stream.
+
+### Changed
+- **Inline action feedback → toasts** (#1389) — settings and seven panels now surface transient
+  action results (save / test / connect / CRUD) as DS toasts instead of inline status lines,
+  continuing the toast sweep.
+
+### Fixed
+- **Deduped inbox/Activity now-item notifications + deliver-before-fire** (#1375) — now-item
+  notifications no longer double-fire across the inbox and Activity surfaces, and a delivery now
+  lands before its fire event.
+- **Clear error for images on a text-only model** (#1374) — attaching an image to a text-only model
+  now shows a clear, actionable error instead of a cryptic extractor rejection.
+- **Chat-tab trash only on the hovered ✕** (#1373) — the delete affordance shows on the ✕ you're
+  hovering, not on every tab at once.
+
+## [0.71.0] - 2026-06-27
+
+### Added
+- **Panel-focus keybindings** (ADR 0063) — `⌃1`/`⌃2`/`⌃3`/`⌃4` move keyboard focus *into* the
+  chat composer / left panel / right panel / bottom dock (so that region's scoped binds activate).
+  Literal `⌃` (mac) so they're distinct from `⌘1–9` tab-jump; `⌃2/3/4` land on the first
+  interactive element in the dock. Rebindable in Settings ▸ Keyboard.
+
+### Changed
+- **⌘K palette chat streams with live text↔tool interleave** — PaletteChat now builds the same
+  ordered `parts` the main chat does (via the shared `appendText`/`appendReasoning`/`addToolRef`
+  helpers + the top-level-only `addToolRef` rule), so the shared `<ChatMessageView>` renders the
+  interleaved timeline (and WorkBlock fold) live instead of the grouped history-fallback. Full
+  parity with the main chat "as it's doing its thing."
+- **Streaming answer text is full-width, no loading side-bar** — removed the DS streaming-pulse
+  (animated 2px accent left-border + inset) from the streaming message body, so the answer streams
+  as raw, full-width text instead of behind an animated rail. Applies to the main chat and the ⌘K
+  palette chat; tool cards keep their own loaders.
+- **No hardcoded emojis in the UI** — stripped emoji/glyph literals from user-facing strings: the
+  chat paste-attachment label (`📎` → `Attached:`), background-agent completion headers (`✅`/`⚠️`),
+  the `/effort` notes (`⚙`/`⚠`), delegate/plugin-install status strings (`✓`/`✗`/`⚠`), and the
+  background-job tool glyphs (now lucide icons). Status is carried by text/tone/icons, not emoji.
+
+### Added
+- **Full-screen document viewer** (ADR 0062) — a reusable reader (`openDocument(spec)` → a
+  root-mounted full-screen dialog rendering markdown). Background-agent reports no longer strand
+  you: the chat card keeps the preview but a **"Read full report"** button opens the *full* report
+  (fetched by job id) full-screen, and **Activity feed** entries open into the *same* viewer — no
+  trip to the Background/Activity panel. `DocumentSpec` is generic (inline `content`, async `load()`,
+  or a custom `render()`), so future long-content views can reuse it.
+- **Keyboard shortcuts** (ADR 0063) — a scoped, user-rebindable keybinding system. Defaults: `⌘K`
+  command palette, `⌘,` Settings, `/` focus composer, VS Code-style panel toggles `⌘B` left rail /
+  `⌘⌥B` right panel / `⌘J` bottom dock, and (in the chat panel) `⌘T` new chat, `⌘⇧K` clear,
+  `⌃Tab`/`⌃⇧Tab` prev/next, `⌘1–9` jump to chat tab N. Bindings are **focus-scoped** (the chat ones
+  fire only when the chat panel is focused) and **rebindable** in **Settings ▸ Keyboard** (record /
+  reset / conflict-detect; overrides persist globally). Forks/plugins add their own via
+  `registerKeybinding`. Note: the browser-mirroring combos (`⌘T`/`⌘1–9`/`⌃Tab`/`⌘B`/`⌘J`) work in
+  the desktop app; a browser tab reserves some — rebind to a free combo there.
+- **Quick-delete a chat tab** — **Shift+click** a tab's ✕ to delete it with no confirmation dialog
+  and no knowledge harvest; while Shift is held the ✕ shows as a red trashcan to signal it. Plain
+  click keeps the confirm dialog.
+- **Hide a rail surface without disabling its plugin** (ADR 0035/0036) — `railOrder` gains a
+  `hidden` bucket: a surface is on exactly one dock *or* hidden (enabled-but-not-shown). Right-click
+  a rail icon → **Hide** to declutter the rails without disabling the plugin; restore it from ⌘K,
+  from **right-clicking the empty rail** (a "Hidden views" menu), or "Move to …". The reconcilers
+  respect `hidden`, so a reload never resurrects a hidden view and uninstalling the plugin prunes
+  it. Persist migration **v13**.
+- **Configure a plugin from its rail icon or util-bar widget** (ADR 0036/0059) — right-clicking a
+  plugin view's rail icon, or its util-bar widget pill, now offers **Configure…**, which opens that
+  plugin's settings dialog (the same per-plugin dialog the Plugins manager uses), store-driven from
+  a single root mount.
+- **Chat tab context menu** (ADR 0036) — right-click a chat session tab for **New chat / Rename /
+  Close** (Close reuses the delete-confirm; Rename opens the inline tab editor).
+- **Fork-safe console behavior seams** (ADR 0061, #1337) — give the console the backend's
+  "extend-without-editing-core, update-safe" property. Extends the `src/ext/` fork pattern
+  with three registries mirroring `registerSurface` (static, first-wins, HMR-safe), so a fork
+  adds chat behavior by dropping a `src/ext/` module — no core edits, no upstream conflicts:
+  - **`registerSlashCommand`** — own a client-side `/<name>` (registering claims the token;
+    the frontend twin of the backend's `register_chat_command`). Core's `/new`, `/clear`,
+    `/effort` now register through it — no hardcoded verbs remain.
+  - **`registerComposerAction`** — add a control to the chat composer's actions slot.
+  - **`registerPaletteCommand`** — add a root ⌘K command; core's deep-links (Plugins: Discover,
+    Settings, …) are dogfooded through it (no `deepLinkCommands()` bypass).
+  - **`createUISlice(namespace, initial)`** — own a namespaced, per-agent-persisted zustand
+    store for fork UI state, without editing core `uiStore.ts` (a standardized fork store, not
+    a merge into core's `UIState`).
+
+## [0.70.0] - 2026-06-24
+
+### Added
+- **Plugins can own `/<name>` chat control commands** via `registry.register_chat_command(name, handler)`
+  — the generalized form of the core `/goal`. The handler is `async (rest, session_id) -> str | None`:
+  a reply string short-circuits the turn (the model never runs), `None` passes through. It is
+  **user-only by design** (not an agent tool), so a plugin can expose a write action the model can't
+  trigger autonomously. Precedence is `goal` > plugin command > workflow > subagent > skill, resolved
+  once in `graph/slash_commands.py` so the chat dispatcher and the console palette can't drift. This is
+  the seam that lets the GitHub `/issue` command move into a plugin.
+- **"Report a bug" link in the hamburger menu** (the header side panel), next to Docs /
+  Changelog / GitHub — opens the repo's new-issue chooser in a new tab. A lightweight,
+  always-present way to file a bug, independent of any GitHub plugin.
+
+### Removed
+- **GitHub is no longer in core — it's a standalone plugin** ([`protoLabsAI/github-plugin`](https://github.com/protoLabsAI/github-plugin)).
+  Removed the read tools (`tools/github_tools.py`), the `/issue` command logic (`tools/gh_issue.py`),
+  its REST surface (`operator_api/github_routes.py`), the in-tree `plugins/github` shim, the core
+  `github.repos`/`github.default_repo` config + settings fields, and the console's util-bar
+  "New issue" button + dialog (`NewIssueDialog`/`issueBody`). The chat `/issue` command and the
+  console GitHub surfaces now come from the plugin (install it + `plugins.enabled: [github]`); the
+  same `github.*` config keys carry over. Kept in core: the generic `ci` goal verifier and its
+  `tools/gh_cli.py` runner (goal-system infra, not the GitHub toolset). Closes the lean-core audit's
+  "GitHub → plugin" item.
+
+## [0.69.0] - 2026-06-24
+
+### Changed
+- **Native reasoning — the agent's thinking now streams from the model, not a forced text
+  protocol.** Dropped the `<scratch_pad>`/`<output>` convention; the chat renders the model's
+  native `reasoning_content`, tool calls, and answer as they actually stream. An agentic
+  turn's reason→tool steps fold into one "Working… / Worked" block that tallies reasoning
+  steps, tool calls, and skill loads (hover for the breakdown) so the final answer leads;
+  the most-recent tool stays spotlighted while the turn runs. (#1328)
+- **Chat markdown now renders through the design system's `Markdown` renderer**
+  (`@protolabsai/ui`), replacing the hand-rolled pipeline. Assistant answers are
+  streaming-hardened (partial markdown never flashes broken mid-stream), with on-brand
+  code/table chrome (copy button), KaTeX math, GFM tables/task-lists, and themed mermaid
+  code blocks. (#1329, #1331)
+
+### Fixed
+- **Heavy research turns no longer wedge the server.** `web_search` and `fetch_url` ran their
+  blocking work (DuckDuckGo search, HTML parsing) directly on the event loop, so a parallel
+  `task_batch` fan-out could peg CPU and make the server unresponsive — even to cancellation.
+  Both now run off the loop, keeping the server responsive under load. (#1328)
+
+## [0.68.0] - 2026-06-23
+
+### Added
+- **`scripts/reset.sh` — factory-reset the default (prod) instance from the CLI.** Wipes
+  the prod instance's data + local config back to a clean slate so the next boot runs the
+  setup wizard (for testing the fresh-user flow). Safe on a multi-instance machine: every
+  *other* instance (any `~/.protoagent/<name>` with an `.instance-uid`, the dev sandbox,
+  fleet members) and every scoped `<store>/<instance>` leaf is preserved — only prod's
+  unscoped DBs + direct files are removed; tracked `config/` files are `git checkout`-
+  restored, gitignored local config deleted. `--dry-run` prints the exact plan;
+  `--keep-secrets` / `--include-dev` / `--backup` / `--force` / `--yes`. No in-app reset
+  (deliberately CLI-only). (#1159)
+
+### Changed
+- **Chat tool-call rendering overhaul.** A `task` delegation card now shows which subagent
+  ran (`task → researcher`); the subagent's own tools nest inside that card with a running
+  count (expand to see them); a turn's finished tools fold into one expandable "N tools"
+  summary chip; and the live tool block holds a stable height — the column no longer grows
+  and shrinks as tools stream in and out. The summary chip is the new `@protolabsai/ui`
+  `ToolCardSummary` primitive. (#1319, #1320, #1321, #1322)
+- **`show_component` (inline component rendering, ADR 0051) is temporarily disabled** — not
+  in the agent's tool roster or the console Tools tab. The component-v1 pipeline (codec,
+  wire extraction, console renderer) is left intact; tracked by #1323. (#1324)
+- **The Goals and Tasks panels refresh on a bus push instead of polling every 5s.** Both
+  panels held a 5s `refetchInterval`; now the goal store publishes `goal.changed` (on
+  set/advance/clear) and the task store publishes `task.changed` (on create/update/
+  close/delete), and the panels invalidate off those `/api/events` pushes — the same
+  pattern the inbox panel already used. Live updates are now immediate (the agent files a
+  task → it appears at once) and steady-state polling is gone. (#1310)
+
+### Fixed
+- **Failed or user-cancelled `task` delegations now close as error cards (the X).** They
+  returned a plain `Error:` / `[cancelled]` string that rode the green "done" card (the
+  card's error flag is read from the tool-message status, which a string never set); the
+  tool now returns a `status="error"` ToolMessage so the card matches the red body. (#1319)
+- **A subagent's own tool calls reliably nest under the delegation card.** Nesting was
+  inferred from frame timing ("last open task wins"), which broke when the detached
+  delegation's end raced ahead of its child frames (and mis-attributed concurrent
+  `task_batch` delegations); the child frames now carry the parent delegation's tool-call
+  id so nesting is explicit and order-independent. (#1321)
+- **Mid-stream output rendering no longer rescans the whole response on every chunk.**
+  The chat stream recomputed the visible `<output>` (and the live reasoning view) by
+  re-running regexes over the *entire* accumulated text per token chunk — O(N²) over a
+  turn. New incremental `StreamingOutputView` / `StreamingReasoningView` scan only the
+  newly-appended tail (a cheap pre-`<output>` scan, then fast-append in the steady
+  answer body), falling back to the authoritative parser on any tag boundary; an
+  equivalence + fuzz test pins them byte-for-byte to the original functions. (#1310)
+- **Empty-rail panel toggles fully disable.** The utility-bar left/right panel-toggle buttons are now greyed out and non-interactive when their rail holds no views (matching the bottom-dock toggle), instead of appearing active but doing nothing when clicked. (#1234)
+- **Console-poll handlers no longer block the event loop.** `GET /api/runtime/status`
+  shelled out to `ps` (the per-poll co-location + fleet version-skew probes) and the
+  inbox/activity console handlers ran sync SQLite reads/writes directly on the loop; both
+  are now offloaded via `asyncio.to_thread`, matching the scheduler/goals handlers and the
+  startup-path co-location check. (#875)
+- **The Docker image now serves the React console and stays in dep-lockstep with
+  pyproject.** A new node builder stage builds `apps/web/dist` and copies it into the
+  runtime image, so `-e PROTOAGENT_UI=console` actually mounts `/app` instead of silently
+  404'ing (`.dockerignore` no longer drops the workspace manifests the build needs); the
+  server now warns loudly when the `console` tier is requested but the console build is
+  absent. A new `tests/test_requirements_core_sync.py` guard fails CI if
+  `requirements-core.txt` (what the image installs) misses any core `pyproject`
+  dependency — it had silently lost `pypdf`, `youtube-transcript-api`, and
+  `markdown-it-py`, now restored. (#874)
+
+## [0.67.0] - 2026-06-22
+
+### Added
+- **Per-agent ACP launch overrides are honored.** `acp.agents.<name>.{command,args}` is
+  now parsed (it was silently dropped — `LangGraphConfig` had no `acp_agents` field), so an
+  `agent_runtime: acp:<agent>` turn launches the locally-installed adapter you configured
+  (`claude-agent-acp`, `codex-acp`) instead of always falling back to the `npx -y …` fetch
+  default — faster cold start, no per-spawn network dependency (ADR 0033). (#1289)
+
+### Fixed
+- **ACP delegate health probe is `initialize`-only — it no longer opens a session every
+  120s.** The prober ran a full `session/new`/`session/load` against every ACP delegate on
+  a timer despite documenting itself as side-effect-free; it now runs only the `initialize`
+  round-trip (`AcpClient.handshake()`). The ACP launch env also strips the inherited
+  `CLAUDECODE` / `CLAUDE_CODE_*` markers so a spawned Claude backend doesn't refuse to start
+  "inside another Claude Code session", and the round-trip (initialize → session/prompt →
+  request_permission) is now logged so an idle freeze is diagnosable. (#1301)
+- **macOS desktop app finds Homebrew/nvm/Volta/asdf-installed binaries.** A Finder/Dock
+  launch inherits only `launchd`'s minimal PATH, so `npx` and ACP adapters were invisible
+  and a `delegate_to` coding-agent launch failed with `binary not on PATH`. The bundled
+  server is now launched with the user's real login-shell PATH, and the delegate Test probe
+  resolves the command against the same merged PATH the spawn uses. (#1302)
+- **Workspace port assignment skips OS-occupied ports.** `_pick_port` now bind-probes
+  `127.0.0.1` and scans a bounded range, skipping ports held by *unrelated* processes (a dev
+  server, another fork on `:7871`) instead of handing out an already-bound port that killed
+  the spawned agent with `EADDRINUSE`. (#1290)
+- **The per-agent theme is instance-scoped.** `theme.json` now lands under
+  `config/<instance>/` like config/secrets/setup, so a `PROTOAGENT_INSTANCE` sandbox no
+  longer shares — and clobbers — the default instance's theme (ADR 0042). (#1294)
+- **The browser tab favicon + `theme-color` follow the active per-agent theme.** Switching
+  agents recolors the tab favicon and PWA/mobile browser chrome to the agent's accent
+  instead of always showing the brand default (ADR 0042). (#1297)
+- **ACP coding-agent subprocesses no longer leak as orphaned processes.** `delegate_to`
+  and the delegate health prober spawn CLI coding agents (`codex-acp`, `claude-agent-acp`,
+  …) over ACP, but teardown signalled only the direct child — the backend each adapter
+  spawns reparented to init and survived — and `dispatch` awaited a *pooled* client that
+  it never reaped on cancel, so stopping a turn left the agent running ("I stopped the
+  main thread and the delegate didn't stop"). Over days these piled up to hundreds of
+  `ppid 1` orphans holding ~20 GB. Now the agent is spawned in its own process group and
+  teardown SIGTERM→SIGKILLs the whole group; `dispatch` hard-kills + drops the pooled
+  client synchronously on cancel; the `_start` handshake self-reaps if it fails or is
+  cancelled mid-flight (the prober's probe-timeout path); and a shutdown hook drains every
+  pooled client so a server stop strands nothing.
 - **Dialogs no longer render their content cramped flush to the body edge.** The shared
   DS dialog defaulted to a tight 16px body padding, and roomier dialogs (MCP catalog,
   New-skill) each hand-added a 24px override — so every newly-converted dialog (the
@@ -19,6 +636,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   remembered to bump it. Raised the app-wide `.pl-dialog__body` default to 24px once and
   dropped the now-redundant per-dialog overrides. Surfaces that embed a full panel
   (Settings, theme quick-pick) keep their intentional zero padding. (#1288)
+
+### Docs
+- **Coding-agents guide: Codex needs the `codex-acp` adapter.** Documented that recent
+  `codex` CLI dropped the native `acp` subcommand (it speaks MCP), so it must be driven
+  through `@zed-industries/codex-acp`. (#1287)
 
 ## [0.66.0] - 2026-06-21
 

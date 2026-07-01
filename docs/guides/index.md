@@ -18,6 +18,7 @@ Shape how the agent's loop behaves — standing goals, timers, middleware hooks,
 | Guide | When to read |
 |---|---|
 | [Goal mode](/guides/goal-mode) | You want the agent to pursue a standing goal across turns, not just answer one-shot |
+| [Watches](/guides/watches) | You want the agent to supervise many external conditions at once — poll a metric, react when it trips |
 | [Schedule future work](/guides/scheduler) | You want the agent to defer tasks to itself ("remind me tomorrow", recurring sweeps) — bundled local sqlite |
 | [Middleware](/guides/middleware) | You want pre/post hooks on the agent turn (plugin-contributed) |
 | [Run on a coding agent (ACP runtime)](/guides/acp-runtime) | You want an external coding agent (proto/Codex/Claude/Copilot/OpenCode) to *be* the runtime brain, with protoAgent as the shell |
@@ -74,6 +75,7 @@ Surface the agent to people — the operator console, or no UI at all.
 |---|---|
 | [Operator console (React/Tauri)](/guides/react-tauri-ui) | You want the multi-chat React console and to package it for desktop |
 | [Command palette (⌘K)](/guides/command-palette) | You want the fast keyboard path to jump between surfaces + inline chat |
+| [Access from your phone (LAN / Tailscale)](/guides/phone-access) | You want to drive the agent from your phone — installable PWA over your LAN or tailnet, add-to-home-screen |
 | [Run headless (API + A2A)](/guides/headless) | You want the agent as a service — REST + A2A — with no UI |
 
 ## Operate & deploy

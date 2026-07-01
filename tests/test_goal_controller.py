@@ -115,10 +115,12 @@ async def test_evaluate_no_progress_flags_unachievable(tmp_path):
 
 @pytest.mark.asyncio
 async def test_model_giveup_flags_unachievable(tmp_path):
-    # Verifier fails (exit 1), so the agent's give-up is honoured.
+    # Verifier fails (exit 1), so the agent's give-up (recorded mid-turn via the
+    # abandon_goal tool → request_abandon) is honoured.
     c = _ctrl(tmp_path)
     await c.parse_control('/goal {"condition": "done", "verifier": {"type": "command", "command": "exit 1"}}', "s")
-    decision = await c.evaluate("s", last_text='cannot do this <goal_unachievable reason="needs prod access"/>')
+    c.request_abandon("s", "needs prod access")
+    decision = await c.evaluate("s", last_text="cannot do this")
     assert decision.action == "done"
     assert decision.state.status == "unachievable"
     assert "prod access" in decision.state.last_reason
@@ -126,19 +128,106 @@ async def test_model_giveup_flags_unachievable(tmp_path):
 
 @pytest.mark.asyncio
 async def test_verifier_overrides_giveup(tmp_path):
-    # Ground truth wins: when the verifier passes, a same-turn give-up tag
+    # Ground truth wins: when the verifier passes, a same-turn give-up (abandon_goal)
     # must NOT mask the achievement.
     c = _ctrl(tmp_path)
     await c.parse_control('/goal {"condition": "done", "verifier": {"type": "command", "command": "exit 0"}}', "s")
-    decision = await c.evaluate("s", last_text='giving up <goal_unachievable reason="cannot proceed"/>')
+    c.request_abandon("s", "cannot proceed")
+    decision = await c.evaluate("s", last_text="giving up")
     assert decision.action == "done"
     assert decision.state.status == "achieved"
 
 
 @pytest.mark.asyncio
-async def test_checklist_extracted_and_carried(tmp_path):
+async def test_checklist_recorded_and_carried(tmp_path):
+    # The plan is recorded mid-turn via the update_goal_plan tool (→ record_plan),
+    # persisted, and fed back into the next continuation prompt.
     c = _ctrl(tmp_path)
     await c.parse_control('/goal {"condition": "done", "verifier": {"type": "command", "command": "exit 1"}}', "s")
-    decision = await c.evaluate("s", last_text="progress <goal_plan>1. do A\n2. do B</goal_plan> more")
+    c.record_plan("s", "1. do A\n2. do B")
+    decision = await c.evaluate("s", last_text="progress")
     assert "do A" in c.active_goal("s").checklist
     assert "do A" in decision.message
+
+
+# --- Phase 1 chat trust-gate (#1407) ---------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_untrusted_chat_refuses_shell_and_eval_verifiers(tmp_path):
+    # command/test/ci shell out; data+expr is a restricted-eval sink — all refused from a
+    # chat message (trusted=False), and NOTHING is set.
+    c = _ctrl(tmp_path)
+    dangerous = [
+        '/goal {"condition": "x", "verifier": {"type": "command", "command": "rm -rf /"}}',
+        '/goal {"condition": "x", "verifier": {"type": "test", "command": "pytest"}}',
+        '/goal {"condition": "x", "verifier": {"type": "ci", "pr": 1}}',
+        '/goal {"condition": "x", "verifier": {"type": "data", "path": "/x", "expr": "1"}}',
+    ]
+    for msg in dangerous:
+        reply = await c.parse_control(msg, "s", trusted=False)
+        assert "can't be" in reply.lower(), msg
+        assert c.active_goal("s") is None, msg
+
+
+@pytest.mark.asyncio
+async def test_untrusted_chat_allows_declarative_verifiers(tmp_path):
+    c = _ctrl(tmp_path)
+    ok = [
+        "/goal make the build green",  # fuzzy → llm
+        '/goal {"condition": "x", "verifier": {"type": "plugin", "check": "p:v"}}',
+        '/goal {"condition": "x", "verifier": {"type": "data", "path": "/x", "contains": "ok"}}',
+    ]
+    for msg in ok:
+        reply = await c.parse_control(msg, "s", trusted=False)
+        assert "Goal set" in reply, msg
+        c._store.clear("s")
+
+
+@pytest.mark.asyncio
+async def test_trusted_default_keeps_full_verifier_access(tmp_path):
+    # The operator/programmatic path (trusted=True, the default) is unchanged — Phase 2
+    # threads a real trust signal into the chat call sites.
+    c = _ctrl(tmp_path)
+    reply = await c.parse_control(
+        '/goal {"condition": "x", "verifier": {"type": "command", "command": "exit 0"}}', "s"
+    )
+    assert "Goal set" in reply
+    assert c.active_goal("s").verifier["type"] == "command"
+
+
+def test_chat_verifier_allow_list():
+    allowed = GoalController._chat_verifier_allowed
+    assert allowed({"type": "plugin", "check": "p:v"})
+    assert allowed({"type": "llm"})
+    assert allowed({})  # no type → defaults to llm
+    assert allowed({"type": "data", "contains": "ok"})
+    assert not allowed({"type": "data", "expr": "1"})
+    assert not allowed({"type": "data", "contains": "ok", "expr": "1"})  # expr present → refused
+    assert not allowed({"type": "command", "command": "x"})
+    assert not allowed({"type": "test"})
+    assert not allowed({"type": "ci"})
+
+
+# --- operator goal channel (ADR 0066 — POST /api/goals, operator-tier gated) -----------
+
+
+def test_set_goal_operator_accepts_dangerous_verifiers(tmp_path):
+    # The operator /api channel accepts command/test/ci/data — unlike set_goal_safe
+    # (plugin-only) — because it's reachable only under the /api operator-tier ceiling.
+    c = _ctrl(tmp_path)
+    ok, msg = c.set_goal_operator("s", "tests pass", {"type": "command", "command": "pytest -q"})
+    assert ok and "Goal set" in msg
+    assert c.active_goal("s").verifier["type"] == "command"
+
+
+def test_set_goal_operator_rejects_unknown_verifier(tmp_path):
+    c = _ctrl(tmp_path)
+    ok, msg = c.set_goal_operator("s", "x", {"type": "bogus"})
+    assert not ok and "unknown verifier type" in msg
+
+
+def test_set_goal_operator_requires_condition(tmp_path):
+    c = _ctrl(tmp_path)
+    ok, msg = c.set_goal_operator("s", "", {"type": "command", "command": "true"})
+    assert not ok and "condition is required" in msg

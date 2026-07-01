@@ -1,12 +1,13 @@
 import { Checkbox, DropdownSelect, Input, Textarea } from "@protolabsai/ui/forms";
 import { Button } from "@protolabsai/ui/primitives";
-import { Loader2, Plus, Save, Trash2, X } from "lucide-react";
+import { Plus, Save, Trash2, X } from "lucide-react";
 
 import { useState } from "react";
 
 import { api } from "../lib/api";
 import { errMsg } from "../lib/format";
 import { PanelHeader } from "@protolabsai/ui/navigation";
+import { useToast } from "@protolabsai/ui/overlays";
 
 // Author a workflow recipe from the console (Sprint C): name + inputs + steps
 // (id, subagent, prompt, depends_on) + output → POST /api/workflows, which
@@ -26,6 +27,7 @@ export function WorkflowBuilder({
   onSaved: (name: string) => void;
   onCancel: () => void;
 }) {
+  const toast = useToast();
   const fallback = subagents[0] || "researcher";
   const [name, setName] = useState("");
   const [description, setDescription] = useState("");
@@ -35,7 +37,6 @@ export function WorkflowBuilder({
   ]);
   const [output, setOutput] = useState("");
   const [saving, setSaving] = useState(false);
-  const [error, setError] = useState("");
 
   const setStep = (i: number, patch: Partial<Step>) =>
     setSteps((s) => s.map((st, j) => (j === i ? { ...st, ...patch } : st)));
@@ -57,7 +58,6 @@ export function WorkflowBuilder({
 
   async function save() {
     setSaving(true);
-    setError("");
     const last = steps[steps.length - 1].id.trim();
     const recipe: Record<string, unknown> = {
       name: name.trim(),
@@ -76,9 +76,11 @@ export function WorkflowBuilder({
     if (description.trim()) recipe.description = description.trim();
     try {
       const r = await api.saveWorkflow(recipe);
-      onSaved(r.name || name.trim());
+      const saved = r.name || name.trim();
+      toast({ tone: "success", title: "Workflow saved", message: `${saved} is ready to run.` });
+      onSaved(saved);
     } catch (e) {
-      setError(errMsg(e));
+      toast({ tone: "error", title: "Couldn't save workflow", message: errMsg(e) });
     } finally {
       setSaving(false);
     }
@@ -194,14 +196,12 @@ export function WorkflowBuilder({
         />
       </label>
 
-      {error && <p className="workflow-failed">{error}</p>}
-
       <div className="panel-actions">
         <Button variant="ghost" type="button" onClick={onCancel} disabled={saving}>
           Cancel
         </Button>
-        <Button variant="primary" type="button" onClick={() => void save()} disabled={!valid || saving}>
-          {saving ? <Loader2 className="spin" size={16} /> : <Save size={16} />}
+        <Button variant="primary" type="button" onClick={() => void save()} loading={saving} disabled={!valid}>
+          {saving ? null : <Save size={16} />}
           Save workflow
         </Button>
       </div>

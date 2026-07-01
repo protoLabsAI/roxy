@@ -26,6 +26,7 @@ routes don't serve until a process restart, so both routes flag it.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 
@@ -142,10 +143,11 @@ def register_plugin_routes(app) -> None:
         or id; one-click install runs `plugin install <repo>` (ADR 0058)."""
         import json
 
-        from graph.config_io import _BUNDLE_CONFIG_DIR, _live_config_dir
+        from infra.paths import instance_paths
 
+        ip = instance_paths()
         entries: list[dict] = []
-        for base in (_live_config_dir(), _BUNDLE_CONFIG_DIR):
+        for base in (ip.config_dir, ip.bundle_dir):
             f = base / "plugin-catalog.json"
             if f.exists():
                 try:
@@ -168,7 +170,7 @@ def register_plugin_routes(app) -> None:
             repo = entry.get("repo") or entry.get("install_url") or ""
             # Bundled built-in (still in the repo's plugins/ tree) — already present, can't
             # be git-installed over (the installer's built-in guard); show as "Bundled".
-            bundled = bool(eid) and (installer.REPO_ROOT / "plugins" / eid).exists()
+            bundled = bool(eid) and (installer.bundled_plugins_dir() / eid).exists()
             inst_id = by_url.get(_norm(repo)) or (eid if eid in by_id else None)
             out.append(
                 {
@@ -189,12 +191,10 @@ def register_plugin_routes(app) -> None:
         ref = str(body.get("ref", "")).strip() or None
         force = bool(body.get("force"))
         try:
-            summary = installer.install(
-                url,
-                ref,
-                force=force,
-                by="console",
-                allow=_sources_allowlist(),
+            # git clone + dep work is blocking — offload so it can't stall the
+            # event loop (and with it every chat/A2A/scheduler request) (#DoS).
+            summary = await asyncio.to_thread(
+                installer.install, url, ref, force=force, by="console", allow=_sources_allowlist()
             )
         except installer.InstallError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -233,9 +233,20 @@ def register_plugin_routes(app) -> None:
                     enabled.append(pid)
             from server.agent_init import _apply_settings_changes
 
-            ok, messages = _apply_settings_changes(
-                config={"plugins": {"enabled": enabled, "disabled": disabled}},
-            )
+            config_updates: dict = {"plugins": {"enabled": enabled, "disabled": disabled}}
+            # Seed the bundle's recommended per-plugin config defaults (#1350) — same trust
+            # gate as auto-enable. Defaults only: reduce against the current YAML config so an
+            # operator value (or a key they've already set) is never clobbered.
+            bundle_config = summary.get("config") if "bundle" in summary else None
+            if bundle_config:
+                from graph.config_io import config_yaml_path, load_yaml_doc
+                from graph.plugins.installer import bundle_config_overlay
+
+                current = load_yaml_doc(config_yaml_path())
+                overlay = bundle_config_overlay(bundle_config, current if isinstance(current, dict) else {})
+                config_updates.update(overlay)
+
+            ok, messages = _apply_settings_changes(config=config_updates)
             if ok:
                 reloaded, enabled_now = True, ids
             else:
@@ -308,7 +319,7 @@ def register_plugin_routes(app) -> None:
         Pinned-to-SHA plugins skip the network; the rest ls-remote their ref
         (TTL-cached + timeout-bounded so the poll can't hang). Errors are
         non-fatal per entry — surfaced in each row's ``error``."""
-        return {"plugins": installer.check_updates()}
+        return {"plugins": await asyncio.to_thread(installer.check_updates)}
 
     @app.post("/api/plugins/sync")
     async def _sync():
@@ -321,7 +332,7 @@ def register_plugin_routes(app) -> None:
         (e.g. a restored data dir whose config still enables it), hot-reload so
         it comes up live — a previously-missing plugin has no mounted router, so
         the hot-mount path applies and no restart is needed."""
-        results = installer.sync(allow=_sources_allowlist())
+        results = await asyncio.to_thread(installer.sync, allow=_sources_allowlist())
         fetched = {r["id"] for r in results if r.get("status") == "installed"}
 
         reloaded = False
@@ -366,12 +377,8 @@ def register_plugin_routes(app) -> None:
             )
         ref = entry.get("requested_ref", "") or None
         try:
-            summary = installer.install(
-                source_url,
-                ref,
-                force=True,
-                by="console",
-                allow=_sources_allowlist(),
+            summary = await asyncio.to_thread(
+                installer.install, source_url, ref, force=True, by="console", allow=_sources_allowlist()
             )
         except installer.InstallError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc

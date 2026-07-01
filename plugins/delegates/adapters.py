@@ -67,6 +67,7 @@ class Delegate:
     url: str = ""
     auth_scheme: str = ""  # "" | bearer | apiKey
     auth_token: str = ""  # secret value (from secrets.yaml overlay)
+    poll_timeout_s: float = 300.0  # a2a: max seconds to await a long-running delegated task
 
     # openai
     model: str = ""
@@ -146,6 +147,55 @@ async def _timed(coro) -> tuple[object, int]:
     return res, int((time.monotonic() - t0) * 1000)
 
 
+def _a2a_error_detail(d: Delegate, err: object) -> str:
+    """Turn a JSON-RPC error payload into an operator-legible cause — especially the
+    version-skew case, which otherwise surfaces as an opaque ``-32009``."""
+    code = err.get("code") if isinstance(err, dict) else None
+    msg = str(err.get("message")) if isinstance(err, dict) else str(err)
+    if code == -32009 or "VERSION_NOT_SUPPORTED" in str(err).upper():
+        return (
+            f"delegate {d.name!r}: peer rejected A2A-Version 1.0 (VERSION_NOT_SUPPORTED) — it speaks "
+            "an older A2A dialect. Upgrade the peer, or point its url at a 1.0 /a2a endpoint."
+        )
+    return f"delegate {d.name!r}: {msg or err}"
+
+
+# The A2A protocol version(s) our delegate client can speak (it sends the
+# ``A2A-Version: 1.0`` header + the 1.0 SendMessage/GetTask dialect). Used to
+# pre-check a peer's advertised version and fail fast on a clear mismatch.
+_A2A_SUPPORTED_VERSIONS = ("1.0",)
+
+
+def _advertised_a2a_versions(card: dict) -> list[str]:
+    """Every A2A protocol version a peer's agent-card advertises (de-duped, in
+    first-seen order), or ``[]`` if the card says nothing about it.
+
+    Reads the native proto field (``supportedInterfaces[].protocolVersion``) AND
+    the proto-free top-level hint (``protocolVersion`` / ``supportedVersions``)
+    that protoLabs agents also expose — so an older or non-protoLabs peer is still
+    understood when it advertises its version in either shape. ``[]`` means
+    *don't know* (older peers, partial cards): callers must treat that as
+    best-effort and NOT block."""
+    if not isinstance(card, dict):
+        return []
+    seen: list[str] = []
+
+    def _add(v: object) -> None:
+        s = str(v or "").strip()
+        if s and s not in seen:
+            seen.append(s)
+
+    for iface in card.get("supportedInterfaces") or []:
+        if isinstance(iface, dict):
+            _add(iface.get("protocolVersion"))
+    _add(card.get("protocolVersion"))
+    versions = card.get("supportedVersions")
+    if isinstance(versions, (list, tuple)):
+        for v in versions:
+            _add(v)
+    return seen
+
+
 class A2aAdapter(Adapter):
     type = "a2a"
     label = "A2A agent"
@@ -175,6 +225,15 @@ class A2aAdapter(Adapter):
                 "secret",
                 help="Stored in secrets.yaml (gitignored), never in tracked config.",
             ),
+            FieldSpec(
+                "poll_timeout_s",
+                "Task poll timeout (s)",
+                "number",
+                default=300,
+                help="Max seconds to wait for a long-running delegated task to finish before "
+                "giving up locally — the peer keeps working. Raise it for slow agents (e.g. a "
+                "code build); the old fixed 30s cut long tasks off mid-flight.",
+            ),
         ]
 
     def parse(self, raw: dict) -> Delegate:
@@ -185,9 +244,15 @@ class A2aAdapter(Adapter):
         auth = raw.get("auth") or {}
         d.auth_scheme = str(auth.get("scheme", "")).strip()
         d.auth_token = _secret(auth, "token", "credentialsEnv")
+        try:
+            d.poll_timeout_s = float(raw.get("poll_timeout_s") or 300.0)
+        except (TypeError, ValueError):
+            d.poll_timeout_s = 300.0
         return d
 
     async def dispatch(self, d: Delegate, query: str, *, timeout: float | None = None) -> str:
+        import time
+
         import httpx
 
         from security import policy
@@ -196,6 +261,20 @@ class A2aAdapter(Adapter):
         blocked = policy.check_url(d.url)
         if blocked:
             raise DelegateError(blocked.replace("destination", f"delegate {d.name!r}", 1))
+        # Pre-flight protocol-version check (best-effort). Fetch the peer's card and, if
+        # it CLEARLY advertises an A2A protocol version we can't speak, fail fast with a
+        # legible mismatch instead of sending and waiting for the opaque -32009
+        # VERSION_NOT_SUPPORTED mid-dispatch. A silent/unreachable card never blocks — we
+        # fall through to dispatch, whose -32009 mapping (``_a2a_error_detail``) still applies.
+        info = await self.probe(d)
+        advertised = info.get("supported_versions") or []
+        if advertised and not any(v in _A2A_SUPPORTED_VERSIONS for v in advertised):
+            raise DelegateError(
+                f"delegate {d.name!r} advertises A2A protocol {'/'.join(advertised)} but this agent "
+                f"speaks {'/'.join(_A2A_SUPPORTED_VERSIONS)} — refusing to dispatch (an older peer "
+                "would reject the call with -32009 VERSION_NOT_SUPPORTED). Upgrade the peer, or point "
+                "its url at a 1.0 /a2a endpoint."
+            )
         # A2A-Version is mandatory for an a2a-sdk >=1.0 peer: a missing header defaults
         # to 0.3 on the receiver → -32009 VERSION_NOT_SUPPORTED (ADR 0051 audit). The
         # scheduler/inbox/background self-POSTs already set it; the delegate client must too.
@@ -207,17 +286,30 @@ class A2aAdapter(Adapter):
 
         async def _rpc(client, method, params):
             body = {"jsonrpc": "2.0", "id": str(uuid.uuid4()), "method": method, "params": params}
-            r = await client.post(d.url, json=body, headers=headers)
+            # Map transport failures to a legible CAUSE — a delegating agent (and the
+            # operator) needs "unreachable" vs "timed out" vs "version-incompatible",
+            # not an opaque stack trace or a bare connection error.
+            try:
+                r = await client.post(d.url, json=body, headers=headers)
+            except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
+                raise DelegateError(f"delegate {d.name!r} unreachable at {d.url} ({type(exc).__name__})") from exc
+            except httpx.TimeoutException as exc:
+                raise DelegateError(f"delegate {d.name!r} timed out contacting {d.url}") from exc
+            except httpx.HTTPError as exc:
+                raise DelegateError(f"delegate {d.name!r} transport error: {str(exc)[:160]}") from exc
             if r.status_code >= 400:
-                raise DelegateError(f"HTTP {r.status_code}: {r.text[:200]}")
+                raise DelegateError(f"delegate {d.name!r} HTTP {r.status_code}: {r.text[:200]}")
             data = r.json()
             if data.get("error"):
-                raise DelegateError(str(data["error"]))
+                raise DelegateError(_a2a_error_detail(d, data["error"]))
             return data.get("result") or {}
 
+        poll_timeout = d.poll_timeout_s if d.poll_timeout_s and d.poll_timeout_s > 0 else 300.0
         # A2A 1.0 (a2a-sdk >=1.0): JSON-RPC `SendMessage` / `GetTask`, the ROLE_USER
         # enum, and a `result.task` envelope. (`message/send` + lowercase `user` is
-        # the v0.3 legacy dialect, which 1.0 servers reject with -32601.)
+        # the v0.3 legacy dialect, which 1.0 servers reject with -32601.) The per-request
+        # client timeout caps a single call; the poll DEADLINE caps the overall wait for a
+        # long-running task — so a 2-minute delegated task no longer fails at the old 30s.
         async with httpx.AsyncClient(timeout=timeout or 60) as client:
             result = await _rpc(
                 client,
@@ -236,17 +328,22 @@ class A2aAdapter(Adapter):
             task = result.get("task", result) or {}
             task_id = task.get("id")
             state = (task.get("status") or {}).get("state")
-            polls = 0
-            while task_id and not _is_terminal(state) and polls < 30:
+            deadline = time.monotonic() + poll_timeout
+            while task_id and not _is_terminal(state) and time.monotonic() < deadline:
                 await asyncio.sleep(1.0)
-                polls += 1
                 result = await _rpc(client, "GetTask", {"name": task_id})
                 task = result.get("task", result) or {}
                 state = (task.get("status") or {}).get("state")
             text = _extract_text(result)
             if text:
                 return text
-            raise DelegateError(f"no text returned (state={state})")
+            if task_id and not _is_terminal(state):
+                raise DelegateError(
+                    f"delegate {d.name!r} still running after {int(poll_timeout)}s — the peer may "
+                    f"still be working; raise its poll timeout if tasks legitimately take longer "
+                    f"(state={state})"
+                )
+            raise DelegateError(f"delegate {d.name!r} returned no text (state={state})")
 
     async def probe(self, d: Delegate) -> dict:
         import httpx
@@ -263,8 +360,23 @@ class A2aAdapter(Adapter):
                 r, ms = await _timed(client.get(card))
             if r.status_code >= 400:
                 return {"ok": False, "latency_ms": ms, "error": f"HTTP {r.status_code}"}
-            name = (r.json() or {}).get("name", "")
-            return {"ok": True, "latency_ms": ms, "detail": f"agent-card OK ({name})"}
+            body = r.json() or {}
+            name = body.get("name", "")
+            # Capture the peer's advertised A2A protocol version(s) so a caller (and
+            # dispatch's pre-check) can fail fast on a version mismatch. ``version`` is
+            # the peer's APP version (distinct); ``protocol_version`` is the primary
+            # advertised protocol, "" when the card is silent (older peers).
+            advertised = _advertised_a2a_versions(body)
+            pv = advertised[0] if advertised else ""
+            detail = f"agent-card OK ({name})" + (f", A2A {pv}" if pv else "")
+            return {
+                "ok": True,
+                "latency_ms": ms,
+                "protocol_version": pv,
+                "supported_versions": advertised,
+                "version": body.get("version", ""),
+                "detail": detail,
+            }
         except Exception as exc:  # noqa: BLE001
             return {"ok": False, "error": str(exc)[:200]}
 
@@ -362,7 +474,13 @@ class AcpAdapter(Adapter):
                 placeholder="proto",
                 help="Binary on PATH that speaks ACP (e.g. proto). For Claude Code use `claude-code` — an alias for the claude-agent-acp adapter.",
             ),
-            FieldSpec("args", "Args", "args", placeholder="--acp", help="Launch args (e.g. --acp). Leave empty for claude-code."),
+            FieldSpec(
+                "args",
+                "Args",
+                "args",
+                placeholder="--acp",
+                help="Launch args (e.g. --acp). Leave empty for claude-code.",
+            ),
             FieldSpec(
                 "workdir",
                 "Workdir",
@@ -438,7 +556,7 @@ class AcpAdapter(Adapter):
 
     async def dispatch(self, d: Delegate, query: str, *, timeout: float | None = None) -> str:
         # Reuse the ADR 0024 ACP client + by-kind permission policy.
-        from plugins.coding_agent import _client_for, _make_permission
+        from plugins.coding_agent import _client_for, _drop_client, _make_permission
         from plugins.coding_agent.acp_client import AcpError
 
         spec = self._spec(d)
@@ -446,6 +564,15 @@ class AcpAdapter(Adapter):
         client._permission = _make_permission(spec)
         try:
             return await client.prompt(query, timeout=timeout or d.timeout_s)
+        except asyncio.CancelledError:
+            # The turn was stopped (operator hit stop, or an orchestrator watchdog
+            # fired). The client is POOLED, so without this its subprocess keeps
+            # running detached — exactly "I stopped the main thread and the delegate
+            # didn't stop". Drop it from the pool + SIGKILL the agent tree NOW
+            # (synchronous, no awaits — we're mid-cancellation) before re-raising.
+            _drop_client(spec)
+            client.kill_now()
+            raise
         except AcpError as exc:
             raise DelegateError(str(exc))
 
@@ -473,13 +600,17 @@ class AcpAdapter(Adapter):
         return await forget_session(self._spec(d))
 
     async def probe(self, d: Delegate) -> dict:
-        """Reachability check for the panel's Test button.
+        """Reachability check for the panel's Test button (also the periodic health
+        prober's per-delegate check).
 
         Does a REAL ACP `initialize` handshake (spawn the command, complete the
-        protocol handshake, close — no session/prompt), so a launch command that's
-        on PATH and workdir-valid but doesn't actually speak ACP FAILS the probe
-        instead of showing green (issue #1116 — the old PATH+workdir check passed
-        `command: claude` while every dispatch failed with an opaque `agent exited`).
+        protocol handshake, close) — and NOTHING more: no `session/new`, no
+        `session/load`, no `session/prompt`. So a launch command that's on PATH and
+        workdir-valid but doesn't actually speak ACP FAILS the probe instead of
+        showing green (issue #1116 — the old PATH+workdir check passed `command:
+        claude` while every dispatch failed with an opaque `agent exited`), while a
+        probe stays genuinely cheap + side-effect-free: it never opens a session every
+        120s the way the old `_ensure_started` path did (#1300).
         """
         import asyncio
         import os
@@ -496,7 +627,14 @@ class AcpAdapter(Adapter):
                     "command: claude-code (an alias) or claude-agent-acp."
                 ),
             }
-        if not shutil.which(d.command):
+        # Resolve the command against the SAME PATH the real spawn will use — the
+        # delegate's env PATH overlaid on the process PATH — not just os.environ.
+        # The actual ACP launch merges d.env (acp_client `_launch_env`/`env=…`), so a
+        # delegate that supplies its own PATH (or runs under the desktop app's
+        # augmented PATH) would spawn fine, yet the probe's bare `shutil.which` still
+        # red-X'd it. Probe and spawn now agree on where to look (#1299).
+        merged_path = (d.env or {}).get("PATH") or os.environ.get("PATH")
+        if not shutil.which(d.command, path=merged_path):
             if os.path.basename(d.command) == "claude-agent-acp":
                 return {
                     "ok": False,
@@ -507,13 +645,14 @@ class AcpAdapter(Adapter):
         if not os.path.isdir(wd):
             return {"ok": False, "error": f"workdir does not exist: {wd}"}
 
-        # Real handshake. `_ensure_started` spawns the agent and runs ACP `initialize`
-        # (it does NOT open a session), so it's a cheap, side-effect-free liveness check.
+        # Real handshake — `handshake()` spawns the agent and runs ACP `initialize`
+        # ONLY (no session/new, no session/load), so it's a cheap, genuinely
+        # side-effect-free liveness check (#1300).
         from plugins.coding_agent.acp_client import AcpClient
 
         client = AcpClient(command=d.command, args=d.args, cwd=wd, env=(d.env or None), name=d.name)
         try:
-            await asyncio.wait_for(client._ensure_started(), timeout=45)
+            await asyncio.wait_for(client.handshake(), timeout=45)
         except asyncio.TimeoutError:
             return {"ok": False, "error": f"ACP handshake timed out — does {d.command!r} speak ACP?"}
         except Exception as exc:  # noqa: BLE001 — spawn/handshake failure → tool-visible string

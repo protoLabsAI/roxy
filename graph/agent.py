@@ -7,6 +7,7 @@ Uses langchain's create_agent() with AgentMiddleware for the DeerFlow pattern.
 from typing import Annotated, Any
 
 from langchain.agents import create_agent
+from langchain_core.messages import AIMessage, ToolMessage
 from langchain_core.tools import BaseTool
 from langgraph.prebuilt import InjectedState
 
@@ -19,7 +20,7 @@ from graph.middleware.memory import SessionSummaryMiddleware
 from graph.middleware.message_capture import MessageCaptureMiddleware
 from graph.state import ProtoAgentState
 from graph.subagents.config import SUBAGENT_REGISTRY
-from tools.lg_tools import _session_id_from, get_all_tools
+from tools.lg_tools import HITL_TOOL_NAMES, _session_id_from, get_all_tools
 
 
 def _build_middleware(config: LangGraphConfig, knowledge_store=None, skills_index=None, extra_middleware=None):
@@ -39,6 +40,13 @@ def _build_middleware(config: LangGraphConfig, knowledge_store=None, skills_inde
     from graph.middleware.wait_yield import WaitYieldMiddleware
 
     middleware.append(WaitYieldMiddleware())
+
+    # Break a no-progress tool loop (#1446) — the same tool + args returning the
+    # same result over and over. Nudge once, then end the turn instead of spinning
+    # to the recursion limit. No-op on any healthy/varied history.
+    from graph.middleware.stall_guard import StallGuardMiddleware
+
+    middleware.append(StallGuardMiddleware())
 
     # Mid-turn user steering (spike) — fold queued user input into the running
     # turn at the next model call, so a user can redirect ongoing work without
@@ -194,6 +202,32 @@ def _parse_compaction_trigger(spec: str):
     return ("fraction", 0.8)
 
 
+class SubagentError(RuntimeError):
+    """A subagent delegation failed hard (the subagent itself raised). The ``task``
+    tool converts this into a ``status="error"`` ToolMessage so the console renders
+    the delegation card as a failure (X) — not a green "done" wrapping an ``Error:``
+    string (which read as success). ``task_batch`` reports it inline and continues."""
+
+
+def _subagent_tools(sub_config, tool_map: dict) -> list:
+    """Resolve a subagent's bound tools from its allowlist, hard-denying the lead-only HITL
+    interrupt tools (``HITL_TOOL_NAMES``) even if the config lists them. A subagent runs on a
+    checkpointer-less graph, so ``ask_human`` / ``request_user_input`` would fail opaquely
+    mid-delegation — this is the enforced backstop to the convention that no subagent allowlist
+    names them, so a fork can't enable one by editing a ``SubagentConfig.tools`` list."""
+    blocked = [n for n in sub_config.tools if n in HITL_TOOL_NAMES]
+    if blocked:
+        import logging
+
+        logging.getLogger(__name__).warning(
+            "[subagent] '%s' lists HITL tool(s) %s — dropping them; a subagent can't resume a "
+            "LangGraph interrupt (no checkpointer). Remove them from its tools list.",
+            sub_config.name,
+            blocked,
+        )
+    return [tool_map[name] for name in sub_config.tools if name in tool_map and name not in HITL_TOOL_NAMES]
+
+
 async def _run_subagent(
     *,
     config,
@@ -203,18 +237,22 @@ async def _run_subagent(
     prompt: str,
     subagent_type: str,
     truncate: int | None = None,
+    parent_task_id: str | None = None,
 ) -> str:
     """Run a single subagent delegation and return its output text.
 
     Shared by the single ``task`` tool and the concurrent ``task_batch`` tool.
     ``truncate`` (chars) bounds the returned body so a wide fan-out can't blow
     the parent context; ``None`` means unbounded (single-task path).
+    ``parent_task_id`` is the delegating ``task``/``task_batch`` tool-call id; when
+    set, every event the subagent emits is tagged with it so the console can nest
+    the subagent's own tool cards under the delegation card.
     """
     sub_config = SUBAGENT_REGISTRY.get(subagent_type)
     if not sub_config:
         return f"Error: Unknown subagent '{subagent_type}'. Available: {available_subagents}"
 
-    sub_tools = [tool_map[name] for name in sub_config.tools if name in tool_map]
+    sub_tools = _subagent_tools(sub_config, tool_map)
     if not sub_tools:
         return f"Error: No tools available for subagent '{subagent_type}'."
 
@@ -246,21 +284,33 @@ async def _run_subagent(
         system_prompt=build_subagent_prompt(subagent_type),
     )
 
+    # Tag every event the subagent emits with the parent delegation's tool-call id.
+    # LangChain propagates config metadata to all child runs, so the subagent's own
+    # tool frames carry `parent_task_id` — letting the console nest them under the
+    # `task` card BY ID rather than by frame ordering (the delegation runs detached
+    # via ensure_future, so its on_tool_end races AHEAD of these child frames).
+    sub_run_config: dict[str, Any] = {"recursion_limit": sub_config.max_turns}
+    if parent_task_id:
+        sub_run_config["metadata"] = {"parent_task_id": parent_task_id}
+
     try:
         result = await subagent.ainvoke(
             {"messages": [{"role": "user", "content": prompt}]},
-            config={"recursion_limit": sub_config.max_turns},
+            config=sub_run_config,
         )
 
         messages = result.get("messages", [])
 
+        # The delegation's answer is the subagent's last AIMessage with content —
+        # not "any message with content" (which could surface a raw tool dump) and
+        # not gated on a fragile startswith("Error") text sniff (which discarded a
+        # legitimate answer that opened with "Error"). Hard failures already raise
+        # SubagentError below, so they never reach here.
         body = None
         for msg in reversed(messages):
-            if hasattr(msg, "content") and msg.content:
-                content = msg.content if isinstance(msg.content, str) else str(msg.content)
-                if content and not content.startswith("Error"):
-                    body = content
-                    break
+            if isinstance(msg, AIMessage) and msg.content:
+                body = msg.content if isinstance(msg.content, str) else str(msg.content)
+                break
 
         if body is None:
             return f"[{subagent_type} completed: {description}] -- no output produced."
@@ -270,7 +320,10 @@ async def _run_subagent(
 
         return f"[{subagent_type} completed: {description}]\n\n{body}"
     except Exception as e:
-        return f"Error: Subagent '{subagent_type}' failed: {e}"
+        # Surface a hard subagent failure as a tool ERROR (X) rather than a green
+        # "done" wrapping an "Error:" string. Callers (``task``/``task_batch``)
+        # turn this into a status="error" ToolMessage or an inline batch error line.
+        raise SubagentError(f"Subagent '{subagent_type}' failed: {e}") from e
 
 
 async def run_manual_subagent(
@@ -309,6 +362,7 @@ async def run_manual_subagent(
         inbox_store=STATE.inbox_store,
         tasks_store=STATE.tasks_store,
         goal_enabled=getattr(config, "goal_enabled", False),
+        graph_config=config,
     )
     if extra_tools:
         all_tools = all_tools + list(extra_tools)
@@ -474,11 +528,19 @@ def _build_task_tools(config: LangGraphConfig, all_tools: list[BaseTool], backgr
                     prompt=prompt,
                     subagent_type=subagent_type,
                     truncate=None,
+                    parent_task_id=tool_call_id,
                 )
             )
             done, _pending = await asyncio.wait({inline}, timeout=auto_s)
             if inline in done:
-                return inline.result()
+                try:
+                    return inline.result()
+                except SubagentError as e:
+                    return ToolMessage(
+                        content=f"[{e}. Continue without its result.]",
+                        tool_call_id=tool_call_id,
+                        status="error",
+                    )
             inline.cancel()
             try:
                 await inline
@@ -509,6 +571,7 @@ def _build_task_tools(config: LangGraphConfig, all_tools: list[BaseTool], backgr
                 prompt=prompt,
                 subagent_type=subagent_type,
                 truncate=None,
+                parent_task_id=tool_call_id,
             )
         )
         delegations.register(session_id, tool_call_id, deleg, label=description)
@@ -518,16 +581,33 @@ def _build_task_tools(config: LangGraphConfig, all_tools: list[BaseTool], backgr
             # User-initiated delegation cancel → swallow and let the lead keep going;
             # a turn-level cancel (flag unset) → re-raise so the whole turn unwinds.
             if delegations.was_cancelled(session_id, tool_call_id):
-                return (
-                    f"[delegation cancelled by the user before it finished: "
-                    f"{subagent_type} — {description}. Continue without its result.]"
+                return ToolMessage(
+                    content=(
+                        f"[delegation cancelled by the user before it finished: "
+                        f"{subagent_type} — {description}. Continue without its result.]"
+                    ),
+                    tool_call_id=tool_call_id,
+                    status="error",  # cancelled → the card closes as an X, not green "done"
                 )
             raise
+        except SubagentError as e:
+            # Subagent crashed → close the delegation card as a failure (X) while still
+            # handing the lead a readable result so it can continue without it.
+            return ToolMessage(
+                content=f"[{e}. Continue without its result.]",
+                tool_call_id=tool_call_id,
+                status="error",
+            )
         finally:
             delegations.unregister(session_id, tool_call_id)
 
     @tool
-    async def task_batch(tasks: list[dict]) -> str:
+    async def task_batch(
+        tasks: list[dict],
+        run_in_background: bool = False,
+        state: Annotated[Any, InjectedState] = None,
+        tool_call_id: Annotated[str, InjectedToolCallId] = "",
+    ) -> str:
         """Delegate several independent tasks to subagents concurrently.
 
         Prefer this over multiple sequential ``task`` calls whenever the
@@ -542,15 +622,62 @@ def _build_task_tools(config: LangGraphConfig, all_tools: list[BaseTool], backgr
                 - ``description`` (str, required): short summary of the task
                 - ``prompt`` (str, required): detailed instructions
                 - ``subagent_type`` (str, optional): defaults to "researcher"
+            run_in_background: Set True to fan the whole batch out DETACHED — every
+                task spawns as its own background agent and this returns IMMEDIATELY
+                with their job ids, instead of blocking until they finish. Use it for a
+                wide fan-out of long / independent / quota-heavy work (research several
+                topics at once) you don't need to wait on; you'll be notified as each
+                finishes. When you set this, do NOT poll, re-check, or re-spawn — just
+                continue. Leave False (the default) when you need the results in this
+                turn. Concurrency is capped either way.
 
         Returns the results concatenated in the same order as ``tasks``, each
         prefixed with its 1-based index. Individual failures are reported
-        inline and do not abort the batch.
+        inline and do not abort the batch. With ``run_in_background`` the return is
+        instead the list of started job ids (results arrive later as notifications).
         """
         if not tasks:
             return "Error: task_batch called with an empty task list."
         if not isinstance(tasks, list):
             return "Error: 'tasks' must be a list of task objects."
+
+        # Background fan-out (ADR 0050): spawn every spec detached and return immediately
+        # with the job ids — the multi-task analog of task(run_in_background=True), through
+        # the same BackgroundManager.spawn. Each completion drains back into this session
+        # independently (one task-notification per job); the manager's concurrency cap bounds
+        # how many run at once. Degrades to the foreground batch below when no manager exists.
+        if run_in_background and background_mgr is not None:
+            session_id = _session_id_from(state)
+            lines: list[str] = []
+            started = 0
+            for i, spec in enumerate(tasks, start=1):
+                if not isinstance(spec, dict):
+                    lines.append(f"Task {i}: skipped — each task must be an object.")
+                    continue
+                desc = spec.get("description") or "(no description)"
+                prm = spec.get("prompt")
+                st = spec.get("subagent_type", "researcher")
+                if not prm:
+                    lines.append(f"Task {i} ({desc}): skipped — missing 'prompt'.")
+                    continue
+                if st not in SUBAGENT_REGISTRY:
+                    lines.append(f"Task {i} ({desc}): skipped — unknown subagent '{st}'.")
+                    continue
+                job_id = await background_mgr.spawn(
+                    origin_session=session_id,
+                    subagent_type=st,
+                    description=desc,
+                    prompt=prm,
+                )
+                started += 1
+                lines.append(f"Task {i}: {job_id} ({st}: {desc})")
+            if not started:
+                return "No background tasks started:\n" + "\n".join(lines)
+            return (
+                f"Started {started} background agent(s), running detached. You will be "
+                "notified automatically as each finishes — do NOT poll, re-check, or "
+                "re-spawn; continue with other work.\n" + "\n".join(lines)
+            )
 
         sem = asyncio.Semaphore(max_concurrency)
 
@@ -562,15 +689,20 @@ def _build_task_tools(config: LangGraphConfig, all_tools: list[BaseTool], backgr
             if not prm:
                 return f"Error: task '{desc}' is missing 'prompt'."
             async with sem:
-                return await _run_subagent(
-                    config=config,
-                    tool_map=tool_map,
-                    available_subagents=available_subagents,
-                    description=desc,
-                    prompt=prm,
-                    subagent_type=spec.get("subagent_type", "researcher"),
-                    truncate=truncate,
-                )
+                try:
+                    return await _run_subagent(
+                        config=config,
+                        tool_map=tool_map,
+                        available_subagents=available_subagents,
+                        description=desc,
+                        prompt=prm,
+                        subagent_type=spec.get("subagent_type", "researcher"),
+                        truncate=truncate,
+                        parent_task_id=tool_call_id,
+                    )
+                except SubagentError as e:
+                    # One failed delegation is reported inline; the batch goes on.
+                    return f"Error: {e}"
 
         results = await asyncio.gather(*(_one(s) for s in tasks), return_exceptions=True)
 
@@ -677,6 +809,10 @@ def create_agent_graph(
         # Subagent builds deliberately omit it: subagents are bounded by
         # max_turns and must not self-set goals.
         goal_enabled=config.goal_enabled,
+        # Lets knowledge_ingest build the gateway STT/vision fns for audio/video/image.
+        graph_config=config,
+        # Lets knowledge_ingest detach a slow URL/media ingest as a background job (ADR 0050).
+        background_mgr=background_mgr,
     )
 
     if extra_tools:
@@ -763,7 +899,7 @@ def create_simple_agent(config: LangGraphConfig, knowledge_store=None, scheduler
     from langgraph.prebuilt import create_react_agent
 
     llm = create_llm(config)
-    all_tools = get_all_tools(knowledge_store, scheduler=scheduler)
+    all_tools = get_all_tools(knowledge_store, scheduler=scheduler, graph_config=config)
 
     system_prompt = build_system_prompt(include_subagents=False)
 

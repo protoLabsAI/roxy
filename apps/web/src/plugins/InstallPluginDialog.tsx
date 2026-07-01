@@ -2,7 +2,7 @@ import { Button } from "@protolabsai/ui/primitives";
 import { Input } from "@protolabsai/ui/forms";
 import { Dialog } from "@protolabsai/ui/overlays";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
-import { Loader2, Plus } from "lucide-react";
+import { Plus } from "lucide-react";
 import { useState } from "react";
 
 import { api } from "../lib/api";
@@ -28,6 +28,10 @@ export function InstallPluginDialog({ open, onClose }: { open: boolean; onClose:
       // gates Uninstall.
       qc.invalidateQueries({ queryKey: runtimeStatusQuery().queryKey });
       qc.invalidateQueries({ queryKey: queryKeys.installedPlugins });
+      // Install auto-enables the plugin, so its declared Settings fields (ADR 0019) are
+      // now in the schema — refetch it or the plugin's config section won't appear until
+      // a restart clears the 5-min-stale cache (#1423).
+      qc.invalidateQueries({ queryKey: queryKeys.settings });
       setUrl("");
       setRef("");
       // Clean install (auto-enabled, nothing to flag) → close; the new row shows in the
@@ -41,11 +45,11 @@ export function InstallPluginDialog({ open, onClose }: { open: boolean; onClose:
       const deps = s.requires_pip?.length ? ` — declares deps (install manually): ${s.requires_pip.join(", ")}` : "";
       setStatus(
         res.enable_error
-          ? `✓ installed ${who} — auto-enable failed (${res.enable_error}); enable it from the list${deps}`
-          : `✓ installed ${who}${deps}`,
+          ? `Installed ${who} — auto-enable failed (${res.enable_error}); enable it from the list${deps}`
+          : `Installed ${who}${deps}`,
       );
     },
-    onError: (e: unknown) => setStatus(`✗ ${e instanceof Error ? e.message : "install failed"}`),
+    onError: (e: unknown) => setStatus(e instanceof Error ? e.message : "install failed"),
   });
 
   if (!open) return null;
@@ -75,10 +79,11 @@ export function InstallPluginDialog({ open, onClose }: { open: boolean; onClose:
         />
         <Button
           variant="primary"
-          disabled={!url.trim() || install.isPending}
+          loading={install.isPending}
+          disabled={!url.trim()}
           onClick={() => { setStatus(""); install.mutate(); }}
         >
-          {install.isPending ? <Loader2 className="spin" size={15} /> : <Plus size={15} />} Install
+          {install.isPending ? null : <Plus size={15} />} Install
         </Button>
       </div>
       {status ? <p className="plugin-install-status" role="status">{status}</p> : null}

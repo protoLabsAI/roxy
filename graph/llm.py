@@ -18,6 +18,26 @@ log = logging.getLogger(__name__)
 _GATEWAY_UA = "protoAgent/0.1 (+https://github.com/protoLabsAI/protoAgent)"
 
 
+class _ReasoningChatOpenAI(ChatOpenAI):
+    """ChatOpenAI that surfaces the gateway's NATIVE reasoning stream.
+
+    The base class deliberately drops the non-OpenAI ``reasoning_content`` delta field
+    ("Use a provider-specific subclass" — its own docstring); DeepSeek and most reasoning
+    models routed through our LiteLLM gateway emit it token-by-token. We lift it into the
+    message's ``additional_kwargs`` so the chat stream can render the model's REAL thinking
+    in real time, instead of a prompted ``<scratch_pad>`` narration.
+    """
+
+    def _convert_chunk_to_generation_chunk(self, chunk, default_chunk_class, base_generation_info):
+        gen = super()._convert_chunk_to_generation_chunk(chunk, default_chunk_class, base_generation_info)
+        if gen is not None:
+            choices = chunk.get("choices") or []
+            reasoning = (choices[0].get("delta") or {}).get("reasoning_content") if choices else None
+            if reasoning:
+                gen.message.additional_kwargs["reasoning_content"] = reasoning
+        return gen
+
+
 def _build_llm_kwargs(config: LangGraphConfig) -> dict:
     """Assemble the ChatOpenAI kwargs from config (extracted for testing)."""
     api_key = config.api_key or os.environ.get("OPENAI_API_KEY", "")
@@ -134,7 +154,19 @@ def create_llm(
     # caches per (model, effort) so the rebuild is paid once.
     if reasoning_effort:
         kwargs["reasoning_effort"] = reasoning_effort
-    return ChatOpenAI(**kwargs)
+    # Context window (#1378): seed the model profile with the gateway's reported
+    # max_input_tokens so SummarizationMiddleware can resolve fraction:/tokens: compaction
+    # (instead of falling back to a message count) and the chat context meter (#1372) gets a
+    # real denominator. Best-effort + cached — an unknown window just omits the profile.
+    try:
+        from graph.model_window import context_window_for
+
+        win = context_window_for(config, kwargs.get("model"))
+        if win:
+            kwargs.setdefault("profile", {"max_input_tokens": win})
+    except Exception:  # noqa: BLE001 — model-info must never break model creation
+        log.debug("[llm] context-window resolution skipped", exc_info=True)
+    return _ReasoningChatOpenAI(**kwargs)
 
 
 def _build_embeddings(config: LangGraphConfig) -> "OpenAIEmbeddings | None":
@@ -218,6 +250,52 @@ def create_transcribe_fn(
             return (resp.json().get("text") or "").strip()
 
     return _transcribe
+
+
+_DESCRIBE_IMAGE_PROMPT = (
+    "Describe this image in detail for a text-only model that cannot see it. Transcribe ALL "
+    "visible text verbatim (UI labels, code, error messages, captions), then describe the "
+    "layout and salient visual content. Be thorough and literal — this description is the "
+    "only way the downstream model can understand the image. No preamble."
+)
+
+
+def create_describe_image_fn(
+    config: LangGraphConfig,
+) -> Callable[[bytes, str, str], str] | None:
+    """Build a sync ``(image_bytes, mime, filename) -> description`` function, or None (#1381).
+
+    Lets a TEXT-only chat model "see" an attached image: the bytes are sent to the configured
+    vision model (``knowledge.image_describe_model``) as an OpenAI ``image_url`` block, and its
+    description + transcribed text is inlined as context by the attachment pipeline — the same
+    shape as ``create_transcribe_fn`` does for audio. Returns ``None`` when no describe model is
+    configured (images then stay unsupported on non-vision models, with a clear error)."""
+    model = (getattr(config, "image_describe_model", "") or "").strip()
+    if not model:
+        return None
+    llm = create_llm(config, model_name=model)
+
+    def _describe(data: bytes, mime: str, filename: str) -> str:
+        import base64
+
+        from langchain_core.messages import HumanMessage
+
+        from graph.output_format import extract_output
+
+        uri = f"data:{mime or 'image/png'};base64,{base64.b64encode(data).decode()}"
+        resp = llm.invoke(
+            [
+                HumanMessage(
+                    content=[
+                        {"type": "text", "text": _DESCRIBE_IMAGE_PROMPT},
+                        {"type": "image_url", "image_url": {"url": uri}},
+                    ]
+                )
+            ]
+        )
+        return extract_output(str(resp.content)).strip()
+
+    return _describe
 
 
 # Contextual Retrieval (Anthropic) — situate each chunk in its source document

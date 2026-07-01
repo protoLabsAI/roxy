@@ -28,18 +28,27 @@ class PluginRegistry:
       (``register_subagent``).
     - ``mcp_servers`` — managed MCP server factories ``config -> entry|None``
       injected into MCP discovery (``register_mcp_server``).
+    - ``chat_commands`` — user-only ``/<name>`` control commands that short-circuit
+      the turn, like ``/goal`` (``register_chat_command``).
 
     Routes mount + surfaces start **once** at process init; a config reload reuses
     them — changing ``plugins.enabled`` needs a restart (ADR 0018).
     """
 
-    def __init__(self, plugin_id: str, plugin_dir: Path, config: dict | None = None):
+    def __init__(
+        self, plugin_id: str, plugin_dir: Path, config: dict | None = None, config_section: str | None = None
+    ):
         self.plugin_id = plugin_id
         self.plugin_dir = plugin_dir
         # The plugin's resolved config section (ADR 0019) — manifest defaults ⊕
         # YAML ⊕ secrets. Read it in register() and close over it for your
-        # tools/routes/surface, e.g. ``registry.config.get("api_key")``.
+        # tools/routes/surface, e.g. ``registry.config.get("api_key")``. This is a
+        # register-time SNAPSHOT; for a mounted router/surface that must reflect config
+        # edits without a restart, use ``live_config()`` instead.
         self.config: dict = dict(config or {})
+        # The top-level config key this plugin's section lives under (``config_section``
+        # or the id) — the lookup key for ``live_config()``.
+        self.config_section: str = config_section or plugin_id
         # Host services (agent invoke + event bus) a surface/route can use — the
         # server populates these before startup; guard for None (e.g. in tests).
         from graph.plugins.host import HOST
@@ -57,9 +66,31 @@ class PluginRegistry:
         self.mcp_servers: list = []  # factories: config -> entry dict | None
         self.thread_id_resolver = None  # (request_metadata, session_id) -> str (#571)
         self.goal_verifiers: dict = {}  # name -> async (spec, ctx) -> VerifyResult (ADR 0028)
-        self.goal_hooks: list = []  # {on_achieved, on_failed} terminal reactions (ADR 0028)
+        self.goal_hooks: list = []  # {on_achieved, on_failed, on_stalled} reactions (ADR 0028 + 0030 D5)
+        self.watch_hooks: list = []  # {on_met, on_expired, on_stalled} watch reactions (ADR 0067)
         self.knowledge_stores: dict = {}  # name -> (config) -> KnowledgeBackend (ADR 0031)
         self.embedders: dict = {}  # name -> (config) -> (text -> vector) embed_fn (ADR 0031)
+        self.chat_commands: dict = {}  # token -> async (rest, session_id) -> str|None (user-only control commands)
+
+    def live_config(self) -> dict:
+        """The plugin's CURRENT resolved config, re-read from the host on each call.
+
+        ``self.config`` is a register-time snapshot, so a hot-reload after a config save
+        can't refresh it for an already-mounted router or running surface (FastAPI can't
+        re-mount a router). But the reload DOES rebuild ``STATE.graph_config`` — so a
+        handler that reads this on each request reflects config edits with no restart.
+        Falls back to the snapshot when the host state isn't available (unit tests, or a
+        section that resolved empty)."""
+        try:
+            from runtime.state import STATE
+
+            pconf = getattr(getattr(STATE, "graph_config", None), "plugin_config", None) or {}
+            live = pconf.get(self.config_section)
+            if isinstance(live, dict):
+                return live
+        except Exception:  # noqa: BLE001 — best-effort; any failure ⇒ the snapshot
+            pass
+        return self.config
 
     def register_tool(self, tool) -> None:
         """Expose a LangChain tool to the agent."""
@@ -72,6 +103,39 @@ class PluginRegistry:
         """Convenience: register an iterable of tools."""
         for tool in tools or []:
             self.register_tool(tool)
+
+    def register_chat_command(self, name: str, handler) -> None:
+        """Own a user-only chat control command — ``/<name> …`` short-circuits the
+        turn with the handler's reply, like the core ``/goal`` (and the old, now
+        plugin-owned, ``/issue``).
+
+        ``handler`` is ``async (rest: str, session_id: str) -> str | None``: ``rest``
+        is everything after the token; return the reply string to send (the turn is
+        NOT run through the agent), or ``None`` to pass the message through as a
+        normal turn. This is **user-only by design** — it is NOT an agent tool, so a
+        plugin can expose a write action (file an issue, open a PR) that the model
+        can't invoke autonomously. Read your own config in ``register()`` and close
+        over it, e.g. ``repo = self.config.get("default_repo")``.
+
+        The token is slugified + lowercased (``/Issue`` == ``/issue``). The reserved
+        core token ``goal`` is refused; a collision with a token another enabled
+        plugin already registered keeps the first and warns (resolved in the loader).
+        """
+        from graph.slash_commands import slugify_slash  # intra-graph, import-safe
+
+        token = slugify_slash(name)
+        if not token or not callable(handler):
+            log.warning(
+                "[plugins] %s: register_chat_command needs a name + callable: %r / %r", self.plugin_id, name, handler
+            )
+            return
+        if token == "goal":
+            log.warning("[plugins] %s: chat command /%s is reserved — skipped", self.plugin_id, token)
+            return
+        if token in self.chat_commands:
+            log.warning("[plugins] %s: chat command /%s registered twice — keeping the first", self.plugin_id, token)
+            return
+        self.chat_commands[token] = handler
 
     def emit(self, topic: str, data: dict | None = None) -> None:
         """Broadcast an event on the bus (ADR 0039) — fire-and-forget.
@@ -156,10 +220,11 @@ class PluginRegistry:
         self.goal_verifiers[key] = fn
 
     def register_goal_hook(self, *, on_achieved=None, on_failed=None) -> None:
-        """React when a goal reaches a terminal state (ADR 0028 D4). ``on_achieved``
-        / ``on_failed`` take the terminal ``GoalState`` (sync or async) — push a
-        notification, record a finding, or set the next goal. A raising hook is
-        logged + swallowed."""
+        """React when a goal reaches a terminal state (ADR 0028 D4). ``on_achieved`` /
+        ``on_failed`` take the terminal ``GoalState`` (sync or async) — push a notification,
+        record a finding, or set the next goal. Provide either/both. A raising hook is logged +
+        swallowed. (A metric to *watch* over time is a watch — see ``register_watch_hook`` with
+        on_met/on_expired/on_stalled, ADR 0067.)"""
         if not (callable(on_achieved) or callable(on_failed)):
             log.warning("[plugins] %s: register_goal_hook needs on_achieved and/or on_failed", self.plugin_id)
             return
@@ -168,6 +233,25 @@ class PluginRegistry:
                 "plugin_id": self.plugin_id,
                 "on_achieved": on_achieved if callable(on_achieved) else None,
                 "on_failed": on_failed if callable(on_failed) else None,
+            }
+        )
+
+    def register_watch_hook(self, *, on_met=None, on_expired=None, on_stalled=None) -> None:
+        """React when a watch trips (ADR 0067) — ``on_met`` (verifier passed), ``on_expired``
+        (deadline passed), ``on_stalled`` (evidence unchanged for ``stall_after`` checks, the
+        watch stays active). Each takes the ``Watch`` (sync or async). Provide ANY of the three.
+        A raising hook is logged + swallowed."""
+        if not (callable(on_met) or callable(on_expired) or callable(on_stalled)):
+            log.warning(
+                "[plugins] %s: register_watch_hook needs on_met, on_expired, and/or on_stalled", self.plugin_id
+            )
+            return
+        self.watch_hooks.append(
+            {
+                "plugin_id": self.plugin_id,
+                "on_met": on_met if callable(on_met) else None,
+                "on_expired": on_expired if callable(on_expired) else None,
+                "on_stalled": on_stalled if callable(on_stalled) else None,
             }
         )
 

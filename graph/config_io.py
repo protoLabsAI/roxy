@@ -10,12 +10,10 @@ Three jobs:
    ships). We use ruamel.yaml when available for comment preservation;
    PyYAML is the fallback.
 
-2. **Two-location SOUL.md handling.** The runtime reads
-   ``/sandbox/SOUL.md`` (populated by ``entrypoint.sh`` at container
-   start). The source-of-truth lives at ``config/SOUL.md`` in the
-   repo. Drawer edits write to both so container restarts preserve
-   the change and local-dev runs without a ``/sandbox`` directory
-   still pick up the edit.
+2. **SOUL.md persona.** The live persona lives at the instance's
+   ``<instance_root>/config/SOUL.md`` (``instance_paths().soul_path``);
+   drawer edits write there and ``read_soul`` falls back to the bundled
+   ``config/SOUL.md`` seed when the instance has none yet.
 
 3. **Gateway introspection.** ``list_gateway_models`` hits
    ``{api_base}/models`` so the drawer's model dropdown reflects
@@ -31,82 +29,62 @@ from pathlib import Path
 from typing import Any
 
 from graph.config import LangGraphConfig
+from infra.paths import instance_paths
 
 log = logging.getLogger("protoagent.config_io")
 
-REPO_ROOT = Path(__file__).parent.parent
 
-# Two config roots, normally the same directory:
-#
-# * BUNDLE  — read-only shipped defaults: the ``.example`` template, SOUL
-#   presets, the default SOUL.md. Lives next to the code (``REPO_ROOT/config``,
-#   or _MEIPASS/config inside a PyInstaller-frozen sidecar).
-# * LIVE    — writable per-deployment state: the live YAML, secrets, and the
-#   setup marker. Overridable via ``PROTOAGENT_CONFIG_DIR``.
-#
-# The desktop sidecar is a read-only frozen binary, so it points
-# ``PROTOAGENT_CONFIG_DIR`` at the per-user app-data dir — defaults are read
-# from the bundle, live state is written to app-data. Unset (local dev, the
-# Docker config volume) collapses both to ``REPO_ROOT/config`` — unchanged.
-_BUNDLE_CONFIG_DIR = REPO_ROOT / "config"
+# ── Path accessors (resolved at call time from infra.paths.instance_paths) ───
+# Every config-dir location is derived from the frozen ``InstancePaths`` object
+# on each call — never captured at import time (the old import-time constants
+# read ``PROTOAGENT_*`` before the env was finalized, the fragility this cutover
+# removes). ``instance_root`` IS the per-instance scoped leaf, so there is no
+# ``scope_leaf`` / double-scope dance here: config / secrets / setup-marker /
+# theme / SOUL all sit directly under ``<instance_root>/config``. The bundled,
+# read-only seeds (``.example`` template, default SOUL.md, presets) live in the
+# App tier under ``app_root/config``.
 
 
-def _live_config_dir() -> Path:
-    override = os.environ.get("PROTOAGENT_CONFIG_DIR", "").strip()
-    return Path(override).expanduser() if override else _BUNDLE_CONFIG_DIR
+def config_yaml_path() -> Path:
+    """The live agent config YAML — ``<instance_root>/config/langgraph-config.yaml``.
+
+    Untracked + per-instance: generated from the ``.example`` template on first
+    run (see ``ensure_live_config``) and rewritten by the wizard/drawer."""
+    return instance_paths().config_yaml
 
 
-_LIVE_CONFIG_DIR = _live_config_dir()
-
-# Bundled, read-only defaults.
-CONFIG_EXAMPLE_PATH = _BUNDLE_CONFIG_DIR / "langgraph-config.example.yaml"
-SOUL_SOURCE_PATH = _BUNDLE_CONFIG_DIR / "SOUL.md"
-# SOUL.md starter templates. The wizard offers these as presets the
-# user can pick then edit before saving. Adding a new file here
-# automatically makes it a choice — no registry to update.
-PRESETS_DIR = _BUNDLE_CONFIG_DIR / "soul-presets"
-
-# Writable, per-deployment state.
-#
-# Live runtime config — untracked, per-deployment. Generated from the
-# ``.example`` template on first run (see ``ensure_live_config``) and rewritten
-# by the wizard/drawer. Keeping it out of git means setup edits never dirty a
-# tracked file; the template carries the shipped defaults + comments.
-# Instance-scoped (ADR 0004): a per-instance config when PROTOAGENT_INSTANCE is set, so
-# `--instance foo` gets its own config/secrets instead of sharing the default's — a no-op
-# (the base path) for the unscoped default. The unscoped base is kept for graceful seeding.
-from infra.paths import scope_leaf as _scope_leaf
+def secrets_yaml_path() -> Path:
+    """Untracked secrets overlay sibling of the config YAML — the model API key
+    and A2A bearer live here (gitignored + dockerignored), never in the tracked
+    YAML, read back by ``LangGraphConfig.from_yaml`` and stripped on every save."""
+    return instance_paths().secrets_yaml
 
 
-def _config_scope(path: Path) -> Path:
-    """Instance-scoping for the config-dir-relative files (config / secrets /
-    setup-marker).
-
-    ``scope_leaf`` isolates co-located instances that SHARE a config dir (the
-    bundle dir, or the data home) by ``PROTOAGENT_INSTANCE``. But when
-    ``PROTOAGENT_CONFIG_DIR`` is set explicitly — the desktop app's per-user dir,
-    or a FLEET MEMBER's per-workspace dir — that dir is ALREADY the isolated leaf.
-    Scoping it again double-nests (``<ws>/<id>/secrets.yaml``), so the member
-    writes a path its own plugin-config resolver (rooted at ``<ws>/plugins``)
-    never reads — a saved plugin secret then reads back ``unset``. So scope the
-    leaf only when the config dir is the implicit default.
-    """
-    if os.environ.get("PROTOAGENT_CONFIG_DIR", "").strip():
-        return path
-    return _scope_leaf(path)
+def setup_marker_path() -> Path:
+    """Setup-complete marker — presence ⇒ the wizard has been run."""
+    return instance_paths().setup_marker
 
 
-_BASE_CONFIG_YAML = _LIVE_CONFIG_DIR / "langgraph-config.yaml"
-CONFIG_YAML_PATH = _config_scope(_BASE_CONFIG_YAML)
-SOUL_RUNTIME_PATH = Path("/sandbox/SOUL.md")
+def theme_json_path() -> Path:
+    """Per-agent console theme file (ADR 0042)."""
+    return instance_paths().theme_json
 
-# Secrets overlay. The setup wizard / drawer collect a model API key and an
-# A2A bearer token; persisting those into the tracked config YAML means every
-# configured checkout carries credentials in git. Instead they live in this
-# untracked sibling file (gitignored + dockerignored), read back by
-# ``LangGraphConfig.from_yaml`` and stripped from the main YAML on every save.
-_BASE_SECRETS_YAML = _LIVE_CONFIG_DIR / "secrets.yaml"
-SECRETS_YAML_PATH = _config_scope(_BASE_SECRETS_YAML)
+
+def config_example_path() -> Path:
+    """Bundled, read-only ``.example`` template (App-tier seed)."""
+    return instance_paths().config_example
+
+
+def soul_source_path() -> Path:
+    """Bundled, read-only default ``SOUL.md`` (App-tier seed)."""
+    return instance_paths().soul_source
+
+
+def presets_dir() -> Path:
+    """Bundled ``SOUL.md`` starter-presets dir (App-tier seed). Dropping a new
+    markdown file in makes it a wizard choice — no registry to update."""
+    return instance_paths().presets_dir
+
 
 # (section, key) pairs that must never be written to the tracked YAML.
 SECRET_PATHS: tuple[tuple[str, str], ...] = (
@@ -140,7 +118,7 @@ def secret_paths() -> tuple[tuple[str, str], ...]:
     try:
         from graph.plugins.pconfig import installed_plugin_config_schemas
 
-        extra = tuple((sch.section, key) for sch in installed_plugin_config_schemas() for key in sch.secrets)
+        extra = tuple((sch.section, key) for sch in installed_plugin_config_schemas(strict=True) for key in sch.secrets)
         _PLUGIN_SECRET_PATHS_CACHE = extra  # remember the good set for next time
     except Exception as e:  # noqa: BLE001 — discovery is best-effort; fail SAFE, not empty
         extra = _PLUGIN_SECRET_PATHS_CACHE
@@ -151,15 +129,6 @@ def secret_paths() -> tuple[tuple[str, str], ...]:
             e,
         )
     return SECRET_PATHS + extra
-
-
-# Setup wizard state.
-# Presence of this (empty) marker file = wizard has been run and the
-# server should boot straight into the chat UI. Absence = show the
-# wizard on first page load. Lives in the live config dir so a Docker volume
-# mount (or the desktop app-data dir) persists setup across runs.
-_BASE_SETUP_MARKER = _LIVE_CONFIG_DIR / ".setup-complete"
-SETUP_MARKER_PATH = _config_scope(_BASE_SETUP_MARKER)
 
 
 # ---------------------------------------------------------------------------
@@ -177,85 +146,212 @@ except ImportError:
     _HAS_RUAMEL = False
 
 
-def _reset_double_scoped_config() -> None:
-    """Self-heal the double-scope bug (ADR 0042): earlier builds nested a fleet
-    member's config under ``<config-dir>/<instance>/`` — ``scope_leaf`` ran on top of
-    an already-per-member ``PROTOAGENT_CONFIG_DIR`` — so a saved plugin secret landed
-    in a dir the member's own plugin-config resolver (rooted at ``<dir>/plugins``)
-    never reads. Config now lives directly under the explicit dir; remove the orphaned
-    nested copy (its secrets are re-entered — by design we don't migrate it). No-op
-    unless an explicit config dir is set AND the old nested config exists."""
-    if not os.environ.get("PROTOAGENT_CONFIG_DIR", "").strip():
-        return
-    old = _scope_leaf(_BASE_CONFIG_YAML)  # the OLD <dir>/<id>/langgraph-config.yaml
-    if old == CONFIG_YAML_PATH or not old.exists():
-        return  # not double-scoped on disk (already healed, or never happened)
-    for name in ("langgraph-config.yaml", "secrets.yaml", ".setup-complete"):
-        try:
-            (old.parent / name).unlink()
-        except OSError:
-            pass
-    try:
-        old.parent.rmdir()  # only succeeds if now empty — never blow away other state
-        log.info("[config] removed orphaned double-scoped config dir %s", old.parent)
-    except OSError:
-        pass
+# Files that make up the live config tier — migrated as a unit by the one-shot
+# legacy-layout bridge below.
+_MIGRATED_CONFIG_FILES = ("langgraph-config.yaml", "secrets.yaml", ".setup-complete", "theme.json")
+
+# Per-instance DATA stores that lived flat under the box root in the old layout
+# (``~/.protoagent/checkpoints.db``, ``~/.protoagent/knowledge``, …) and now live
+# under ``instance_root`` (``~/.protoagent/default/...``). The store-tier bridge
+# below carries them for the DEFAULT instance only. Box-tier shared state
+# (host-config.yaml, commons, .instances, .data-version, workspaces) is deliberately
+# NOT in either list — it stays at the box root, shared by every instance.
+_LEGACY_STORE_FILES = ("checkpoints.db", "telemetry.db", "skills.db", "a2a-tasks.db", "a2a-push.db")
+_LEGACY_STORE_DIRS = (
+    "knowledge",
+    "memory",
+    "scheduler",
+    "inbox",
+    "background",
+    "activity",
+    "audit",
+    "tasks",
+    "workflows",
+    "acp_sessions",
+    "goals",
+    "workspace",
+)
+
+
+def _legacy_config_dirs() -> list[Path]:
+    """Old-layout directories that may hold this instance's pre-redesign config, in
+    priority order. Computed independently of the (now-deleted) legacy resolvers.
+
+    Two shapes cover every deployment:
+      * flat under the instance root — ``<instance_root>/langgraph-config.yaml`` (the
+        desktop ``PROTOAGENT_HOME`` dir and a fleet member's ``<ws>`` dir used to hold
+        the config file directly), and
+      * the bundle/repo config dir ``<app_root>/config[/<iid>]`` (local default in
+        ``REPO/config``, the dev sandbox in ``REPO/config/dev``, the container in
+        ``/opt/protoagent/config``), plus an explicit ``PROTOAGENT_CONFIG_DIR`` when the
+        upgrading environment still exports the retired var.
+    """
+    p = instance_paths()
+    out: list[Path] = [p.instance_root]
+    cd = os.environ.get("PROTOAGENT_CONFIG_DIR", "").strip()
+    if cd:
+        out.append(Path(cd).expanduser())
+    else:
+        base = p.app_root / "config"
+        iid = os.environ.get("PROTOAGENT_INSTANCE", "").strip()
+        out.append(base / iid if iid else base)
+    cfg = p.config_dir.resolve()
+    return [d for d in out if d.resolve() != cfg]
+
+
+def migrate_legacy_layout() -> bool:
+    """One-shot, idempotent, non-destructive bridge from the pre-redesign on-disk
+    layout into the new ``instance_root/config``. Returns True if it copied anything.
+
+    Runs only when the new live config is ABSENT, then copies an old config bundle
+    (``langgraph-config.yaml`` + ``secrets.yaml`` + ``.setup-complete`` + ``theme.json``)
+    from the first legacy dir that has one — so a build upgraded in place keeps its
+    config, secrets and setup state with no user action. Copy (never move) leaves the
+    originals as harmless orphans; ``copy2`` preserves ``secrets.yaml``'s 0600 mode. A
+    no-op once migrated. Self-contained and deletable in a future major — the path
+    *resolver* stays single-rule; this is the only bridge from the old layout.
+    """
+    import shutil
+
+    p = instance_paths()
+    if p.config_yaml.exists():
+        return False
+    migrated = False
+    for src_dir in _legacy_config_dirs():
+        if not (src_dir / "langgraph-config.yaml").is_file():
+            continue
+        p.config_dir.mkdir(parents=True, exist_ok=True)
+        for name in _MIGRATED_CONFIG_FILES:
+            src, dst = src_dir / name, p.config_dir / name
+            if src.is_file() and not dst.exists():
+                shutil.copy2(src, dst)  # copy2 keeps secrets.yaml's 0600 mode
+                migrated = True
+        log.warning(
+            "[config] migrated legacy config layout %s → %s (one-time; the originals are "
+            "left untouched and can be removed once you've confirmed the upgrade)",
+            src_dir,
+            p.config_dir,
+        )
+        break
+    # The container's old runtime SOUL (entrypoint used to write /sandbox/SOUL.md).
+    legacy_soul = Path("/sandbox/SOUL.md")
+    if legacy_soul.is_file() and not p.soul_path.exists():
+        p.soul_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(legacy_soul, p.soul_path)
+        migrated = True
+    # Carry the default instance's data stores into the new instance_root (first
+    # boot only — gated by the same absent-live-config condition above so a store
+    # the operator later clears is never resurrected). Only the DEFAULT instance
+    # auto-migrates; scoped sandboxes (e.g. the dev instance) re-init from scratch.
+    migrated = _migrate_legacy_stores(p) or migrated
+    return migrated
+
+
+def _migrate_legacy_stores(p) -> bool:
+    """One-shot, idempotent, non-destructive copy of the pre-redesign data stores from
+    the flat box root into ``instance_root`` (``box_root/<store>`` → ``box_root/default/
+    <store>``). Returns True if it copied anything.
+
+    Only runs for the standard local DEFAULT instance (``instance_id == "default"`` and
+    ``box_root`` is the parent of ``instance_root``) — a ``PROTOAGENT_HOME`` deploy or a
+    named/dev instance has a distinct root and re-inits rather than inheriting the
+    default's data. Copy (never move); skip any store whose destination already exists.
+    Box-tier shared state is never touched. Best-effort — a copy failure must never
+    block boot."""
+    import shutil
+
+    if p.instance_id != "default" or p.box_root != p.instance_root.parent:
+        return False
+    moved: list[str] = []
+    for name in _LEGACY_STORE_FILES:
+        src, dst = p.box_root / name, p.instance_root / name
+        if src.is_file() and not dst.exists():
+            try:
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(src, dst)
+                moved.append(name)
+            except OSError as exc:
+                log.warning("[migrate] could not carry store file %s: %s", name, exc)
+    for name in _LEGACY_STORE_DIRS:
+        src, dst = p.box_root / name, p.instance_root / name
+        if src.is_dir() and not dst.exists():
+            try:
+                shutil.copytree(src, dst)
+                moved.append(f"{name}/")
+            except OSError as exc:
+                log.warning("[migrate] could not carry store dir %s: %s", name, exc)
+    if moved:
+        log.warning(
+            "[migrate] carried default-instance data stores into %s (one-time; originals "
+            "left untouched, removable once you've confirmed the upgrade): %s",
+            p.instance_root,
+            ", ".join(moved),
+        )
+    return bool(moved)
 
 
 def ensure_live_config() -> bool:
     """Seed the live config on first run. Returns True only when it created the file.
 
     The live ``langgraph-config.yaml`` is untracked, so a fresh clone / new container
-    volume / **new instance** won't have one. Seed source:
+    volume / **new instance** won't have one. Seed source, in precedence order:
 
-    - An **instance-scoped** path (PROTOAGENT_INSTANCE set) inherits the unscoped *base*
-      config + secrets + setup-marker when they exist — so `--instance foo` boots from
-      the default's setup, then diverges on its own saves (graceful, no re-setup).
-    - Otherwise (or no base yet) copy the tracked ``.example`` template.
+    - ``PROTOAGENT_SEED_CONFIG`` — an explicit baked config file. A container/fleet
+      deploy points at it so a fresh instance comes up **pre-configured** (then
+      console edits override it, persisted on the config volume). This is the
+      config-as-code seed: bake your config into the image, point this env at it, and
+      you never hand-bake the live ``langgraph-config.yaml`` (which a config volume
+      would then freeze + shadow on later image updates).
+    - Otherwise copy the bundled ``.example`` template (``config_example_path()``).
 
     Idempotent — does nothing once the live file exists, so edits are never clobbered.
     """
-    _reset_double_scoped_config()  # self-heal: drop the old <dir>/<id>/ nesting
-    if CONFIG_YAML_PATH.exists():
+    # Bridge an in-place upgrade first: if an old-layout config exists, copy it into the
+    # new instance_root/config so the seed-from-.example branch below never strands it.
+    migrate_legacy_layout()
+    live = config_yaml_path()
+    if live.exists():
         return False
     import shutil
 
-    # Scoped iff the live path actually sits in an instance subdir of the base
-    # (PROTOAGENT_INSTANCE set AND no explicit config dir — see `_config_scope`); a
-    # fleet member's explicit dir is its own base, so it seeds from the template, not
-    # a self-copy.
-    scoped = CONFIG_YAML_PATH != _BASE_CONFIG_YAML
-    source = _BASE_CONFIG_YAML if (scoped and _BASE_CONFIG_YAML.exists()) else CONFIG_EXAMPLE_PATH
+    # An explicit baked seed (PROTOAGENT_SEED_CONFIG) wins over the bundled .example.
+    # Missing/blank env → seed from the template.
+    seed_override = os.environ.get("PROTOAGENT_SEED_CONFIG", "").strip()
+    seed_path = Path(seed_override).expanduser() if seed_override else None
+    if seed_path is not None and seed_path.is_file():
+        source = seed_path
+    else:
+        if seed_override:
+            log.warning(
+                "[config] PROTOAGENT_SEED_CONFIG=%r is not a readable file — "
+                "seeding from the default template instead", seed_override
+            )
+        source = config_example_path()
     if not source.exists():
         return False
 
-    CONFIG_YAML_PATH.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copyfile(source, CONFIG_YAML_PATH)
-    # When seeding a scoped instance from the base, carry its secrets + setup state too,
-    # so the instance is usable immediately instead of dropping into the setup wizard.
-    if scoped and source == _BASE_CONFIG_YAML:
-        if _BASE_SECRETS_YAML.exists() and not SECRETS_YAML_PATH.exists():
-            shutil.copyfile(_BASE_SECRETS_YAML, SECRETS_YAML_PATH)
-        if _BASE_SETUP_MARKER.exists() and not SETUP_MARKER_PATH.exists():
-            shutil.copyfile(_BASE_SETUP_MARKER, SETUP_MARKER_PATH)
-    log.info("[config] seeded live config %s from %s", CONFIG_YAML_PATH, source.name)
+    live.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(source, live)
+    log.info("[config] seeded live config %s from %s", live, source.name)
     return True
 
 
-def load_yaml_doc(path: Path = CONFIG_YAML_PATH) -> Any:
+def load_yaml_doc(path: Path | None = None) -> Any:
     """Load the config YAML as a mutable document.
 
-    With ruamel: returns a CommentedMap that preserves comments +
-    key order on subsequent dump. Without: returns a plain dict and
-    comments are lost on next save (a warning is logged once per
-    save so the operator knows).
+    ``path`` defaults to ``config_yaml_path()`` (resolved at call time, never an
+    import-time constant). With ruamel: returns a CommentedMap that preserves
+    comments + key order on subsequent dump. Without: returns a plain dict and
+    comments are lost on next save (a warning is logged once per save so the
+    operator knows).
     """
-    if path == CONFIG_YAML_PATH:
+    resolved = Path(path) if path is not None else config_yaml_path()
+    if resolved == config_yaml_path():
         ensure_live_config()
-    if not path.exists():
+    if not resolved.exists():
         return {} if not _HAS_RUAMEL else _ruamel.load("{}\n")
 
-    with open(path) as f:
+    with open(resolved) as f:
         if _HAS_RUAMEL:
             return _ruamel.load(f) or _ruamel.load("{}\n")
         import yaml
@@ -263,17 +359,18 @@ def load_yaml_doc(path: Path = CONFIG_YAML_PATH) -> Any:
         return yaml.safe_load(f) or {}
 
 
-def save_yaml_doc(doc: Any, path: Path = CONFIG_YAML_PATH) -> None:
+def save_yaml_doc(doc: Any, path: Path | None = None) -> None:
     """Persist the document atomically (temp + rename). Creates parent dirs.
 
-    This file is the single most important one the agent owns — a crash
-    mid-dump must never leave a truncated YAML behind, so the dump goes to a
-    buffer and lands via ``paths.atomic_write``.
+    ``path`` defaults to ``config_yaml_path()``. This file is the single most
+    important one the agent owns — a crash mid-dump must never leave a truncated
+    YAML behind, so the dump goes to a buffer and lands via ``paths.atomic_write``.
     """
     import io
 
     from infra.paths import atomic_write
 
+    resolved = Path(path) if path is not None else config_yaml_path()
     buf = io.StringIO()
     if _HAS_RUAMEL:
         _ruamel.dump(doc, buf)
@@ -282,12 +379,12 @@ def save_yaml_doc(doc: Any, path: Path = CONFIG_YAML_PATH) -> None:
             "ruamel.yaml not installed — YAML comments in %s will not be "
             "preserved on save. Add `ruamel.yaml>=0.18` to requirements.txt "
             "to fix.",
-            path,
+            resolved,
         )
         import yaml
 
         yaml.safe_dump(doc, buf, sort_keys=False, default_flow_style=False)
-    atomic_write(path, buf.getvalue())
+    atomic_write(resolved, buf.getvalue())
 
 
 # ---------------------------------------------------------------------------
@@ -395,15 +492,23 @@ def config_to_dict(config: LangGraphConfig) -> dict[str, Any]:
     # (blank-means-unchanged, like api_key). A default config has none.
     plugin_cfg = getattr(config, "plugin_config", {}) or {}
     if plugin_cfg:
+        discovery_ok = True
         try:
             # ALL installed plugins (not just enabled) — so a disabled plugin's stored
             # secret is redacted from the API response too, never echoed back in the clear.
             from graph.plugins.pconfig import installed_plugin_config_schemas
 
-            secrets_by_section = {s.section: set(s.secrets) for s in installed_plugin_config_schemas()}
-        except Exception:  # noqa: BLE001
+            secrets_by_section = {s.section: set(s.secrets) for s in installed_plugin_config_schemas(strict=True)}
+        except Exception:  # noqa: BLE001 — discovery FAILED (vs genuinely-empty): we no longer know which keys are secret
+            discovery_ok = False
             secrets_by_section = {}
         for section, vals in plugin_cfg.items():
+            if not discovery_ok:
+                # Fail SAFE: with no schema we can't tell a secret from a non-secret
+                # value, so blank the WHOLE section rather than risk echoing a plugin
+                # secret in the clear (blank-means-unchanged on save, like api_key).
+                d[section] = {k: "" for k in vals}
+                continue
             redacted = dict(vals)
             for skey in secrets_by_section.get(section, set()):
                 if skey in redacted:
@@ -526,12 +631,13 @@ def strip_secrets_from_doc(doc: Any) -> Any:
 
 def load_secrets() -> dict[str, Any]:
     """Load the untracked secrets overlay (empty dict if absent/unreadable)."""
-    if not SECRETS_YAML_PATH.exists():
+    secrets_path = secrets_yaml_path()
+    if not secrets_path.exists():
         return {}
     import yaml as _yaml
 
     try:
-        with open(SECRETS_YAML_PATH) as f:
+        with open(secrets_path) as f:
             data = _yaml.safe_load(f) or {}
         return data if isinstance(data, dict) else {}
     except (OSError, _yaml.YAMLError):
@@ -557,12 +663,13 @@ def save_secrets(secret_updates: dict[str, Any]) -> None:
         for key, val in values.items():
             dest[key] = val
 
-    SECRETS_YAML_PATH.parent.mkdir(parents=True, exist_ok=True)
-    tmp = SECRETS_YAML_PATH.with_suffix(".yaml.tmp")
+    secrets_path = secrets_yaml_path()
+    secrets_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = secrets_path.with_suffix(".yaml.tmp")
     with open(tmp, "w") as f:
         _yaml.safe_dump(current, f, sort_keys=False, default_flow_style=False)
     os.chmod(tmp, 0o600)
-    os.replace(tmp, SECRETS_YAML_PATH)
+    os.replace(tmp, secrets_path)
 
 
 def validate_config_dict(updates: dict[str, Any]) -> tuple[bool, str]:
@@ -618,37 +725,25 @@ def validate_config_dict(updates: dict[str, Any]) -> tuple[bool, str]:
 def read_soul() -> str:
     """Return the current persona text.
 
-    Prefers the runtime path (``/sandbox/SOUL.md``) since that's what
-    ``graph/prompts.build_system_prompt`` actually reads; falls back
-    to the repo source so local-dev picks it up even when no sandbox
-    volume is mounted.
+    Reads the instance's live ``SOUL.md`` (``instance_paths().soul_path``, what
+    ``graph/prompts.build_system_prompt`` resolves), falling back to the bundled
+    seed (``soul_source_path()``) when the instance hasn't written one yet.
     """
-    for path in (SOUL_RUNTIME_PATH, SOUL_SOURCE_PATH):
+    for path in (instance_paths().soul_path, soul_source_path()):
         if path.exists():
             return path.read_text(encoding="utf-8")
     return ""
 
 
 def write_soul(text: str) -> list[Path]:
-    """Write persona text to every reachable SOUL.md path.
+    """Write persona text to the instance's live ``SOUL.md`` (mkdir parents).
 
-    Always writes the repo source (``config/SOUL.md``). Additionally
-    writes the runtime path if its parent directory exists — in the
-    container ``/sandbox`` is created by Dockerfile; in local dev it
-    usually isn't, so we skip quietly instead of erroring.
-
-    Returns the paths that were written for UI feedback.
+    Returns the path(s) written for UI feedback.
     """
-    written: list[Path] = []
-    SOUL_SOURCE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    SOUL_SOURCE_PATH.write_text(text, encoding="utf-8")
-    written.append(SOUL_SOURCE_PATH)
-
-    if SOUL_RUNTIME_PATH.parent.exists():
-        SOUL_RUNTIME_PATH.write_text(text, encoding="utf-8")
-        written.append(SOUL_RUNTIME_PATH)
-
-    return written
+    target = instance_paths().soul_path
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(text, encoding="utf-8")
+    return [target]
 
 
 # ---------------------------------------------------------------------------
@@ -676,12 +771,18 @@ def list_gateway_models(
 
     key = api_key or os.environ.get("OPENAI_API_KEY", "")
     url = api_base.rstrip("/") + "/models"
-    # SSRF guard (#871): an operator-supplied api_base must not steer this probe at an
-    # internal service or cloud-metadata (169.254.169.254). Blocked unless explicitly
-    # allowlisted via egress.allowed_hosts.
+    # SSRF guard (#871): an operator-supplied api_base must not steer this probe at
+    # cloud-metadata (169.254.169.254) or another link-local/reserved address. But a
+    # custom api_base is an OPERATOR-configured gateway — overwhelmingly localhost
+    # (Ollama / LM Studio / local vLLM / LiteLLM) or a LAN/tailnet host — so allow_private
+    # (same as the fleet-remote probe in graph/fleet/supervisor.py) while STILL blocking
+    # link-local/metadata/multicast/reserved. An unresolvable host isn't itself an SSRF
+    # target — let the real httpx connection error surface instead of a misleading block.
+    # If an egress allowlist IS set, it still enforces (the host must be allowlisted, which
+    # it also needs for actual gateway egress / the OpenShell policy anyway).
     from security import egress
 
-    if egress.check_url(url):
+    if egress.check_url(url, allow_private=True, block_unresolvable=False):
         return [], "api_base host is blocked by the egress guard (set egress.allowed_hosts to permit it)"
     headers = {}
     if key:
@@ -748,10 +849,12 @@ def validate_model_connection(
 
     key = api_key or os.environ.get("OPENAI_API_KEY", "")
     url = api_base.rstrip("/") + "/chat/completions"
-    # SSRF guard (#871) — same as list_gateway_models.
+    # SSRF guard (#871) — same as list_gateway_models: allow_private so a localhost /
+    # LAN / tailnet operator gateway works, link-local/metadata stays blocked, and an
+    # allowlist (when set) still enforces.
     from security import egress
 
-    if egress.check_url(url):
+    if egress.check_url(url, allow_private=True, block_unresolvable=False):
         return False, "api_base host is blocked by the egress guard (set egress.allowed_hosts to permit it)"
     headers = {"Content-Type": "application/json"}
     if key:
@@ -853,7 +956,7 @@ def is_setup_complete() -> bool:
     with a baked-in config still needs to walk a user through the
     wizard on first run.
     """
-    return SETUP_MARKER_PATH.exists()
+    return setup_marker_path().exists()
 
 
 def mark_setup_complete() -> None:
@@ -862,8 +965,9 @@ def mark_setup_complete() -> None:
     Idempotent — safe to call repeatedly. The file is empty; only
     its presence matters.
     """
-    SETUP_MARKER_PATH.parent.mkdir(parents=True, exist_ok=True)
-    SETUP_MARKER_PATH.touch()
+    marker = setup_marker_path()
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.touch()
 
 
 def validate_for_headless(config) -> tuple[bool, str]:
@@ -895,7 +999,7 @@ def reset_setup() -> None:
     + SOUL.md in place so the wizard pre-populates with the current
     values — reset is for revisiting choices, not for wiping config.
     """
-    SETUP_MARKER_PATH.unlink(missing_ok=True)
+    setup_marker_path().unlink(missing_ok=True)
 
 
 # ---------------------------------------------------------------------------
@@ -910,9 +1014,10 @@ def list_soul_presets() -> list[str]:
     markdown file into ``config/soul-presets/`` makes it a choice
     without code changes.
     """
-    if not PRESETS_DIR.exists():
+    root = presets_dir()
+    if not root.exists():
         return []
-    return sorted(p.stem for p in PRESETS_DIR.glob("*.md"))
+    return sorted(p.stem for p in root.glob("*.md"))
 
 
 def read_soul_preset(name: str) -> str:
@@ -922,12 +1027,13 @@ def read_soul_preset(name: str) -> str:
     the wizard treats that as "no preset selected, blank canvas".
 
     Path-traversal guarded: the resolved target must live inside
-    ``PRESETS_DIR``. A name like ``"../secret"`` would otherwise
+    ``presets_dir()``. A name like ``"../secret"`` would otherwise
     escape the presets directory and read arbitrary ``.md`` files
     anywhere the process can reach.
     """
-    presets_root = PRESETS_DIR.resolve()
-    candidate = (PRESETS_DIR / f"{name}.md").resolve()
+    root = presets_dir()
+    presets_root = root.resolve()
+    candidate = (root / f"{name}.md").resolve()
     if presets_root not in candidate.parents or not candidate.is_file():
         return ""
     return candidate.read_text(encoding="utf-8")

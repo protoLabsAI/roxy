@@ -46,7 +46,12 @@ def register_fleet_routes(app) -> None:
                 str((req or {}).get("url", "")),
                 token=str((req or {}).get("token", "") or ""),
             )
-            return {"ok": True, "agent": rec}
+            # Probe the new remote's agent card immediately (off the loop — it's a network
+            # call) so the response can warn at register time. We DON'T reject an unreachable
+            # peer — deferred registration is intentional (it can come online later); the
+            # caller just learns `reachable:false` now instead of waiting for the next poll.
+            reachable, version = await asyncio.to_thread(supervisor.probe_remote, rec["id"])
+            return {"ok": True, "agent": rec, "reachable": reachable, "version": version}
         except (supervisor.FleetError, manager.WorkspaceError) as exc:
             raise HTTPException(400, str(exc))
 
@@ -144,11 +149,11 @@ def register_fleet_routes(app) -> None:
         # its plugins — only if the host is actually configured (fresh host → plain blank template).
         inherit_model = None
         if bool(body.get("inherit_config", True)):
-            from graph.config_io import _live_config_dir
+            from graph.config_io import config_yaml_path
 
-            cfg_dir = _live_config_dir()
-            if (cfg_dir / "langgraph-config.yaml").exists():
-                inherit_model = str(cfg_dir)
+            cfg_yaml = config_yaml_path()
+            if cfg_yaml.exists():
+                inherit_model = str(cfg_yaml.parent)
         try:
             # create() may overlay the host model + install a bundle (subprocess) — off the loop.
             ws = await asyncio.to_thread(

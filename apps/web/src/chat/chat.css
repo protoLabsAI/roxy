@@ -28,6 +28,154 @@
   min-height: 0;
 }
 
+/* The tab-bar wrapper exists only to scope the right-click context menu (ADR 0036) to the
+   tab strip — it generates no box, so the DS TabBar stays the flex child it was. */
+.chat-tabbar-wrap {
+  display: contents;
+}
+
+/* Background-agent report card (ADR 0050/0062). The DS system message is a de-emphasized
+   centered pill (bg-inset fill); for a report + "Read full report" button that reads wrong.
+   Restyle it as a bordered card sitting on the chat surface: same background as the surface
+   (transparent), a border instead of the fill, de-pilled + left-aligned + readable size. */
+.chat-report.pl-message--system {
+  justify-content: stretch;
+}
+.chat-report .pl-message__content {
+  background: transparent; /* match the chat surface — no bg-inset fill */
+  border: var(--pl-border-width) solid var(--pl-color-border);
+  border-radius: var(--pl-radius);
+  display: block;
+  text-align: left;
+  font-size: 0.9rem;
+  color: var(--pl-color-fg);
+  padding: 10px 14px;
+}
+.chat-report-open {
+  margin-top: 8px;
+}
+
+/* Per-turn token/cost footer under an assistant answer (#1372) — a quiet, monospace row of
+   prompt ↑ / output ↓ / cost chips; full breakdown lives in the title tooltip. */
+.chat-usage {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 12px;
+  margin-top: 7px;
+  color: var(--fg-secondary, var(--fg-muted));
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+  cursor: default;
+}
+.chat-usage-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+.chat-usage-item svg {
+  opacity: 0.85;
+}
+/* Context-window fill bar — quiet until it nears the compaction threshold, then warns. */
+.chat-usage-bar {
+  display: inline-block;
+  width: 42px;
+  height: 4px;
+  margin-left: 2px;
+  border-radius: 2px;
+  background: var(--border);
+  overflow: hidden;
+  vertical-align: middle;
+}
+.chat-usage-bar-fill {
+  display: block;
+  height: 100%;
+  border-radius: 2px;
+  background: var(--fg-muted);
+}
+.chat-usage-bar-fill[data-warn="true"] {
+  background: var(--warning, #d98324);
+}
+
+/* Hover card (DS Tooltip content): a compact label/value breakdown of the turn. */
+.chat-usage-tip {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  min-width: 190px;
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  text-align: left;
+}
+.chat-usage-tip-row {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 16px;
+}
+.chat-usage-tip-label {
+  color: var(--fg-muted);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.chat-usage-tip-value {
+  font-size: 12px;
+  font-weight: 500;
+  text-align: right;
+}
+.chat-usage-tip-sub {
+  display: block;
+  color: var(--fg-muted);
+  font-weight: 400;
+  font-size: 10.5px;
+}
+.chat-usage-tip-note {
+  margin: 3px 0 0;
+  padding-top: 6px;
+  border-top: 1px solid color-mix(in srgb, currentColor 18%, transparent);
+  color: var(--fg-muted);
+  font-family: var(--font-sans, inherit);
+  font-size: 11px;
+  line-height: 1.4;
+  white-space: normal;
+  max-width: 230px;
+}
+
+/* Quick-delete mode: while Shift is held, the ✕ becomes a red trashcan (Shift+click deletes
+   with no confirm + no harvest). Scoped to :hover (#1373) so ONLY the tab whose ✕ you're
+   pointing at shows the trash — not every tab at once — for a clearer delete affordance and
+   fewer accidental clicks. Swap the DS ✕ svg for a trash silhouette (mask tinted via
+   currentColor). The Shift+click handler is unchanged; this only narrows the visual cue. */
+.chat-tabbar-wrap--del .pl-tabbar__close:hover {
+  color: var(--pl-color-danger, #e5484d);
+}
+
+/* Bypass-permissions indicator in the composer toolbar — a DS warning Badge (outline tone) in a
+   bare button so clicking it turns bypass off (same as `/bypass off`). The Badge owns the styling. */
+.composer-bypass-toggle {
+  display: inline-flex;
+  align-items: center;
+  padding: 0;
+  border: none;
+  background: none;
+  cursor: pointer;
+}
+.chat-tabbar-wrap--del .pl-tabbar__close:hover svg {
+  display: none;
+}
+.chat-tabbar-wrap--del .pl-tabbar__close:hover::after {
+  content: "";
+  display: inline-block;
+  width: 13px;
+  height: 13px;
+  background-color: currentColor;
+  -webkit-mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath d='M9 3v1H4v2h16V4h-5V3H9zM6 7l1 13h10l1-13H6z'/%3E%3C/svg%3E") center / contain no-repeat;
+  mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath d='M9 3v1H4v2h16V4h-5V3H9zM6 7l1 13h10l1-13H6z'/%3E%3C/svg%3E") center / contain no-repeat;
+}
+
 .chat-session-slot {
   height: 100%;
   display: grid;
@@ -68,6 +216,32 @@
    the report's own margins tidy inside the card. */
 .chat-session-slot .pl-message--system .pl-message__content .markdown > :first-child { margin-top: 0; }
 .chat-session-slot .pl-message--system .pl-message__content .markdown > :last-child { margin-bottom: 0; }
+
+/* Local SYSTEM NOTE (noteToThread) — a slash-command confirmation / status / warning. Same
+   inset system card as a report, but compact and with a tone-coloured left accent driven by
+   the message's `noteTone` (info/warning/danger/success). System notes never carry the answer
+   action row (that's role-"assistant"-only). Add a tone: one rule here + the SystemNoteTone
+   union in lib/types.ts. The `.chat-note--*` class sits ON `.pl-message--system`, so these
+   (4 classes) outrank the base system rule above (3 classes). */
+.chat-session-slot .pl-message--system.chat-note .pl-message__content {
+  font-size: 0.85rem;
+  padding: 8px 12px;
+}
+.chat-session-slot .pl-message--system.chat-note--info .pl-message__content { border-left-color: var(--pl-color-info, #3b82f6); }
+.chat-session-slot .pl-message--system.chat-note--success .pl-message__content { border-left-color: var(--pl-color-success, #30a46c); }
+.chat-session-slot .pl-message--system.chat-note--warning .pl-message__content { border-left-color: var(--pl-color-warning, #d98324); }
+.chat-session-slot .pl-message--system.chat-note--danger .pl-message__content { border-left-color: var(--pl-color-danger, #e5484d); }
+
+/* No "loading side-bar" on streaming answer text. The DS pulses a 2px accent left-border +
+   10px inset on a streaming message body (ai.css) — but the streaming text itself is the cue,
+   and it should read FULL WIDTH, not inset behind an animated rail. Drop it (higher specificity
+   than the DS rule, so it wins regardless of import order; applies to BOTH the main chat and the
+   ⌘K palette chat). Tools keep their own loaders — their cards/WorkBlock are untouched. */
+.pl-message.pl-message--streaming .pl-message__body {
+  border-left: none;
+  padding-left: 0;
+  animation: none;
+}
 
 /* Stop (while streaming) and the queued-steer bubble are now the DS busy mode +
    <Message queued> (0.42.0) — see ChatSurface. No bespoke CSS needed here. */

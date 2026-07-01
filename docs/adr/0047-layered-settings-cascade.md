@@ -1,8 +1,13 @@
 # ADR 0047 — Layered settings cascade (App→Host→Agent, per-field, `Field.scope`)
 
 - **Status:** Accepted (2026-06-10; decisions locked in the operator walkthrough — see §2.1).
-  **Host-file scoping ratified _per-hub_ on 2026-06-16 (#1077)** — `host_config_path()` is
-  `scope_leaf`'d; the original §D2 unscoped-`data_home()` (per-physical-box) proposal is superseded.
+  **Host-file scoping ratified _per-hub_ on 2026-06-16 (#1077)** — `host_config_path()` was
+  `scope_leaf`'d; the original §D2 unscoped-`data_home()` (per-physical-box) proposal was superseded.
+  **Re-amended 2026-06-30 by [ADR 0065](0065-two-tier-instance-paths.md):** the Host file is
+  **box-shared again** — it lives at `box_root/host-config.yaml` (the box tier of the two-tier path
+  model), so every instance on the machine reads one machine-wide Host layer, which is the layer's
+  purpose. The per-field cascade semantics and `Field.scope` below are unchanged — only the file's
+  *location* moved.
 - **Date:** 2026-06-10
 - **Deciders:** Josh Mabry; protoAgent maintainers
 - **Tags:** config, settings, fleet, host, architecture, cascade, schema-driven
@@ -139,6 +144,7 @@ the corresponding items in §7.
    | `prompt_cache.enabled/ttl/warm.enabled/warm.interval_seconds` | cache tier is gateway/deployment-dependent |
    | `telemetry.enabled`, `telemetry.retention_days` | observability is machine-wide |
    | `identity.org` | white-label org branding is deployment-wide (`identity.name`/`operator` stay per-agent) |
+   | `egress.allowed_hosts` | box-wide outbound network policy (ADR 0008); sits at the Host layer beside the inbound `network.bind` (D8) |
 
    Everything else is `agent`: `identity.name/operator`, `model.temperature/max_tokens/max_iterations`,
    `agent_runtime` (each agent picks **native or `acp:*`** independently), `operator_mcp.tools`,

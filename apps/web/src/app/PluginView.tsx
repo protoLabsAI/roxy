@@ -1,4 +1,5 @@
-import { AlertTriangle, Loader2 } from "lucide-react";
+import { Spinner } from "@protolabsai/ui/data";
+import { AlertTriangle } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 
 import { apiUrl, authToken } from "../lib/api";
@@ -47,7 +48,20 @@ export function PluginView({ view }: { view: PluginViewType }) {
   // bare {"detail":"Not Found"} body as the "view".
   const [reachable, setReachable] = useState(false);
   const frameRef = useRef<HTMLIFrameElement | null>(null);
+  // Pending init re-post timers (see handleLoad) — cleared on unmount / src change.
+  const initTimers = useRef<number[]>([]);
   const pluginId = useMemo(() => pluginIdFromPath(view.path), [view.path]);
+
+  // Post the bearer + theme to the iframe. Idempotent on the kit side (applyTheme just
+  // re-sets CSS vars), so it's safe to call repeatedly — which the handshake relies on.
+  const postInit = (win: Window) => {
+    try {
+      const origin = new URL(apiUrl(src), window.location.href).origin;
+      win.postMessage({ type: "protoagent:init", token: authToken() || null, theme: consoleTheme() }, origin);
+    } catch {
+      /* cross-origin / detached — best effort */
+    }
+  };
 
   // Probe the view URL before mounting the iframe. A same-origin HTTP error (a 404 from an
   // unmounted /api/plugins/<id>/<view>, FastAPI's {"detail":"Not Found"}) fires the iframe's
@@ -127,7 +141,15 @@ export function PluginView({ view }: { view: PluginViewType }) {
       // Only trust messages from THIS iframe's window.
       if (!frameRef.current || e.source !== frameRef.current.contentWindow) return;
       const m = e.data || {};
-      if (m.type === "protoagent:subscribe" && Array.isArray(m.patterns)) {
+      if (m.type === "protoagent:ready") {
+        // The kit announced it's now listening. It registers its `message` handler
+        // asynchronously (dynamic import of the plugin-kit), so the load-time init post
+        // can race ahead of it and be dropped — leaving the view on the kit's default
+        // theme until a manual switch. Re-send the bearer + theme now that we know it's
+        // listening, so it themes immediately. (Older kits don't ping; handleLoad's
+        // retry covers those.)
+        if (frameRef.current?.contentWindow) postInit(frameRef.current.contentWindow);
+      } else if (m.type === "protoagent:subscribe" && Array.isArray(m.patterns)) {
         patterns = m.patterns.filter((p: unknown) => typeof p === "string");
       } else if (m.type === "protoagent:publish" && typeof m.topic === "string") {
         // Force the plugin's namespace — a page can only publish under its own id.
@@ -156,6 +178,9 @@ export function PluginView({ view }: { view: PluginViewType }) {
     return () => {
       window.removeEventListener("message", onWindowMessage);
       off();
+      // Drop any pending init re-posts — the iframe is being torn down / re-pointed.
+      initTimers.current.forEach(clearTimeout);
+      initTimers.current = [];
     };
   }, [src, pluginId]);
 
@@ -184,16 +209,19 @@ export function PluginView({ view }: { view: PluginViewType }) {
     setLoaded(true);
     const win = e.currentTarget.contentWindow;
     if (!win) return;
-    // Hand the page the bearer + theme AFTER load — same origin, targeted, not in
-    // the URL. The plugin page listens for `message` and uses them.
-    try {
-      const origin = new URL(apiUrl(src), window.location.href).origin;
-      win.postMessage(
-        { type: "protoagent:init", token: authToken() || null, theme: consoleTheme() },
-        origin,
-      );
-    } catch {
-      /* cross-origin / detached — best effort */
+    // Hand the page the bearer + theme AFTER load — same origin, targeted, not in the URL.
+    // The plugin page registers its `message` listener asynchronously (dynamic import of the
+    // plugin-kit), so this first post can land BEFORE the kit is listening and be dropped —
+    // the view then renders with the kit's default theme until a manual theme switch (the
+    // "toggle around for it to load" bug). So re-post on a short schedule; the retry lands
+    // once the kit is ready, and postInit is idempotent so the extra posts are harmless. A
+    // newer kit that pings `protoagent:ready` makes this exact (handled above); the retry is
+    // the fallback for kits that only listen.
+    initTimers.current.forEach(clearTimeout);
+    initTimers.current = [];
+    postInit(win);
+    for (const ms of [100, 300, 700, 1500]) {
+      initTimers.current.push(window.setTimeout(() => postInit(win), ms));
     }
   }
 
@@ -219,7 +247,7 @@ export function PluginView({ view }: { view: PluginViewType }) {
           <>
             {!loaded ? (
               <div className="plugin-view-state">
-                <Loader2 className="spin" size={18} />
+                <Spinner size={18} />
                 <span>Loading {view.label}…</span>
               </div>
             ) : null}
@@ -229,6 +257,9 @@ export function PluginView({ view }: { view: PluginViewType }) {
             {reachable ? (
               // sandbox: allow-popups (+ -to-escape-sandbox) so links / window.open inside
               // a plugin open as normal un-sandboxed pages instead of being blocked.
+              // allow-pointer-lock so a plugin (or a nested artifact iframe inside it) can
+              // capture the mouse — needed for games / canvas / 3D; pointer lock must be
+              // granted at EVERY nesting level, and Esc always releases it.
               // allow: clipboard via Permissions-Policy (no sandbox token exists for it) so
               // copy/paste works in plugin UIs.
               <iframe
@@ -236,7 +267,7 @@ export function PluginView({ view }: { view: PluginViewType }) {
                 className="plugin-view-frame"
                 src={apiUrl(src)}
                 title={view.label}
-                sandbox="allow-scripts allow-forms allow-same-origin allow-popups allow-popups-to-escape-sandbox"
+                sandbox="allow-scripts allow-forms allow-same-origin allow-popups allow-popups-to-escape-sandbox allow-pointer-lock"
                 allow="clipboard-read; clipboard-write"
                 onLoad={handleLoad}
                 onError={() => setError(`The plugin page at ${src} didn’t respond.`)}

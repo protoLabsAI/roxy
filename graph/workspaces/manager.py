@@ -1,10 +1,12 @@
 """Workspace lifecycle (ADR 0041) — create / list / run / remove.
 
-A workspace is a directory ``<root>/<name>/`` that *is* an agent: its
-``langgraph-config.yaml`` + ``secrets.yaml`` + (once a bundle installs) ``plugins.lock``
-+ ``config/plugins/`` live there (so ``PROTOAGENT_CONFIG_DIR=<ws>`` makes it the whole
-identity), and ``instance.id = <name>`` scopes its private data to ``~/.protoagent/<name>/*``.
-``workspace.yaml`` is the registry record (id, port, bundle, created).
+A workspace is a directory ``<root>/<name>/`` that *is* an agent's instance root:
+its ``config/langgraph-config.yaml`` + ``config/secrets.yaml`` + (once a bundle
+installs) ``plugins.lock`` + ``plugins/`` live there, so launching it with
+``PROTOAGENT_HOME=<ws>`` makes the workspace dir the member's whole instance root
+(config under ``<ws>/config``, plugins under ``<ws>/plugins``). ``PROTOAGENT_INSTANCE=<id>``
+scopes its private data stores to ``~/.protoagent/<id>/*``. ``workspace.yaml`` is the
+registry record (id, port, bundle, created), kept at the workspace root.
 
 This module only orchestrates the existing knobs — no new runtime, no new storage
 format. ``run`` returns the env + argv for the CLI to ``exec`` the normal server.
@@ -36,21 +38,19 @@ _RESERVED_NAMES = {"host"}
 
 
 def workspaces_root() -> Path:
-    """Where workspaces live. ``PROTOAGENT_WORKSPACES_DIR`` overrides; default
-    ``~/.protoagent/workspaces``.
+    """Where workspaces live. ``PROTOAGENT_WORKSPACES_DIR`` overrides (verbatim);
+    default the per-instance ``instance_root/workspaces`` store.
 
-    Instance-scoped (ADR 0004) like every other store — ``scope_leaf`` on the final
-    resolved path, so a scoped hub owns its own fleet (``~/.protoagent/<iid>/workspaces``
-    + its ``fleet.json``) instead of sharing one registry with every co-located instance
-    (two hubs pruning/evicting each other's agents). This also fences peers: workspace
-    agents run with ``PROTOAGENT_INSTANCE=<name>``, so a peer's fleet view is its own,
-    not the parent hub's. Unscoped stays the shared legacy root (#706 warning covers it).
-    """
-    from infra.paths import scope_leaf
+    HUB-instance-scoped (ADR 0004), so a scoped hub owns its own fleet
+    (``<instance_root>/workspaces`` + its ``fleet.json``) instead of sharing one registry
+    with every co-located instance (two hubs pruning/evicting each other's agents). This
+    also fences peers: workspace agents run with ``PROTOAGENT_HOME=<ws>``, so a member's
+    own (empty) workspaces root keeps the supervisor's ``shutdown_all`` hub-only by
+    construction."""
+    from infra.paths import instance_paths
 
     override = os.environ.get("PROTOAGENT_WORKSPACES_DIR", "").strip()
-    base = Path(override).expanduser() if override else (Path.home() / ".protoagent" / "workspaces")
-    return scope_leaf(base)
+    return Path(override).expanduser() if override else instance_paths().workspaces_dir
 
 
 def _safe(name: str) -> str:
@@ -135,6 +135,26 @@ def _port_base() -> int:
     return PORT_BASE
 
 
+def _port_is_free(port: int) -> bool:
+    """True if 127.0.0.1:<port> can be bound right now — i.e. nothing (fleet OR an
+    unrelated process) is already listening.
+
+    ``_pick_port`` used to consider only fleet-registered ports, so it could hand out a
+    port already held by an UNRELATED instance (a dev server, another protoAgent fork on
+    the conventional :7871) — the spawned agent then died with ``EADDRINUSE`` at bind.
+    Probing the OS closes that gap. Best-effort: any bind failure reads as 'not free' (the
+    safe choice — skip it). A TOCTOU window remains between this check and the agent's own
+    bind, but it eliminates the common, durable collision."""
+    import socket
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        try:
+            s.bind(("127.0.0.1", port))
+            return True
+        except OSError:
+            return False
+
+
 def _pick_port(explicit: int | None) -> int:
     if explicit:
         return int(explicit)
@@ -148,10 +168,13 @@ def _pick_port(explicit: int | None) -> int:
             used.add(int(STATE.active_port))
     except Exception:  # noqa: BLE001 — best-effort; CLI/no-STATE context just skips it
         pass
-    p = _port_base() + 1
-    while p in used:
-        p += 1
-    return p
+    base = _port_base() + 1
+    # Skip registry-known ports AND OS-occupied ones (an unrelated process on the port).
+    # Bounded scan so a saturated range fails loudly instead of looping forever.
+    for p in range(base, base + 1000):
+        if p not in used and _port_is_free(p):
+            return p
+    raise WorkspaceError(f"no free port in {base}..{base + 999} — too many agents, or the range is occupied")
 
 
 _CONFIG_TEMPLATE = """\
@@ -218,7 +241,11 @@ def create(
         raise WorkspaceError(f"workspace {wid!r} already exists at {ws}")
     ws.mkdir(parents=True)
 
-    cfg = ws / "langgraph-config.yaml"
+    # The member reads its config at <ws>/config/ (instance_root=<ws> → config tier
+    # under <ws>/config), so scaffold there.
+    cfg_dir = ws / "config"
+    cfg_dir.mkdir(parents=True, exist_ok=True)
+    cfg = cfg_dir / "langgraph-config.yaml"
     if from_config:
         src = Path(from_config).expanduser()
         src_cfg = src / "langgraph-config.yaml" if src.is_dir() else src
@@ -228,11 +255,11 @@ def create(
         shutil.copyfile(src_cfg, cfg)
         src_sec = (src if src.is_dir() else src.parent) / "secrets.yaml"
         if src_sec.exists():
-            shutil.copyfile(src_sec, ws / "secrets.yaml")
+            shutil.copyfile(src_sec, cfg_dir / "secrets.yaml")
         _stamp_identity(cfg, name, shared_skills, instance_id=wid)
     else:
         cfg.write_text(_CONFIG_TEMPLATE.format(name=name, id=wid))
-        (ws / "secrets.yaml").write_text("# Per-workspace secrets overlay.\n")
+        (cfg_dir / "secrets.yaml").write_text("# Per-workspace secrets overlay.\n")
         if inherit_model:
             _overlay_model(cfg, ws, inherit_model)  # gateway only — not plugins/skills
         if shared_skills:
@@ -257,10 +284,97 @@ def create(
     try:
         if bundle:
             installed = _install_bundle_into(ws, bundle)
+            # Auto-enable the bundle's plugins so a new agent boots WITH its tools live —
+            # matching the console install path (which auto-enables on install, ADR 0027).
+            # The CLI installer deliberately doesn't enable, so without this the agent
+            # comes up with the bundle installed-but-off and the operator has to flip each
+            # one on in Settings ▸ Plugins (#1346). Then seed the bundle's recommended
+            # per-plugin config defaults (#1350) — a fresh workspace, so nothing to clobber.
+            _enable_installed_in_config(cfg, ws / "plugins.lock")
+            _apply_bundle_config_defaults(cfg, ws / "plugins.lock")
     except Exception:
         shutil.rmtree(ws, ignore_errors=True)
         raise
     return {**rec, "path": str(ws), "installed": installed}
+
+
+def _enable_installed_in_config(cfg: Path, lock: Path) -> list[str]:
+    """Add a freshly-installed bundle's plugins to ``plugins.enabled`` in the workspace
+    config, so the agent starts with them on. Honors each bundle's curated ``enabled``
+    subset (cached in the lock by ``_install_bundle``), falling back to every installed
+    member; for a bare single-plugin install with no bundle entry, enables that plugin.
+    Unions with whatever the template already enabled (``delegates``); returns the ids
+    newly added. Best-effort — a malformed lock/config leaves enablement untouched."""
+    import json
+
+    from graph.config_io import load_yaml_doc, save_yaml_doc
+
+    try:
+        data = json.loads(lock.read_text()) if lock.exists() else {}
+    except (json.JSONDecodeError, OSError):
+        return []
+    bundles = data.get("bundles") or []
+    want: list[str] = []
+    if bundles:
+        for b in bundles:
+            want += [str(x) for x in (b.get("enabled") or b.get("plugins") or [])]
+    else:  # a bare plugin install (no bundle record) — enable what landed
+        want += [str(p["id"]) for p in (data.get("plugins") or []) if p.get("id")]
+    if not want:
+        return []
+
+    doc = load_yaml_doc(cfg)
+    if not isinstance(doc, dict):
+        return []
+    plugins = doc.setdefault("plugins", {})
+    enabled = list(plugins.get("enabled") or [])
+    added = [p for p in want if p not in enabled]
+    if added:
+        plugins["enabled"] = enabled + added
+        save_yaml_doc(doc, cfg)
+    return added
+
+
+def _apply_bundle_config_defaults(cfg: Path, lock: Path) -> dict:
+    """Seed a freshly-installed bundle's recommended per-plugin ``config:`` defaults
+    into the workspace config (#1350). Defaults only — `bundle_config_overlay` drops any
+    key already set in the config, so an operator value is never clobbered. Each plugin's
+    config is a top-level section keyed by its id (ADR 0019). Returns the applied overlay.
+    Best-effort — a malformed lock/config is a no-op."""
+    import json
+
+    from graph.config_io import load_yaml_doc, save_yaml_doc
+    from graph.plugins.installer import bundle_config_overlay
+
+    try:
+        data = json.loads(lock.read_text()) if lock.exists() else {}
+    except (json.JSONDecodeError, OSError):
+        return {}
+    # Merge every bundle's `config` into one {section: {...}} map. Last-write-wins per
+    # section (`dict.update`): if two installed bundles ship defaults for the SAME plugin
+    # section, the later bundle's block replaces the earlier one's. That's acceptable —
+    # a fresh workspace installs a single archetype bundle, so collisions don't arise in
+    # the create() path; the order is lock order if they ever do.
+    merged: dict = {}
+    for b in data.get("bundles") or []:
+        merged.update(b.get("config") or {})
+    if not merged:
+        return {}
+
+    doc = load_yaml_doc(cfg)
+    if not isinstance(doc, dict):
+        return {}
+    overlay = bundle_config_overlay(merged, doc)
+    if not overlay:
+        return {}
+    for section, fill in overlay.items():
+        dest = doc.setdefault(section, {})
+        if not isinstance(dest, dict):
+            continue
+        for k, v in fill.items():
+            dest[k] = v
+    save_yaml_doc(doc, cfg)
+    return overlay
 
 
 def _overlay_model(cfg: Path, ws: Path, src: str) -> None:
@@ -283,8 +397,8 @@ def _overlay_model(cfg: Path, ws: Path, src: str) -> None:
         new["model"] = host["model"]
         save_yaml_doc(new, cfg)  # save_yaml_doc(doc, path) — doc first
     src_sec = (src_path if src_path.is_dir() else src_path.parent) / "secrets.yaml"
-    if src_sec.exists():  # carries the api_key so the gateway actually works
-        shutil.copyfile(src_sec, ws / "secrets.yaml")
+    if src_sec.exists():  # carries the api_key so the gateway actually works — sits next to cfg
+        shutil.copyfile(src_sec, cfg.parent / "secrets.yaml")
 
 
 def _stamp_identity(cfg: Path, name: str, shared_skills: bool, *, instance_id: str | None = None) -> None:
@@ -304,12 +418,11 @@ def _stamp_identity(cfg: Path, name: str, shared_skills: bool, *, instance_id: s
 
 def _install_bundle_into(ws: Path, bundle: str) -> list[str]:
     """Install a bundle (or plugin) into the workspace via a scoped subprocess —
-    fresh env so the installer's module-level lock path picks up this workspace."""
+    ``PROTOAGENT_HOME=<ws>`` makes the workspace the installer's instance root, so
+    plugins land at ``<ws>/plugins`` and the lock at ``<ws>/plugins.lock``."""
     env = {
         **os.environ,
-        "PROTOAGENT_CONFIG_DIR": str(ws),
-        "PROTOAGENT_PLUGINS_DIR": str(ws / "plugins"),
-        "PROTOAGENT_PLUGINS_LOCK": str(ws / "plugins.lock"),
+        "PROTOAGENT_HOME": str(ws),
     }
     proc = subprocess.run(
         [sys.executable, "-m", "server", "plugin", "install", bundle],
@@ -332,17 +445,20 @@ def _install_bundle_into(ws: Path, bundle: str) -> list[str]:
 def run_exec(ident: str, passthrough: list[str]) -> tuple[dict, list[str]]:
     """Return ``(env_overrides, argv)`` to launch this workspace's server. The CLI
     applies the env and ``exec``s — so the workspace runs as a normal server with
-    its config dir + instance + port wired in. ``ident`` is an id or display name."""
+    its instance root + id + port wired in. ``ident`` is an id or display name.
+
+    ``PROTOAGENT_HOME=<ws>`` makes the workspace dir the member's instance root
+    (config at ``<ws>/config``, plugins at ``<ws>/plugins``, lock at
+    ``<ws>/plugins.lock`` — all derived); ``PROTOAGENT_INSTANCE=<id>`` scopes its
+    private data stores."""
     found = _find(ident)
     ws = Path(found["path"]) if found else _ws_dir(ident)
     rec = _read_record(ws)
     if rec is None:
         raise WorkspaceError(f"no workspace {ident!r} at {ws}")
     env = {
-        "PROTOAGENT_CONFIG_DIR": str(ws),
+        "PROTOAGENT_HOME": str(ws),
         "PROTOAGENT_INSTANCE": str(rec.get("id", ident)),
-        "PROTOAGENT_PLUGINS_DIR": str(ws / "plugins"),
-        "PROTOAGENT_PLUGINS_LOCK": str(ws / "plugins.lock"),
     }
     argv = [sys.executable, "-m", "server", "--port", str(rec.get("port", PORT_BASE + 1)), *passthrough]
     return env, argv
@@ -388,7 +504,7 @@ def rename(ident: str, new_name: str) -> dict:
     rec = _read_record(ws) or {}
     rec["name"] = new_name
     atomic_write(ws / "workspace.yaml", yaml.safe_dump(rec, sort_keys=False))
-    cfg = ws / "langgraph-config.yaml"
+    cfg = ws / "config" / "langgraph-config.yaml"
     if cfg.exists():  # keep the agent's self-identity in step with the display name
         _stamp_identity(cfg, new_name, False, instance_id=rec.get("id", found["id"]))
     return {"id": found["id"], "name": new_name}

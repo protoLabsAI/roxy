@@ -67,12 +67,52 @@ test("tool-call card is collapsed by default and renders structured components",
 test("expanded state is sticky and the assistant answer renders as markdown", async ({ page }) => {
   await send(page, "MARKDOWN: summarize");
 
-  // Final answer renders through the markdown pipeline.
+  // Final answer renders through the streamdown markdown pipeline. streamdown emits real
+  // semantic tags for block elements (h2/li/pre/code) but renders inline emphasis as a
+  // styled span (`[data-streamdown="strong"]`, class `font-semibold`) rather than <strong>.
   const md = page.locator(".pl-message--assistant .markdown");
   await expect(md.locator("h2")).toHaveText("Summary");
-  await expect(md.locator("strong")).toHaveText("key");
+  await expect(md.locator('[data-streamdown="strong"]')).toHaveText("key");
   await expect(md.locator("li")).toHaveCount(2);
   await expect(md.locator("pre code")).toContainText("const x = 1;");
+});
+
+test("a completed turn shows a context meter + token/cost footer (#1372)", async ({ page }) => {
+  await send(page, "what is the capital of France?");
+
+  // The terminal cost-v1 + context-v1 DataParts → a quiet footer under the answer:
+  // context-window fill (with a compaction bar) / output ↓ / $cost.
+  const usage = page.locator(".pl-message--assistant .chat-usage").first();
+  await expect(usage).toBeVisible();
+  await expect(usage).toContainText("12.3k / 120k"); // contextTokens 12_340 / compactionAtTokens 120_000
+  await expect(usage).toContainText("1.2k"); // output_tokens 1_200
+  await expect(usage).toContainText("2.3s"); // durationMs 2300
+  await expect(usage).toContainText("$0.04"); // costUsd 0.0412
+  // The fill bar renders (token-based trigger → chartable).
+  await expect(usage.locator(".chat-usage-bar-fill")).toBeVisible();
+
+  // The full breakdown is a rich hover card (DS Tooltip) — the compaction threshold + the
+  // honest scope note live there, not in a native title attribute.
+  // The full breakdown is a rich hover card (DS Tooltip) that mounts only on hover. Radix
+  // double-renders the content (positioned + a11y copy) with identical text — assert on the
+  // first; its presence proves the card opened.
+  await expect(page.locator(".chat-usage-tip")).toHaveCount(0); // closed → not mounted
+  await usage.hover();
+  const tip = page.locator(".chat-usage-tip").first();
+  await expect(tip).toContainText("near 120,000 tokens");
+  await expect(tip).toContainText("Context is the live prompt size");
+});
+
+test("Settings ▸ Chat can hide the token/cost footer (#1372)", async ({ page }) => {
+  await send(page, "what is the capital of France?");
+  await expect(page.locator(".pl-message--assistant .chat-usage")).toBeVisible();
+
+  // Flip it off in Settings ▸ Chat — the chat stays mounted behind the overlay, so the footer
+  // clears live the moment the pref changes (no reload).
+  await page.getByTestId("settings-widget").click();
+  await page.locator(".settings-overlay .pl-sidenav").getByRole("tab", { name: "Chat", exact: true }).click();
+  await page.locator('.setting-row[data-key="chat.showUsage"] .pl-switch').click();
+  await expect(page.locator(".pl-message--assistant .chat-usage")).toHaveCount(0);
 });
 
 test("long tool values do not overflow the chat horizontally", async ({ page }) => {
@@ -96,4 +136,20 @@ test("long tool values do not overflow the chat horizontally", async ({ page }) 
   // content (long values wrap rather than blowing out the column).
   expect(metrics.docScroll).toBeLessThanOrEqual(metrics.win + 1);
   expect(metrics.bodyScroll).toBeLessThanOrEqual(metrics.bodyClient + 1);
+});
+
+test("right-click a chat tab → New chat / Rename / Close, and New chat adds a tab", async ({ page }) => {
+  // ADR 0036 — the chat tab context menu. Default has one session tab.
+  const tabs = page.locator(".pl-tabbar__tab");
+  await expect(tabs).toHaveCount(1);
+
+  await tabs.first().click({ button: "right" });
+  const menu = page.locator(".pl-menu");
+  await expect(menu).toBeVisible();
+  await expect(menu.getByText("New chat", { exact: true })).toBeVisible();
+  await expect(menu.getByText("Rename", { exact: true })).toBeVisible();
+  await expect(menu.getByText("Close chat", { exact: true })).toBeVisible();
+
+  await menu.getByText("New chat", { exact: true }).click();
+  await expect(tabs).toHaveCount(2);
 });

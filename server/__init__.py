@@ -39,15 +39,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from events import ACTIVITY_CONTEXT, EventBus
-from infra.paths import scope_leaf
 from runtime.state import STATE, get_state
-from graph.output_format import (
-    DROPPED_SCRATCH_KICKER,
-    extract_confidence,
-    extract_output,
-    is_dropped_scratch_turn,
-    stream_visible_output,
-)
+from graph.output_format import extract_output
 
 if TYPE_CHECKING:
     from scheduler.interface import SchedulerBackend
@@ -103,7 +96,7 @@ def _resolve_operator_project_root() -> str:
     isn't a real workspace, so the console's project-scoped APIs (notes/tasks)
     fail with "project_path does not exist". Resolve a stable, writable dir
     instead: an explicit ``PROTOAGENT_PROJECT_DIR`` wins; else (when frozen) the
-    per-user app dir the desktop already provides via ``PROTOAGENT_CONFIG_DIR``,
+    per-user app dir the desktop already provides via ``PROTOAGENT_HOME``,
     else the home dir."""
     env = os.environ.get("PROTOAGENT_PROJECT_DIR")
     if env:
@@ -118,7 +111,7 @@ def _resolve_operator_project_root() -> str:
         if chosen.is_dir():
             return str(chosen.resolve())
     if getattr(sys, "frozen", False):
-        cfg = os.environ.get("PROTOAGENT_CONFIG_DIR")
+        cfg = os.environ.get("PROTOAGENT_HOME")
         base = Path(cfg) if cfg else Path.home()
         return str(base.expanduser().resolve())
     return str(_bundle_root())
@@ -219,6 +212,7 @@ from server.a2a import (  # noqa: E402,F401 — re-export of the extracted A2A s
     _agent_skills,
     _bearer_configured,
     _build_agent_card_proto,
+    agent_card_routes,
     assert_routable_card_url,
     _package_version,
     _record_a2a_telemetry,
@@ -243,7 +237,7 @@ from server.agent_init import (  # noqa: E402,F401 — re-export of the extracte
     _build_telemetry_store,
     _checkpoint_prune_loop,
     _init_langgraph_agent,
-    _monitor_goals_loop,
+    _watch_loop,
     _mount_plugin_routers,
     _plugin_agent_invoke,
     _populate_plugin_host,
@@ -254,7 +248,6 @@ from server.agent_init import (  # noqa: E402,F401 — re-export of the extracte
     _resolve_skills_db,
     _retire_thread,
     _run_on_server_loop,
-    _seed_instance_env,
     _start_scheduler_async,
     _stop_scheduler_async,
     _sync_autostart_with_config,
@@ -299,6 +292,15 @@ def _main():
         from graph.fleet.cli import run_fleet_cli
 
         raise SystemExit(run_fleet_cli(sys.argv[2:]))
+
+    # Config subcommand: `python -m server config explain` — a read-only diagnostic
+    # that prints this instance's identity, both roots, every resolved path, and the
+    # per-field cascade provenance (the "where did my config/key go?" answer). Acts
+    # on disk + the env, then exits; never starts the server.
+    if len(sys.argv) > 1 and sys.argv[1] == "config":
+        from graph.config_explain import run_config_cli
+
+        raise SystemExit(run_config_cli(sys.argv[2:]))
 
     # Frozen-binary entrypoint for a plugin's managed MCP server (ADR 0019): the
     # bundled desktop app has no `python` on PATH, so a plugin's managed-server
@@ -370,14 +372,14 @@ def _main():
     if args.setup:
         from graph.config import LangGraphConfig
         from graph.config_io import (
-            CONFIG_YAML_PATH,
+            config_yaml_path,
             ensure_live_config,
             mark_setup_complete,
             validate_for_headless,
         )
 
         ensure_live_config()
-        cfg = LangGraphConfig.from_yaml(CONFIG_YAML_PATH)
+        cfg = LangGraphConfig.from_yaml(config_yaml_path())
         ok, reason = validate_for_headless(cfg)
         if not ok:
             print(f"setup: config invalid — {reason}", file=sys.stderr)
@@ -461,6 +463,9 @@ def _main():
         goal_list=_console._operator_goals_list,
         goal_clear=_console._operator_goals_clear,
         goal_set=_console._operator_goals_set,
+        watch_list=_console._operator_watches_list,
+        watch_clear=_console._operator_watches_clear,
+        watch_set=_console._operator_watches_set,
         chat_commands=_console._operator_chat_commands,
         events_subscribe=_event_bus.subscribe,
         events_publish=_event_bus.publish,
@@ -519,7 +524,7 @@ def _main():
         if STATE.graph_config is not None and getattr(STATE.graph_config, "goal_enabled", True):
             import asyncio
 
-            STATE.monitor_goals_task = asyncio.create_task(_monitor_goals_loop())
+            STATE.watch_task = asyncio.create_task(_watch_loop())
 
         # (The inbound Discord gateway now starts as the discord plugin's surface,
         # below — ADR 0018/0019.)
@@ -547,6 +552,13 @@ def _main():
             from graph.fleet import discovery
 
             await asyncio.to_thread(discovery.advertise, agent_name(), int(getattr(STATE, "active_port", 0) or 0))
+            # …and kick off a one-shot BACKGROUND sweep so peers that booted alongside us are
+            # cached and the first console GET /api/fleet/discover is instant (instead of only
+            # finding them after a manual rescan). Fire-and-forget on the loop — discover()
+            # offloads the sync zeroconf browse to a thread itself, so boot is never blocked;
+            # every failure is swallowed inside, and discovered peers are only surfaced as
+            # candidates (never auto-added to the fleet).
+            discovery.start_boot_sweep()
         except Exception:
             log.exception("[discovery] mDNS advertise failed")
 
@@ -629,8 +641,8 @@ def _main():
                 log.exception("[cache-warmer] shutdown failed")
         if STATE.checkpoint_prune_task is not None:
             STATE.checkpoint_prune_task.cancel()
-        if STATE.monitor_goals_task is not None:
-            STATE.monitor_goals_task.cancel()
+        if STATE.watch_task is not None:
+            STATE.watch_task.cancel()
         # Close the long-lived A2A push-notification client (created below in
         # _main) so its connection pool doesn't leak on shutdown/reload — matters
         # in the desktop-sidecar restart loop. Best-effort; NameError if boot
@@ -689,7 +701,6 @@ def _main():
     # emits the four custom extensions. Task + push-config state is durable
     # (SQLite via a2a_impl.stores), and push callbacks are SSRF-guarded.
     from a2a.server.request_handlers import DefaultRequestHandler
-    from a2a.server.routes.agent_card_routes import create_agent_card_routes
     from a2a.server.routes.fastapi_routes import add_a2a_routes_to_fastapi
     from a2a.server.routes.jsonrpc_routes import create_jsonrpc_routes
 
@@ -716,11 +727,16 @@ def _main():
     # that to ``None`` so configure() applies the documented A2A_AUTH_TOKEN env
     # fallback. (configure() treats an explicit "" as "bearer off, no fallback";
     # protoAgent has no separate apiKey-only flag, so unset ⇒ env, not off.)
+    # Plugin-declared auth-exempt prefixes (namespace-scoped in the manifest parser)
+    # — registered before the gate is installed so an inbound webhook / public view
+    # page passes under a token-gated deployment.
+    auth.set_public_prefixes(getattr(STATE, "plugin_public_paths", []) or [])
     auth.install(
         fastapi_app,
         bearer_token=((STATE.graph_config.auth_token if STATE.graph_config else "") or None),
         api_key=os.environ.get(f"{AGENT_NAME_ENV.upper()}_API_KEY", ""),
         allowed_origins_raw=os.environ.get("A2A_ALLOWED_ORIGINS", ""),
+        federation_token=((STATE.graph_config.federation_token if STATE.graph_config else "") or None),
     )
 
     # Short-lived SSE token endpoint (Part 3 of auth inversion): the React
@@ -760,9 +776,40 @@ def _main():
 
         return await finalize_structured(skill_id, spec["schema"], spec["mime"], final_text, STATE.graph_config)
 
+    def _context_meta() -> dict:
+        """Static compaction context for the context-v1 DataPart (#1372): whether compaction
+        is on, the configured trigger, the model's context window, and the absolute token
+        threshold compaction fires at. The window comes from the gateway (#1378), so a
+        `fraction:` trigger now resolves to `fraction × window`; `tokens:N` is taken verbatim;
+        `messages:` has no token threshold (the meter shows size without a bar)."""
+        cfg = STATE.graph_config
+        trigger = str(getattr(cfg, "compaction_trigger", "") or "")
+        meta: dict = {"enabled": bool(getattr(cfg, "compaction_enabled", False)), "trigger": trigger}
+        from graph.model_window import context_window_for
+
+        window = context_window_for(cfg)
+        if window:
+            meta["maxTokens"] = window
+        kind, _, val = trigger.partition(":")
+        val = val.strip()
+        if kind == "tokens" and val.isdigit():
+            meta["compactionAtTokens"] = int(val)
+        elif kind == "fraction" and window:
+            try:
+                frac = float(val)
+            except ValueError:
+                frac = 0.0
+            if 0 < frac <= 1:
+                meta["compactionAtTokens"] = int(window * frac)
+        return meta
+
     _a2a_push_client = httpx.AsyncClient(timeout=30)
     a2a_request_handler = DefaultRequestHandler(
-        agent_executor=ProtoAgentExecutor(_chat_langgraph_stream, structured_finalizer=_structured_finalizer),
+        agent_executor=ProtoAgentExecutor(
+            _chat_langgraph_stream,
+            structured_finalizer=_structured_finalizer,
+            context_meta_provider=_context_meta,
+        ),
         task_store=task_store,
         agent_card=a2a_card,
         push_config_store=push_config_store,
@@ -770,7 +817,10 @@ def _main():
     )
     add_a2a_routes_to_fastapi(
         fastapi_app,
-        agent_card_routes=create_agent_card_routes(a2a_card),
+        # ``agent_card_routes`` (server.a2a) serves the same well-known card as
+        # a2a-sdk's ``create_agent_card_routes`` plus a proto-free protocolVersion
+        # hint, so a delegating peer can pre-check version compatibility (ADR 0051).
+        agent_card_routes=agent_card_routes(a2a_card),
         jsonrpc_routes=create_jsonrpc_routes(a2a_request_handler, rpc_url="/a2a"),
     )
     log.info("[a2a] a2a-sdk routes mounted (JSON-RPC at /a2a, card at /.well-known/agent-card.json)")
@@ -799,8 +849,23 @@ def _main():
     mount_ds_plugin_kit(fastapi_app, web_dist_dir)
 
     # The console SPA (/app) — console/full tiers only; 'none' (members/headless) skip it.
-    if ui != "none" and mount_react_app(fastapi_app, web_dist_dir):
-        log.info("React operator console mounted at /app")
+    if ui != "none":
+        if mount_react_app(fastapi_app, web_dist_dir):
+            log.info("React operator console mounted at /app")
+        else:
+            # The console tier was requested but the build output is missing — /app
+            # would silently 404 (the #874 footgun: a no-Node Docker image, or a
+            # source checkout that never ran `npm run build`). Warn LOUDLY with the
+            # exact fix instead of a single quiet log line.
+            log.warning(
+                "--ui %s requested but the React console build is missing at %s — "
+                "/app will 404. Build it with `npm ci && npm run build --workspace "
+                "@protoagent/web` (or use a Docker image built from the multi-stage "
+                "Dockerfile, which builds it for you). Use `--ui none` to run headless "
+                "without the console.",
+                ui,
+                web_dist_dir,
+            )
 
     # --- Static + PWA assets (skipped in 'none') ---------------------------
     if ui != "none" and static_dir.exists():

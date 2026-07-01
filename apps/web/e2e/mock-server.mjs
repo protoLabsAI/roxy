@@ -26,6 +26,7 @@ import {
   RUNTIME_STATUS,
   SCHEDULER_JOBS,
   SETTINGS_SCHEMA,
+  GATEWAY_MODELS,
   settingsRestartRequired,
   SLASH_COMMANDS,
   PLAYBOOKS,
@@ -124,7 +125,7 @@ function handleApiGet(pathname, fleet = FLEET) {
         tools: [
           { name: "web_search", description: "Search the web.", source: "core", category: "General" },
           { name: "memory_recall", description: "Search long-term memory.", source: "core", category: "Memory" },
-          { name: "echo__ping", description: "Echo ping.", source: "mcp", category: "MCP" },
+          { name: "echo__ping", description: "Echo ping.", source: "mcp", category: "echo" },
         ],
         count: 3,
       };
@@ -269,7 +270,11 @@ async function handleA2AStream(req, res, body) {
     .join("");
   const frames = buildFrames({
     rpcId: body.id ?? "1",
-    contextId: params.contextId || "e2e-ctx",
+    // Echo the contextId the console sent (it rides on the MESSAGE, like the real server,
+    // which mirrors message.context_id back onto every frame). The console now drops frames
+    // whose contextId != its sessionId (frameIsForeign, #1399); a mock that didn't echo the
+    // real contextId would have all its frames rejected and render nothing.
+    contextId: params.message?.contextId || params.contextId || "e2e-ctx",
     taskId: "task-e2e-1",
     prompt,
   });
@@ -279,6 +284,18 @@ async function handleA2AStream(req, res, body) {
     "cache-control": "no-cache",
     connection: "keep-alive",
   });
+  // A turn a spec can HOLD OPEN: stream only the opening frames (so the surface
+  // enters its "streaming" / steering state) and never the terminal frame, until
+  // the client disconnects. Lets the mid-turn steering ✕-cancel e2e (#1103) keep a
+  // turn running deterministically instead of racing the ~40ms-gapped frames.
+  if (/hold the turn open/i.test(prompt)) {
+    for (const frame of frames.slice(0, 2)) {
+      res.write(`data: ${JSON.stringify(frame)}\r\n\r\n`);
+      await new Promise((r) => setTimeout(r, 40));
+    }
+    await new Promise((resolve) => req.on("close", resolve));
+    return res.end();
+  }
   for (const frame of frames) {
     // CRLF frame separator — the a2a-sdk emits SSE with `\r\n\r\n`, not `\n\n`.
     // The mock must mirror that so this e2e exercises the real wire shape: an
@@ -368,7 +385,7 @@ const server = createServer(async (req, res) => {
     // Push periodically so the unread badge (off-surface), live append (on-surface), and
     // the plugin notification dot (a `boardy.*` event) are all deterministically testable.
     const t = setInterval(() => {
-      frame("activity.message", { text: "live activity ping", origin: "scheduler", trigger: "heartbeat" });
+      frame("activity.message", { text: "live activity ping", origin: "scheduler", trigger: "heartbeat", stimulus: "Hourly heartbeat check." });
       frame("inbox.item", { id: 99, priority: "next", source: "mock", text: "live inbox ping" });
       frame("boardy.created", { id: "b1" }); // ADR 0039 — exercises the rail notification dot
     }, 500);
@@ -392,6 +409,19 @@ const server = createServer(async (req, res) => {
     if (/^\/api\/chat\/sessions\/[^/]+\/steer$/.test(pathname) && req.method === "POST") {
       const body = await readBody(req);
       return sendJson(res, { ok: true, id: body.id ?? null, pending: 0 });
+    }
+    // Mid-turn steering cancel (the ✕ on a queued bubble) — dequeue still-queued.
+    // `removed: true` is the happy path the #1103 e2e drives (cancel before drain).
+    if (/^\/api\/chat\/sessions\/[^/]+\/steer\/[^/]+$/.test(pathname) && req.method === "DELETE") {
+      return sendJson(res, { removed: true, pending: 0 });
+    }
+    if (pathname === "/api/config/models" && req.method === "POST") {
+      // "Get models" (#1386): probe the (form) gateway for its model list. The mock returns a
+      // DIFFERENT set than the saved dropdown, so the test can prove the dropdown refreshes.
+      return sendJson(res, { models: GATEWAY_MODELS, error: "" });
+    }
+    if (pathname === "/api/config/test-model" && req.method === "POST") {
+      return sendJson(res, { ok: true, error: "" });
     }
     if (pathname === "/api/knowledge/attach" && req.method === "POST") {
       // Chat attachment upload (#1002) — multipart, so DON'T JSON-parse the body.
@@ -643,6 +673,9 @@ const server = createServer(async (req, res) => {
       `window.addEventListener("message",function(e){var m=e.data||{};` +
       `if(m.type!=="protoagent:init")return;` +
       `document.body.setAttribute("data-bridge",m.token?"authed":"anon");});` +
+      // Like the real plugin-kit: announce readiness so the console (re-)sends the
+      // bearer + theme, closing the race where load-time init beats our listener.
+      `try{parent&&parent!==window&&parent.postMessage({type:"protoagent:ready"},"*");}catch(_){}` +
       `</script></body></html>`,
     );
     return;

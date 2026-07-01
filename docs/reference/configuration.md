@@ -70,9 +70,16 @@ model:
   api_key: sk-...
 auth:
   token: bearer-...
+  federation_token: fed-...   # optional (ADR 0066) — semi-trusted peers get THIS, not `token`
 ```
 
 `LangGraphConfig.from_yaml` overlays this file on top of the main config at load time. Precedence for each secret: **`secrets.yaml` → main YAML value → env var** (`OPENAI_API_KEY` / `A2A_AUTH_TOKEN`). So env-injected deployments (e.g. `infisical run`) work unchanged — just leave `secrets.yaml` absent. Every config save also strips any secret keys the main YAML might still carry, so a checkout converges to secret-free. The `/api/config` endpoint redacts both fields to `""`; runtime status reports only whether a key is set (`model.api_key_configured`), never the value.
+
+### Federation token — operator vs peer (ADR 0066)
+
+A deployment that hands its `/a2a` endpoint to **semi-trusted A2A peers** (a fleet hub, a partner agent) can issue them a **second** credential instead of the operator bearer: set `auth.federation_token` (secret; env fallback `A2A_FEDERATION_TOKEN`). A request authenticated with the federation token reaches only the **`/a2a` + `/v1` consumer surfaces** — it is **denied the whole `/api` operator surface** (plugin install/enable = host code-exec, config/SOUL rewrite, subagent runs, the operator goal set-path) with a `403`. The operator bearer keeps full access. Leaving `federation_token` blank is **single-token mode** (unchanged behavior): every bearer holder is the operator. Rotate existing peers onto the federation token — until they do, they still hold the operator credential.
+
+This is the R1 path ceiling behind the goal trust-gate: the dangerous goal verifiers (`command`/`test`/`ci`, `data`+`expr`) are refused from a `/goal` **chat** message for everyone (Phase 1), and the operator sets them through the operator-tier **`POST /api/goals`** endpoint — safe precisely because the `/api` ceiling confines that endpoint to the operator.
 
 ## `subagents`
 
@@ -254,7 +261,7 @@ filesystem:
 
 ## `egress`
 
-Deny-by-default outbound-host allowlist ([ADR 0008](../adr/0008-sandboxing-and-openshell.md)) enforced in `fetch_url` — the tool where the model picks an arbitrary host (the in-process exfiltration / SSRF vector). Also the single source of truth the OpenShell network policy is generated from (`scripts/gen_openshell_policy.py`).
+Deny-by-default outbound-host allowlist ([ADR 0008](../adr/0008-sandboxing-and-openshell.md)) enforced in `fetch_url` — the tool where the model picks an arbitrary host (the in-process exfiltration / SSRF vector). Also the single source of truth the OpenShell network policy is generated from (`scripts/gen_openshell_policy.py`). Editable in the console at **Settings ▸ Box ▸ Network** (host-scoped, hot-reloads).
 
 ```yaml
 egress:
@@ -265,9 +272,9 @@ egress:
 
 | Key | Default | What |
 |---|---|---|
-| `allowed_hosts` | `[]` | Hosts `fetch_url` may reach. **Empty = permissive** (off). When set, any other host is denied. `*.host` matches subdomains + apex; case-insensitive, port-agnostic. Hot-reloads. |
+| `allowed_hosts` | `[]` | Hosts `fetch_url` may reach. **Empty = permissive** (off, with a built-in SSRF guard still blocking private / loopback / cloud-metadata addresses). When set, any other host is denied. `*.host` matches subdomains + apex; case-insensitive, port-agnostic. Hot-reloads. |
 
-Covers `fetch_url` only; `execute_code`/`run_command` process-level egress is fenced by running under OpenShell (see [Sandboxing & egress](../guides/sandboxing.md)).
+When the allowlist **is** set, your configured model gateway (`model.api_base`) host is permitted **automatically** — you don't have to list it, and the connection-test / "Get models" probes for a custom base URL won't be blocked. (With an empty allowlist this auto-add is a no-op; adding one host there would flip the guard into deny-by-default for every other host.) Covers `fetch_url` only; `execute_code`/`run_command` process-level egress is fenced by running under OpenShell (see [Sandboxing & egress](../guides/sandboxing.md)).
 
 ## `security`
 
@@ -301,7 +308,7 @@ routing:
 
 ## `goal`
 
-**Goal mode** (`graph/goals/`) lets you give the agent a *testable outcome* it self-drives toward. After each terminal turn (the agent stops with a final answer), the goal's **verifier** decides whether it's met; if not, the agent is re-invoked with a continuation prompt — carrying the verifier's evidence and a running `<goal_plan>` checklist — until the verifier passes, the iteration budget runs out (`exhausted`), or the goal is flagged `unachievable` (a no-progress streak, or the model emitting `<goal_unachievable reason="…"/>`). Unlike a pure-LLM "are we done?" check, completion is backed by a real verifier.
+**Goal mode** (`graph/goals/`) lets you give the agent a *testable outcome* it self-drives toward. After each terminal turn (the agent stops with a final answer), the goal's **verifier** decides whether it's met; if not, the agent is re-invoked with a continuation prompt — carrying the verifier's evidence and the running plan the agent records with the `update_goal_plan` tool — until the verifier passes, the iteration budget runs out (`exhausted`), or the goal is flagged `unachievable` (a no-progress streak, or the agent calling the `abandon_goal` tool). Unlike a pure-LLM "are we done?" check, completion is backed by a real verifier.
 
 The machinery is wired when `enabled`, but **no goal is active until one is set** via the `/goal` control message (works over A2A / the React console / OpenAI-compat) or the `/api/goal/{session_id}` endpoints. State is persisted per session under `GOAL_PATH` → `/sandbox/goals` → `~/.protoagent/goals`.
 

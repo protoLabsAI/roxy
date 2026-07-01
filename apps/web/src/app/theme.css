@@ -106,9 +106,16 @@
   cursor: pointer;
 }
 
-.util-btn:hover {
+.util-btn:not(:disabled):hover {
   background: var(--bg-elevated, #1a1a1f);
   color: var(--fg);
+}
+
+/* Fully disabled toggle (#1234): the rail/dock it controls has no views, so the
+   button is greyed out and non-interactive (no hover feedback, no pointer). */
+.util-btn:disabled {
+  opacity: 0.4;
+  cursor: default;
 }
 
 .util-btn svg {
@@ -286,6 +293,26 @@
   max-height: 50vh;
   overflow-y: auto;
   overscroll-behavior: contain;
+}
+
+/* Expanded row body: a live tool-by-tool feed (DS ToolCard) and/or the result. The wrapper
+   owns the single top separator; the nested result drops its own to avoid a double rule. */
+.bg-jobs-detail {
+  border-top: 1px solid var(--border, #2a2a31);
+}
+.bg-jobs-detail .bg-jobs-result {
+  border-top: none;
+}
+.bg-jobs-feed {
+  padding: 8px 12px 8px 33px;
+  /* A chatty job (many tools) scrolls within the row rather than growing the dialog. */
+  max-height: 40vh;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+/* Divider when a result is shown beneath the tool feed. */
+.bg-jobs-feed + .bg-jobs-result {
+  border-top: 1px solid var(--border, #2a2a31);
 }
 
 .topbar {
@@ -661,6 +688,9 @@ select:disabled {
   padding: var(--pl-space-6, 24px);
 }
 
+/* Toast top-right anchoring now comes from the DS prop (`<ToastProvider position="top-right">`,
+   @protolabsai/ui ≥ 0.49) — the `.pl-toast-stack` override that used to live here is retired. */
+
 /* MCP catalog quick-add (McpCatalogDialog) — a curated directory of common servers,
    self-contained styles so the dialog doesn't depend on the Plugins surface CSS. */
 /* Browse (grid) view: pin the dialog to a tall, consistent height and let the card
@@ -692,52 +722,11 @@ select:disabled {
   flex-wrap: wrap;
   margin: 2px 0 12px;
 }
+/* The search box (DS Input + `icon`) and category filter (DS segmented Tabs)
+   own their own styling now; the controls row just sizes the search to fill. */
 .mcp-catalog-search {
-  display: flex;
-  align-items: center;
-  gap: 6px;
   flex: 1;
   min-width: 200px;
-  padding: 6px 10px;
-  background: var(--bg-raised);
-  border: 1px solid var(--border);
-  border-radius: 7px;
-}
-.mcp-catalog-search > svg {
-  color: var(--fg-muted);
-  flex-shrink: 0;
-}
-.mcp-catalog-search input {
-  flex: 1;
-  min-width: 0;
-  border: 0;
-  background: transparent;
-  color: var(--fg);
-  font-size: 13px;
-  outline: none;
-}
-.mcp-catalog-cats {
-  display: flex;
-  gap: 6px;
-  flex-wrap: wrap;
-}
-.mcp-catalog-cat {
-  padding: 4px 10px;
-  font-size: 12px;
-  border-radius: 999px;
-  border: 1px solid var(--border);
-  background: transparent;
-  color: var(--fg-secondary);
-  cursor: pointer;
-  transition: border-color 0.15s, color 0.15s;
-}
-.mcp-catalog-cat:hover {
-  border-color: color-mix(in srgb, var(--pl-color-brand-lavender) 45%, transparent);
-}
-.mcp-catalog-cat.on {
-  background: color-mix(in srgb, var(--pl-color-brand-lavender) 18%, transparent);
-  border-color: color-mix(in srgb, var(--pl-color-brand-lavender) 55%, transparent);
-  color: var(--fg);
 }
 .mcp-catalog-grid {
   display: grid;
@@ -849,88 +838,12 @@ select:disabled {
 
 /* Tool-call cards + per-tool renderers — moved to src/chat/tool-calls.css (#832). */
 
-/* Rendered markdown (assistant messages). The parent keeps pre-wrap for the
-   literal user text; markdown content reflows normally. */
-.markdown {
-  white-space: normal;
-  line-height: 1.55;
-}
-.markdown > :first-child { margin-top: 0; }
-.markdown > :last-child { margin-bottom: 0; }
-.markdown p { margin: 0 0 0.6em; }
-.markdown ul,
-.markdown ol { margin: 0 0 0.6em; padding-left: 1.4em; }
-.markdown li { margin: 0.15em 0; }
-.markdown h1,
-.markdown h2,
-.markdown h3,
-.markdown h4 { margin: 0.9em 0 0.4em; line-height: 1.25; font-weight: 600; }
-.markdown h1 { font-size: 1.3em; }
-.markdown h2 { font-size: 1.18em; }
-.markdown h3 { font-size: 1.06em; }
-.markdown a { color: var(--brand-indigo-bright); text-decoration: underline; }
-.markdown code {
-  font-family: var(--font-mono);
-  font-size: 0.9em;
-  background: var(--bg-raised);
-  border: 1px solid var(--border);
-  border-radius: 4px;
-  padding: 0.1em 0.35em;
-}
-.markdown pre {
-  margin: 0 0 0.7em;
-  padding: 12px 14px;
-  background: var(--bg-raised);
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
-  overflow-x: auto;
-}
-.markdown pre code {
-  background: none;
-  border: 0;
-  padding: 0;
-  font-size: 0.85em;
-}
-.markdown blockquote {
-  margin: 0 0 0.6em;
-  padding-left: 0.9em;
-  border-left: 3px solid var(--border-strong);
-  color: var(--fg-secondary);
-}
-.markdown table {
-  border-collapse: collapse;
-  margin: 0 0 0.7em;
-  display: block;
-  overflow-x: auto;
-}
-.markdown th,
-.markdown td { border: 1px solid var(--border); padding: 4px 8px; text-align: left; }
-.markdown th { background: var(--bg-raised); }
-.markdown hr { border: 0; border-top: 1px solid var(--border); margin: 0.9em 0; }
-
-/* highlight.js tokens (compact dark theme for rehype-highlight output) */
-.markdown .hljs-comment,
-.markdown .hljs-quote { color: var(--fg-muted); font-style: italic; }
-.markdown .hljs-keyword,
-.markdown .hljs-selector-tag,
-.markdown .hljs-built_in,
-.markdown .hljs-name { color: #c792ea; }
-.markdown .hljs-string,
-.markdown .hljs-attr,
-.markdown .hljs-template-tag { color: #c3e88d; }
-.markdown .hljs-number,
-.markdown .hljs-literal,
-.markdown .hljs-type { color: #f78c6c; }
-.markdown .hljs-title,
-.markdown .hljs-function .hljs-title,
-.markdown .hljs-section { color: #82aaff; }
-.markdown .hljs-attribute,
-.markdown .hljs-variable,
-.markdown .hljs-symbol { color: #ffcb6b; }
-.markdown .hljs-deletion { color: #ff5370; }
-.markdown .hljs-addition { color: #c3e88d; }
-.markdown .hljs-emphasis { font-style: italic; }
-.markdown .hljs-strong { font-weight: 600; }
+/* Rendered markdown (assistant messages) is now the DS `<Markdown>` (@protolabsai/ui
+   ≥0.48), which scopes its own `.pl-markdown` and owns the FULL visual layer — prose
+   typography, Shiki code, KaTeX math, GFM tables, AND streamdown's interactive chrome
+   (code/table action buttons, themed + re-pinned to the brand). The console's hand-rolled
+   `.markdown` rules + the streamdown Tailwind scan are gone (protoContent#297/#298). The
+   `.markdown` class still rides the same element as an e2e/selector alias. */
 
 /* Chat composer + slash-command autocomplete — moved to src/chat/chat.css (#832). */
 /* HITL request card — moved to src/chat/hitl.css (#832). */
@@ -1716,15 +1629,8 @@ textarea {
   border-top: 1px solid var(--border);
 }
 
-.spin {
-  animation: spin 1000ms linear infinite;
-}
-
-@keyframes spin {
-  to {
-    transform: rotate(360deg);
-  }
-}
+/* The app `.spin` keyframe is retired — busy spinners now come from the DS
+   (`<Button loading>` and `<Spinner>`, @protolabsai/ui ≥ 0.50). */
 
 /* Below this width there isn't room for the rail + chat + side panel, so drop
    to two columns and hide the panel (reachable again by widening / the toggle).

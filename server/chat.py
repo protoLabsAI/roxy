@@ -17,16 +17,10 @@ import asyncio
 import json
 import logging
 import time
+import weakref
 from typing import Any
 
-from graph.output_format import (
-    DROPPED_SCRATCH_KICKER,
-    extract_confidence,
-    extract_output,
-    is_dropped_scratch_turn,
-    stream_visible_output,
-    stream_visible_reasoning,
-)
+from graph.output_format import extract_output
 from runtime.state import STATE
 
 log = logging.getLogger("protoagent.server")
@@ -99,40 +93,72 @@ def _resolve_thread_id(request_metadata: dict | None, session_id: str) -> str:
     return f"a2a:{session_id}"
 
 
+def _goal_continuation_config(config: dict, goal_state) -> dict:
+    """The LangGraph config for one goal *continuation* turn.
+
+    Same-session goals reuse ``config`` (the checkpointer keeps the transcript so the model
+    sees prior iterations). Fresh-context goals (Ralph loop) get a scoped, per-iteration
+    ``thread_id`` so the checkpointer starts clean each turn — derived from the CURRENT
+    ``config`` thread_id so the streaming (``a2a:…``) and non-streaming (``chat:…``) drive
+    loops build it identically instead of each hand-rolling it. (They had drifted: the two
+    paths re-derived the base thread_id differently and only the streaming one set
+    ``recursion_limit`` — this unifies both.) Durable state lives in the goal's plan
+    artifact on disk, not the thread.
+    """
+    if not (goal_state and getattr(goal_state, "fresh_context", False)):
+        return config
+    base_tid = (config.get("configurable") or {}).get("thread_id") or "goal"
+    return {
+        "configurable": {"thread_id": f"{base_tid}:goal-iter-{goal_state.iteration}"},
+        "recursion_limit": 200,
+    }
+
+
 # One ACP runtime per thread (the ACP session is stateful — the coding agent holds
 # history, so we reuse it across turns; ADR 0033 slice 4).
 _ACP_RUNTIMES: dict[str, Any] = {}
 _ACP_RUNTIME_ACCESS: dict[str, float] = {}  # thread_id → time.monotonic() last access
+_ACP_BUSY: dict[str, int] = {}  # thread_id → in-flight turn count; never evict while > 0
+_ACP_LOCK = asyncio.Lock()  # serializes registry mutation across concurrent turns
 _ACP_IDLE_TTL_S = 1800  # 30 min idle before eviction
 _ACP_MAX_RUNTIMES = 100  # hard cap — evict LRU when exceeded
 
 
 async def _evict_acp_runtimes(now: float) -> None:
-    """Sweep idle ACP runtimes and enforce the hard cap."""
-    # Phase 1 — evict entries older than the idle TTL.
+    """Sweep idle ACP runtimes and enforce the hard cap. The CALLER holds ``_ACP_LOCK``
+    (kept lock-free here so it composes under the get/acquire helpers). A runtime with an
+    in-flight turn (``_ACP_BUSY > 0``) is NEVER evicted — closing it would kill a live turn
+    (a long ACP coding turn can outlast the idle TTL)."""
+    # Phase 1 — evict entries older than the idle TTL (never an in-flight one).
     for tid in list(_ACP_RUNTIMES):
+        if _ACP_BUSY.get(tid, 0) > 0:
+            continue
         last = _ACP_RUNTIME_ACCESS.get(tid, 0)
         if now - last >= _ACP_IDLE_TTL_S:
-            rt = _ACP_RUNTIMES.pop(tid)
+            rt = _ACP_RUNTIMES.pop(tid, None)
             _ACP_RUNTIME_ACCESS.pop(tid, None)
-            await rt.close()
-            agent = getattr(rt, "agent", "?")
-            log.info("[acp-runtime] evicted idle runtime for thread=%s agent=%s", tid, agent)
+            if rt is not None:
+                await rt.close()
+                log.info("[acp-runtime] evicted idle runtime for thread=%s agent=%s", tid, getattr(rt, "agent", "?"))
 
-    # Phase 2 — if still over cap, evict LRU entries until at or below _ACP_MAX_RUNTIMES.
+    # Phase 2 — over cap: evict the LRU NON-BUSY runtime until at/below the cap.
     while len(_ACP_RUNTIMES) > _ACP_MAX_RUNTIMES:
-        lru_tid = min(_ACP_RUNTIME_ACCESS, key=lambda k: _ACP_RUNTIME_ACCESS[k])
-        rt = _ACP_RUNTIMES.pop(lru_tid)
+        evictable = [t for t in _ACP_RUNTIME_ACCESS if _ACP_BUSY.get(t, 0) == 0]
+        if not evictable:
+            break  # everything is in-flight — ride over cap rather than kill a live turn
+        lru_tid = min(evictable, key=lambda k: _ACP_RUNTIME_ACCESS[k])
+        rt = _ACP_RUNTIMES.pop(lru_tid, None)
         _ACP_RUNTIME_ACCESS.pop(lru_tid, None)
-        await rt.close()
-        agent = getattr(rt, "agent", "?")
-        log.info("[acp-runtime] evicted LRU runtime for thread=%s agent=%s", lru_tid, agent)
+        if rt is not None:
+            await rt.close()
+            log.info("[acp-runtime] evicted LRU runtime for thread=%s agent=%s", lru_tid, getattr(rt, "agent", "?"))
 
 
-async def _get_acp_runtime(thread_id: str):
+async def _get_acp_runtime_locked(thread_id: str):
+    """Get-or-create the runtime for ``thread_id`` (evicting idle/over-cap first). The
+    CALLER holds ``_ACP_LOCK``."""
     now = time.monotonic()
     await _evict_acp_runtimes(now)
-
     rt = _ACP_RUNTIMES.get(thread_id)
     _ACP_RUNTIME_ACCESS[thread_id] = now  # bump on every call (hit or miss)
     if rt is None:
@@ -141,6 +167,93 @@ async def _get_acp_runtime(thread_id: str):
         rt = AcpRuntime(STATE.graph_config)
         _ACP_RUNTIMES[thread_id] = rt
     return rt
+
+
+async def _get_acp_runtime(thread_id: str):
+    """Get-or-create the ACP runtime for ``thread_id`` (lock-guarded)."""
+    async with _ACP_LOCK:
+        return await _get_acp_runtime_locked(thread_id)
+
+
+async def _acp_acquire(thread_id: str):
+    """Get-or-create the runtime AND mark it in-flight (refcount++), atomically under
+    ``_ACP_LOCK``, so a concurrent turn's eviction can't close it mid-turn. Pair with
+    ``_acp_release`` in a ``finally``."""
+    async with _ACP_LOCK:
+        rt = await _get_acp_runtime_locked(thread_id)
+        _ACP_BUSY[thread_id] = _ACP_BUSY.get(thread_id, 0) + 1
+        return rt
+
+
+async def _acp_release(thread_id: str) -> None:
+    """Mark a thread's ACP runtime no longer in-flight (refcount--)."""
+    async with _ACP_LOCK:
+        n = _ACP_BUSY.get(thread_id, 0) - 1
+        if n > 0:
+            _ACP_BUSY[thread_id] = n
+        else:
+            _ACP_BUSY.pop(thread_id, None)
+        _ACP_RUNTIME_ACCESS[thread_id] = time.monotonic()  # fresh access on release
+
+
+async def _acp_drive_turn(rt, message: str):
+    """Drive one ACP turn over ``rt``, yielding the normalized frames (text /
+    tool_start / tool_end, then usage + done, or an error) in arrival order. Extracted
+    so the A2A handler can wrap the turn in _acp_acquire/_acp_release without a deep
+    in-line reindent."""
+    # Bridge the agent's reader-loop callbacks (answer-text deltas + tool events) into the
+    # same text / tool_start / tool_end frames the native runtime yields, in arrival order.
+    _ACP_DONE = object()
+    frame_q: asyncio.Queue = asyncio.Queue()
+
+    async def _on_text(delta: str) -> None:
+        await frame_q.put(("text", delta))
+
+    async def _on_tool(ev: dict) -> None:
+        if ev.get("phase") == "start":
+            await frame_q.put(
+                ("tool_start", {"id": ev.get("id", ""), "name": ev.get("name", "tool"), "input": ev.get("input", "")})
+            )
+        elif ev.get("phase") == "end":
+            await frame_q.put(
+                ("tool_end", {"id": ev.get("id", ""), "name": ev.get("name", "tool"), "output": ev.get("output", "")})
+            )
+
+    async def _drive():
+        try:
+            return await rt.run_turn(message, text_callback=_on_text, tool_callback=_on_tool)
+        finally:
+            await frame_q.put(_ACP_DONE)
+
+    driver = asyncio.create_task(_drive())
+    while True:
+        frame = await frame_q.get()
+        if frame is _ACP_DONE:
+            break
+        yield frame  # (kind, payload) — already normalized
+    try:
+        answer = await driver
+    except Exception as exc:  # noqa: BLE001 — surface as a turn error, don't 500
+        log.exception("[acp-runtime] turn failed")
+        yield ("error", f"ACP runtime ({rt.agent}) failed: {exc}")
+        return
+    # Attribute the turn to the ACP agent in telemetry — gateway tokens/cost are 0 (the
+    # external agent's own subscription meters its usage). The acp:<agent> model label is
+    # the honest signal that this turn wasn't gateway-metered.
+    yield (
+        "usage",
+        {
+            "model": f"acp:{rt.agent}",
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "cache_read_input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "cost_usd": 0.0,
+        },
+    )
+    # The answer already streamed as text deltas; `done` finalizes (executor appends only
+    # meta when text was streamed, so no duplication).
+    yield ("done", answer)
 
 
 def _setup_required_message() -> list[dict[str, Any]]:
@@ -232,7 +345,13 @@ def _interrupt_payload(val) -> dict:
 async def _pending_interrupt_value(config: dict):
     """Return the value of a pending LangGraph interrupt (ask_human / HITL) for
     this thread, or ``None``. Both chat paths read the same snapshot to detect a
-    turn that paused for human input instead of producing a final answer."""
+    turn that paused for human input instead of producing a final answer.
+
+    Returns a single value because the graph only ever has one interrupt pending:
+    ``create_agent`` / ``ToolNode`` runs an assistant turn's tool calls SEQUENTIALLY, so the
+    first ask_human / request_user_input ``interrupt()`` halts the tool node before the next
+    tool runs (verified). Multiple HITL calls therefore surface as back-to-back pauses — each
+    drained on its own resume by the lead/autonomous turn loop — not as one batch."""
     try:
         snapshot = await STATE.graph.aget_state(config)
     except Exception:
@@ -243,7 +362,29 @@ async def _pending_interrupt_value(config: dict):
             pending.extend(getattr(t, "interrupts", ()) or ())
     if not pending:
         return None
+    if len(pending) > 1:
+        # Tripwire: with sequential tool execution this can't happen. If a LangGraph change
+        # ever makes interrupts pend simultaneously, surfacing only pending[0] would silently
+        # drop the rest — warn loudly so we build real multi-interrupt handling instead.
+        log.warning(
+            "[hitl] %d pending interrupts at once — only the first is surfaced; tool execution "
+            "is expected to be sequential, so this signals a behavior change to handle.",
+            len(pending),
+        )
     return getattr(pending[0], "value", pending[0])
+
+
+async def _clear_pending_interrupt(config: dict) -> None:
+    """Discard a pending (un-resumed) LangGraph interrupt so the thread is left in a clean,
+    non-interrupted state. Used when an autonomous turn gives up on a HITL pause it can't
+    answer (below): ``aupdate_state(config, None)`` advances the checkpoint past the interrupt
+    WITHOUT running the model — verified to clear ``snapshot.interrupts`` and let the next
+    fresh-input turn run clean. Best-effort: a failure here must never break the turn, and the
+    next fresh turn supersedes a stray interrupt anyway."""
+    try:
+        await STATE.graph.aupdate_state(config, None)
+    except Exception:  # noqa: BLE001 — clearing is defensive; never break the turn
+        log.debug("[hitl] could not clear pending interrupt on autonomous give-up", exc_info=True)
 
 
 def _last_tool_text(result) -> str:
@@ -305,9 +446,7 @@ async def _run_turn_stream(
     from observability import metrics
     from observability import pricing
 
-    accumulated_raw = ""
-    streamed_len = 0  # chars of visible <output> already emitted as text frames
-    reasoned_len = 0  # chars of scratch_pad reasoning already emitted (live thinking)
+    accumulated_raw = ""  # the answer text so far (the model's content; no protocol tags)
     _llm_started: dict[str, float] = {}  # run_id → monotonic start (per-call latency)
     announced_tools: set[str] = set()  # tool_call ids already surfaced as a start frame
     async for event in STATE.graph.astream_events(
@@ -317,6 +456,11 @@ async def _run_turn_stream(
     ):
         kind = event.get("event", "")
         name = event.get("name", "")
+        # A subagent's events carry the delegating `task`/`task_batch` tool-call id (set
+        # as run metadata in graph.agent._run_subagent), so the console can nest the
+        # subagent's own tool cards under the delegation card BY ID — not by frame order
+        # (the delegation runs detached, so the task's on_tool_end races ahead of these).
+        parent_tool_id = (event.get("metadata") or {}).get("parent_task_id")
         # Skills are no longer auto-retrieved per turn (ADR 0060 — progressive
         # disclosure); the model loads one on demand via the `load_skill` tool,
         # which surfaces as an ordinary tool card. No `skills_loaded` event to forward.
@@ -340,16 +484,20 @@ async def _run_turn_stream(
             # run_command, an execution error, an enforcement block) closes the card
             # as a failure (X) instead of a green "done".
             coerced = _coerce_tool_output(output)
-            # A show_component result (ADR 0051) carries a sentinel-wrapped payload — lift
-            # it into a `component` frame (→ a component-v1 DataPart) and strip it from the
-            # card so the user sees the rendered widget, not raw wire JSON.
-            if isinstance(coerced, str):
+            # A show_component result (ADR 0051) carries a sentinel-wrapped payload — lift it
+            # into a `component` frame (→ a component-v1 DataPart) and strip it from the card so
+            # the user sees the rendered widget, not raw wire JSON. Extract from the FULL tool
+            # content, NOT the truncated card preview `coerced`: _coerce_tool_output caps at
+            # _TOOL_PREVIEW_CHARS for the SSE frame, which cuts a large component's JSON tail and
+            # breaks extraction (#1323 — a rich timeline rendered nothing).
+            full = getattr(output, "content", output)
+            if isinstance(full, str):
                 from graph.components import extract_component, strip_component
 
-                comp = extract_component(coerced)
+                comp = extract_component(full)
                 if comp is not None:
                     yield ("component", comp)
-                    coerced = strip_component(coerced)
+                    coerced = str(strip_component(full))[:_TOOL_PREVIEW_CHARS]  # card = human prefix
             yield (
                 "tool_end",
                 {
@@ -357,6 +505,7 @@ async def _run_turn_stream(
                     "name": name,
                     "output": coerced,
                     "error": getattr(output, "status", None) == "error",
+                    **({"parentId": parent_tool_id} if parent_tool_id else {}),
                 },
             )
         elif kind == "on_chat_model_stream":
@@ -371,22 +520,38 @@ async def _run_turn_stream(
                 tcid, tcname = tcc.get("id"), tcc.get("name")
                 if tcid and tcname and tcid not in announced_tools:
                     announced_tools.add(tcid)
-                    yield ("tool_start", {"id": tcid, "name": tcname, "input": ""})
+                    yield (
+                        "tool_start",
+                        {"id": tcid, "name": tcname, "input": "", **({"parentId": parent_tool_id} if parent_tool_id else {})},
+                    )
+            # A subagent's answer + reasoning belong to ITS delegation, not the lead's
+            # turn: `_run_subagent` captures the subagent's final message and hands it back
+            # as the `task`/`task_batch` tool result (which renders as the delegation card's
+            # output). But the subagent's LLM events still surface on THIS stream because
+            # LangChain propagates the parent run's callbacks into the nested `ainvoke`,
+            # tagging them with `parent_task_id` (set in graph.agent._run_subagent).
+            # Forwarding those content/reasoning chunks streams the subagent's internals
+            # into the lead answer — polluting `accumulated_raw` and, under `task_batch`,
+            # interleaving every concurrent subagent's tokens character-by-character (the
+            # garbled-output bug). Suppress them here: the subagent's tool cards above still
+            # nest by id, and the `on_chat_model_end` cost accounting below is untouched
+            # (subagent tokens still bill). Only the lead's own tokens reach the answer.
+            if parent_tool_id:
+                continue
+            # Native reasoning: the model's REAL thinking, streamed on its own channel.
+            # `_ReasoningChatOpenAI` lifts the gateway's `reasoning_content` into
+            # additional_kwargs; reasoning chunks carry NO `content`, so this is checked
+            # independently of the answer below. Rendered live as a collapsible "thinking"
+            # view — it never enters the answer text (so it can't leak to storage either).
+            native_reasoning = (getattr(chunk, "additional_kwargs", None) or {}).get("reasoning_content")
+            if native_reasoning:
+                yield ("reasoning", native_reasoning if isinstance(native_reasoning, str) else str(native_reasoning))
+            # The answer is the model's content, streamed directly — no <scratch_pad>/<output>
+            # protocol. (extract_output at the terminal still strips any stray legacy tag.)
             if hasattr(chunk, "content") and chunk.content:
-                accumulated_raw += chunk.content if isinstance(chunk.content, str) else str(chunk.content)
-                # Stream only the user-facing <output> region, token by token —
-                # never the scratch_pad. The terminal artifact (extract_output)
-                # reconciles any partial tail held back here.
-                visible = stream_visible_output(accumulated_raw)
-                if len(visible) > streamed_len:
-                    yield ("text", visible[streamed_len:])
-                    streamed_len = len(visible)
-                # Stream the scratch_pad reasoning on its own channel — a collapsible
-                # "thinking" view in the console (never folded into the answer text).
-                reasoning = stream_visible_reasoning(accumulated_raw)
-                if len(reasoning) > reasoned_len:
-                    yield ("reasoning", reasoning[reasoned_len:])
-                    reasoned_len = len(reasoning)
+                text = chunk.content if isinstance(chunk.content, str) else str(chunk.content)
+                accumulated_raw += text
+                yield ("text", text)
         elif kind == "on_chat_model_end":
             output = event.get("data", {}).get("output")
             # Finalize each tool card with its full args, keyed by the tool_call id.
@@ -399,7 +564,12 @@ async def _run_turn_stream(
                     announced_tools.add(tcid)
                     yield (
                         "tool_start",
-                        {"id": tcid, "name": tc.get("name", ""), "input": _coerce_tool_value(tc.get("args", ""))},
+                        {
+                            "id": tcid,
+                            "name": tc.get("name", ""),
+                            "input": _coerce_tool_value(tc.get("args", "")),
+                            **({"parentId": parent_tool_id} if parent_tool_id else {}),
+                        },
                     )
             usage = getattr(output, "usage_metadata", None) if output else None
             rid = event.get("run_id")
@@ -590,6 +760,7 @@ async def _run_parsed_subagent(subagent_type: str, prompt: str) -> str:
 # the two can't drift (operator_api may not import server, so it can't live here).
 from graph.slash_commands import (  # noqa: E402
     find_user_facing_skill as _find_user_facing_skill,
+    run_plugin_chat_command as _run_plugin_chat_command,
     slash_kind as _slash_kind,
 )
 
@@ -616,6 +787,172 @@ def _skill_directive(skill: dict, args: str) -> str:
     if args:
         directive += f"\nInput: {args}\n"
     return directive
+
+
+# Per-thread_id locks (WeakValueDictionary so a lock is GC'd once no turn holds it,
+# bounding memory). See _thread_lock.
+_THREAD_LOCKS: weakref.WeakValueDictionary = weakref.WeakValueDictionary()
+
+
+def _thread_lock(thread_id: str) -> asyncio.Lock:
+    """Per-thread_id async lock — serializes turns on the SAME checkpointer thread so
+    two concurrent A2A message/send on one context_id can't lost-update each other's
+    history. Auto-evicted once no turn references the lock."""
+    lock = _THREAD_LOCKS.get(thread_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _THREAD_LOCKS[thread_id] = lock
+    return lock
+
+
+# Origins (ADR 0022) whose turns run with NO operator watching the chat: a HITL pause
+# (ask_human / request_user_input) on one of these would park the task in input-required
+# FOREVER — and that state is deliberately exempt from the TTL sweep, so it never settles.
+# Live operator turns carry an empty origin (they keep parking — a human is watching);
+# inbound `a2a` calls are excluded too, because the remote caller can itself resume the
+# input-required task. For everything here, we auto-answer the interrupt instead of parking.
+_AUTONOMOUS_ORIGINS = frozenset({"scheduler", "inbox", "webhook", "background"})
+
+# What we resume an autonomous turn's HITL interrupt with, so the agent stops waiting and
+# finishes the turn instead of deadlocking. Bounded by the cap below so a model that keeps
+# re-asking can't auto-answer in an infinite loop; past the cap we force the turn to complete
+# (clearing the stray interrupt) rather than parking — an autonomous turn must never park.
+_AUTONOMOUS_HITL_SENTINEL = (
+    "[no interactive operator available] This turn is running autonomously "
+    "(scheduled / inbox / background), so no human can answer right now. Do not wait for "
+    "input — proceed using your best judgment and explicitly state any assumption you made."
+)
+_MAX_AUTONOMOUS_AUTOANSWERS = 3
+
+
+async def _run_native_turn(message, session_id, config, *, request_metadata=None, resume=False, images=None):
+    """One native LangGraph turn (the non-ACP path): run the graph, the dropped-turn
+    kicker retry, and goal-mode continuations, then yield the terminal confidence + done
+    frames. Extracted from _chat_langgraph_stream so the A2A handler can hold a per-thread
+    lock around the whole turn without a deep in-line reindent."""
+    from graph.goals.goal_turn import goal_turn
+
+    # Per-tab model + reasoning-effort override (the console puts the tab's chosen model +
+    # the /effort level in the A2A request metadata). Threaded into every turn this stream
+    # runs — initial, kicker, goal continuation. Unset → the configured default.
+    _model = ((request_metadata or {}).get("model") or "").strip() or None
+    _effort = ((request_metadata or {}).get("reasoning_effort") or "").strip() or None
+    # When a goal is already active, the whole turn is goal-driven (suppress cross-session
+    # prior_sessions on the initial turn + kicker, matching the continuation turns).
+    goal_active = STATE.goal_controller is not None and STATE.goal_controller.active_goal(session_id) is not None
+
+    # One graph turn (model tokens accumulated silently; A2A consumers get progress from
+    # tool_start/tool_end). Final text is extracted once via extract_output().
+    accumulated_raw = ""
+    paused = False
+    last_tool_out = ""  # streaming equivalent of _last_tool_text — the empty-turn fallback answer
+    # An autonomous turn (no operator watching) must never deadlock on a HITL pause: when one
+    # of these turns hits input_required we resume the graph with a "no operator" sentinel and
+    # run another pass, up to a cap, instead of parking the task forever (see _AUTONOMOUS_*).
+    _autonomous = ((request_metadata or {}).get("origin") or "").strip().lower() in _AUTONOMOUS_ORIGINS
+    _resume_value = (message if resume else None)
+    _auto_answers = 0
+    with goal_turn(goal_active):
+        while True:
+            _autoanswer_pending = False
+            _autonomous_giveup = False
+            async for kind, payload in _run_turn_stream(
+                message,
+                session_id,
+                config,
+                resume_value=_resume_value,
+                images=images,
+                model=_model,
+                reasoning_effort=_effort,
+            ):
+                if kind == "__raw__":
+                    accumulated_raw = payload
+                elif kind == "input_required":
+                    if not _autonomous:
+                        # Operator/a2a turn: surface it and park the turn; the A2A runner sets
+                        # the task input-required and the caller resumes via message/send on the
+                        # same taskId. (A human — local or at the remote a2a caller — can answer.)
+                        yield (kind, payload)
+                        paused = True
+                    elif _auto_answers < _MAX_AUTONOMOUS_AUTOANSWERS:
+                        # No human can answer — auto-answer this interrupt and re-run the turn so
+                        # it completes, rather than parking an (un-sweepable) input-required task.
+                        # The graph is checkpointed at the interrupt; the resume below feeds the
+                        # sentinel as ask_human / request_user_input's return value.
+                        _autoanswer_pending = True
+                    else:
+                        # Still asking after the auto-answer budget is spent: an autonomous turn
+                        # must NEVER park, so give up on the pause and force the turn to a
+                        # terminal state. The stray interrupt is cleared after the loop.
+                        _autonomous_giveup = True
+                else:
+                    if kind == "tool_end" and isinstance(payload, dict) and payload.get("output"):
+                        last_tool_out = str(payload["output"])
+                    yield (kind, payload)
+            if _autoanswer_pending:
+                # Resume past the interrupt with the no-operator sentinel and run another pass;
+                # images belong only to the first (fresh) pass, so drop them on resume.
+                _auto_answers += 1
+                _resume_value = _AUTONOMOUS_HITL_SENTINEL
+                images = None
+                continue
+            if _autonomous_giveup:
+                # Discard the un-answered interrupt so the checkpoint isn't left dangling, then
+                # fall through to the normal completion path below (extract_output → done).
+                await _clear_pending_interrupt(config)
+            break
+
+    # A paused turn produced no final answer — don't run the dropped-scratch kicker or
+    # goal verification; the task is parked.
+    if paused:
+        return
+
+    final_text = extract_output(accumulated_raw)
+
+    # Goal mode: when an active goal exists for this session, verify the outcome after the
+    # agent stops; if not met, re-invoke on the same thread with a continuation prompt until
+    # the verifier passes, the iteration budget is spent, or it's flagged unachievable.
+    if STATE.goal_controller is not None and STATE.goal_controller.active_goal(session_id):
+        guard, hard_cap = 0, STATE.graph_config.goal_max_iterations + 2
+        note = ""
+        while guard < hard_cap:
+            guard += 1
+            decision = await STATE.goal_controller.evaluate(session_id, last_text=final_text)
+            if decision is None:
+                break
+            note = decision.note
+            yield ("tool_start", f"🎯 {decision.note}")
+            if decision.action == "done":
+                break
+            # Fresh-context goals get a scoped per-iteration thread; same-session reuse
+            # `config`. Shared helper keeps the streaming + non-streaming loops in lockstep.
+            cont_config = _goal_continuation_config(config, decision.state)
+
+            cont_raw = ""
+            with goal_turn():
+                async for kind, payload in _run_turn_stream(
+                    decision.message, session_id, cont_config, model=_model, reasoning_effort=_effort
+                ):
+                    if kind == "__raw__":
+                        cont_raw = payload
+                    else:
+                        yield (kind, payload)
+            cont_text = extract_output(cont_raw)
+            if cont_text:
+                final_text = cont_text
+        # Append the terminal goal outcome to the answer so the A2A terminal artifact
+        # carries it, matching the non-streaming path (the 🎯 status frames above are
+        # transient and can coalesce).
+        if note:
+            final_text = f"{final_text}\n\n---\n{note}"
+
+    # Never end the stream on a silent empty answer (a native-reasoning model that emitted
+    # only reasoning, or an otherwise empty turn): surface the last tool result or a
+    # placeholder, matching the non-streaming path's _last_tool_text-or-placeholder.
+    if not final_text:
+        final_text = last_tool_out or "_(The agent ended the turn without a textual reply.)_"
+
+    yield ("done", final_text)
 
 
 async def _chat_langgraph_stream(
@@ -649,7 +986,6 @@ async def _chat_langgraph_stream(
     """
     from observability import tracing
 
-    from graph.goals.goal_turn import goal_turn
     from graph.middleware.request_context import request_metadata_scope
 
     trace_meta: dict = {"message_preview": message[:100]}
@@ -675,9 +1011,19 @@ async def _chat_langgraph_stream(
             # Goal control messages (/goal ...) short-circuit the turn: set /
             # status / clear a goal and return the reply without running the graph.
             if STATE.goal_controller is not None:
-                reply = await STATE.goal_controller.parse_control(message, session_id)
+                reply = await STATE.goal_controller.parse_control(message, session_id, trusted=False)
                 if reply is not None:
                     yield ("done", reply)
+                    return
+
+            # Plugin-registered chat control command (/<name> …) short-circuits the
+            # turn with the plugin's reply — user-only, like /goal (e.g. the github
+            # plugin's /issue). No plugin claims a token by default ⇒ falls through.
+            name, rest = _parse_slash_command(message)
+            if name:
+                cmd_reply = await _run_plugin_chat_command(name, rest, session_id)
+                if cmd_reply is not None:
+                    yield ("done", cmd_reply)
                     return
 
             # Workflow slash command (/<workflow-name> …) short-circuits the turn:
@@ -762,72 +1108,16 @@ async def _chat_langgraph_stream(
             from runtime.acp_runtime import is_acp_runtime
 
             if is_acp_runtime(STATE.graph_config):
-                rt = await _get_acp_runtime(_resolve_thread_id(request_metadata, session_id))
-                # Bridge the agent's reader-loop callbacks (answer-text deltas + tool events)
-                # into the same text / tool_start / tool_end frames the native runtime yields,
-                # in arrival order → live streaming + tool cards.
-                _ACP_DONE = object()
-                frame_q: asyncio.Queue = asyncio.Queue()
-
-                async def _on_text(delta: str) -> None:
-                    await frame_q.put(("text", delta))
-
-                async def _on_tool(ev: dict) -> None:
-                    if ev.get("phase") == "start":
-                        await frame_q.put(
-                            (
-                                "tool_start",
-                                {"id": ev.get("id", ""), "name": ev.get("name", "tool"), "input": ev.get("input", "")},
-                            )
-                        )
-                    elif ev.get("phase") == "end":
-                        await frame_q.put(
-                            (
-                                "tool_end",
-                                {
-                                    "id": ev.get("id", ""),
-                                    "name": ev.get("name", "tool"),
-                                    "output": ev.get("output", ""),
-                                },
-                            )
-                        )
-
-                async def _drive():
-                    try:
-                        return await rt.run_turn(message, text_callback=_on_text, tool_callback=_on_tool)
-                    finally:
-                        await frame_q.put(_ACP_DONE)
-
-                driver = asyncio.create_task(_drive())
-                while True:
-                    frame = await frame_q.get()
-                    if frame is _ACP_DONE:
-                        break
-                    yield frame  # (kind, payload) — already normalized
+                _acp_tid = _resolve_thread_id(request_metadata, session_id)
+                # Hold the runtime "in-flight" for the whole turn so a concurrent turn's
+                # eviction can't close it mid-stream (a long ACP coding turn can outlast the
+                # idle TTL); registry mutation is serialized by _ACP_LOCK. See _acp_acquire.
+                rt = await _acp_acquire(_acp_tid)
                 try:
-                    answer = await driver
-                except Exception as exc:  # noqa: BLE001 — surface as a turn error, don't 500
-                    log.exception("[acp-runtime] turn failed")
-                    yield ("error", f"ACP runtime ({rt.agent}) failed: {exc}")
-                    return
-                # Attribute the turn to the ACP agent in telemetry — else it defaults to the
-                # gateway model (`protolabs/reasoning`), which never ran. Gateway tokens/cost are
-                # 0: the external agent's own subscription meters its usage, not us. (The model
-                # label `acp:<agent>` is the honest signal that this turn wasn't gateway-metered.)
-                yield (
-                    "usage",
-                    {
-                        "model": f"acp:{rt.agent}",
-                        "input_tokens": 0,
-                        "output_tokens": 0,
-                        "cache_read_input_tokens": 0,
-                        "cache_creation_input_tokens": 0,
-                        "cost_usd": 0.0,
-                    },
-                )
-                # The answer already streamed as text deltas; `done` finalizes (executor appends
-                # only meta when text was streamed, so no duplication).
-                yield ("done", answer)
+                    async for frame in _acp_drive_turn(rt, message):
+                        yield frame
+                finally:
+                    await _acp_release(_acp_tid)
                 return
 
             # thread_id keys this session's history in the checkpointer (bound
@@ -835,142 +1125,23 @@ async def _chat_langgraph_stream(
             # sessions from the non-streaming chat in the shared MemorySaver. Derivation is
             # a pluggable seam (#571): a fork registers a resolver to scope memory
             # off request metadata (e.g. per-project) without editing this file.
+            _tid = _resolve_thread_id(request_metadata, session_id)
             config = {
-                "configurable": {"thread_id": _resolve_thread_id(request_metadata, session_id)},
+                "configurable": {"thread_id": _tid},
                 "recursion_limit": 200,
             }
 
-            # Per-tab model + reasoning-effort override (the console puts the tab's chosen
-            # model + the /effort level in the A2A request metadata). Threaded into every
-            # turn this stream runs — initial, kicker, goal continuation — so the whole
-            # conversation stays on the tab's model/effort. Unset → the configured default.
-            _model = ((request_metadata or {}).get("model") or "").strip() or None
-            _effort = ((request_metadata or {}).get("reasoning_effort") or "").strip() or None
-
-            # When a goal is already active, the whole turn is goal-driven —
-            # suppress cross-session prior_sessions on the initial turn (and the
-            # kicker retry below), matching the continuation turns.
-            goal_active = (
-                STATE.goal_controller is not None and STATE.goal_controller.active_goal(session_id) is not None
-            )
-
-            # One graph turn (model tokens accumulated silently; A2A consumers
-            # get progress from tool_start/tool_end). Final text is extracted
-            # once via extract_output().
-            accumulated_raw = ""
-            paused = False
-            with goal_turn(goal_active):
-                async for kind, payload in _run_turn_stream(
-                    message,
-                    session_id,
-                    config,
-                    resume_value=(message if resume else None),
-                    images=images,
-                    model=_model,
-                    reasoning_effort=_effort,
+            # Serialize turns on the SAME thread_id: two near-simultaneous A2A
+            # message/send on one context_id would otherwise run concurrent graph turns
+            # against the shared checkpointer thread → lost-update history corruption. A
+            # per-thread async lock runs them one-at-a-time (mirrors the console steering
+            # queue; different contexts never block each other). The turn body lives in
+            # _run_native_turn so the lock wraps it without a deep in-line reindent.
+            async with _thread_lock(_tid):
+                async for frame in _run_native_turn(
+                    message, session_id, config, request_metadata=request_metadata, resume=resume, images=images
                 ):
-                    if kind == "__raw__":
-                        accumulated_raw = payload
-                    elif kind == "input_required":
-                        # Agent paused for human input — surface it and park the
-                        # turn; the A2A runner sets the task input-required and the
-                        # caller resumes via message/send on the same taskId.
-                        yield (kind, payload)
-                        paused = True
-                    else:
-                        yield (kind, payload)
-
-            # A paused turn produced no final answer — don't run the
-            # dropped-scratch kicker or goal verification; the task is parked.
-            if paused:
-                return
-
-            final_text = extract_output(accumulated_raw)
-            final_raw = accumulated_raw
-
-            # Dropped-turn recovery: the model emitted only <scratch_pad>/<think>
-            # — no <output>, no tool call — so extract_output is empty and the
-            # turn would silently drop. Re-prompt once on the same thread with a
-            # kicker (history is preserved by the checkpointer). Capped at 1 retry.
-            if not final_text and is_dropped_scratch_turn(accumulated_raw):
-                log.warning(
-                    "[chat-stream] dropped scratch-only turn (session=%s) — kicker retry",
-                    session_id,
-                )
-                yield ("tool_start", "↻ retry: prior turn dropped scratch-only")
-                retry_raw = ""
-                with goal_turn(goal_active):
-                    async for kind, payload in _run_turn_stream(
-                        DROPPED_SCRATCH_KICKER, session_id, config, model=_model, reasoning_effort=_effort
-                    ):
-                        if kind == "__raw__":
-                            retry_raw = payload
-                        else:
-                            yield (kind, payload)
-                recovered = extract_output(retry_raw)
-                if recovered:
-                    final_text, final_raw = recovered, retry_raw
-                    log.info("[chat-stream] kicker recovered the turn (session=%s)", session_id)
-                else:
-                    log.warning(
-                        "[chat-stream] kicker retry also empty (session=%s) — falling back",
-                        session_id,
-                    )
-
-            # Goal mode: when an active goal exists for this session, verify the
-            # outcome after the agent stops; if not met, re-invoke on the same
-            # thread with a continuation prompt until the verifier passes, the
-            # iteration budget is spent, or it's flagged unachievable.
-            if STATE.goal_controller is not None and STATE.goal_controller.active_goal(session_id):
-                guard, hard_cap = 0, STATE.graph_config.goal_max_iterations + 2
-                note = ""
-                while guard < hard_cap:
-                    guard += 1
-                    decision = await STATE.goal_controller.evaluate(session_id, last_text=final_text)
-                    if decision is None:
-                        break
-                    note = decision.note
-                    yield ("tool_start", f"🎯 {decision.note}")
-                    if decision.action == "done":
-                        break
-                    # For fresh-context goals, create a scoped thread so the checkpointer
-                    # starts clean — no accumulated transcript from prior iterations.
-                    goal_state = decision.state
-                    if goal_state and goal_state.fresh_context:
-                        base_tid = _resolve_thread_id(request_metadata, session_id)
-                        cont_config = {
-                            "configurable": {"thread_id": f"{base_tid}:goal-iter-{goal_state.iteration}"},
-                            "recursion_limit": 200,
-                        }
-                    else:
-                        cont_config = config  # same-session (existing behavior)
-
-                    cont_raw = ""
-                    with goal_turn():
-                        async for kind, payload in _run_turn_stream(
-                            decision.message, session_id, cont_config, model=_model, reasoning_effort=_effort
-                        ):
-                            if kind == "__raw__":
-                                cont_raw = payload
-                            else:
-                                yield (kind, payload)
-                    cont_text = extract_output(cont_raw)
-                    if cont_text:
-                        final_text, final_raw = cont_text, cont_raw
-                # Append the terminal goal outcome to the answer so the A2A
-                # terminal artifact carries it, matching the non-streaming path
-                # (the 🎯 status frames above are transient and can coalesce).
-                if note:
-                    final_text = f"{final_text}\n\n---\n{note}"
-
-            # Self-reported confidence (from whichever pass produced the answer),
-            # yielded before "done" so the A2A handler records it on the
-            # terminal artifact's confidence-v1 DataPart.
-            confidence, explanation = extract_confidence(final_raw)
-            if confidence is not None:
-                yield ("confidence", {"confidence": confidence, "explanation": explanation})
-
-            yield ("done", final_text)
+                    yield frame
 
         except GeneratorExit:
             # Expected: A2A consumers break out of the SSE loop after
@@ -1009,9 +1180,18 @@ async def _chat_langgraph(message: str, session_id: str, *, model: str | None = 
         try:
             # Goal control messages short-circuit (set / status / clear).
             if STATE.goal_controller is not None:
-                reply = await STATE.goal_controller.parse_control(message, session_id)
+                reply = await STATE.goal_controller.parse_control(message, session_id, trusted=False)
                 if reply is not None:
                     return [{"role": "assistant", "content": reply}]
+
+            # Plugin-registered chat control command (/<name> …) short-circuits —
+            # user-only, like /goal (e.g. the github plugin's /issue). No plugin
+            # claims a token by default ⇒ falls through to normal dispatch.
+            name, rest = _parse_slash_command(message)
+            if name:
+                cmd_reply = await _run_plugin_chat_command(name, rest, session_id)
+                if cmd_reply is not None:
+                    return [{"role": "assistant", "content": cmd_reply}]
 
             # Workflow slash command (/<workflow-name> …) short-circuits the turn.
             parsed = _parse_workflow_command(message)
@@ -1065,21 +1245,6 @@ async def _chat_langgraph(message: str, session_id: str, *, model: str | None = 
                     question = payload.get("question") or payload.get("title") or "The agent needs input to continue."
                     return [{"role": "assistant", "content": f"🙋 **Input needed:** {question}"}]
 
-                # Dropped scratch-only turn (no <output>, no tool call): re-prompt
-                # once with the kicker, matching _chat_langgraph_stream.
-                if is_dropped_scratch_turn(raw):
-                    log.warning("[chat] dropped scratch-only turn (session=%s) — kicker retry", session_id)
-                    with goal_turn(goal_active):
-                        result = await STATE.graph.ainvoke(
-                            {
-                                "messages": [HumanMessage(content=DROPPED_SCRATCH_KICKER)],
-                                "session_id": session_id,
-                                **_model_extra,
-                            },
-                            config=config,
-                        )
-                    response = extract_output(_last_ai(result))
-
             # Still nothing (e.g. a `wait` yield, or a tool-only turn): fall back
             # to the last tool result so the caller gets a signal, not a blank.
             if not response:
@@ -1098,15 +1263,9 @@ async def _chat_langgraph(message: str, session_id: str, *, model: str | None = 
                     note = decision.note
                     if decision.action == "done":
                         break
-                    # For fresh-context goals, create a scoped thread so the checkpointer
-                    # starts clean — no accumulated transcript from prior iterations.
-                    goal_state = decision.state
-                    if goal_state and goal_state.fresh_context:
-                        cont_config = {
-                            "configurable": {"thread_id": f"chat:{session_id}:goal-iter-{goal_state.iteration}"},
-                        }
-                    else:
-                        cont_config = config
+                    # Fresh-context goals get a scoped per-iteration thread; same-session
+                    # reuse `config`. Same shared helper as the streaming path (no drift).
+                    cont_config = _goal_continuation_config(config, decision.state)
 
                     with goal_turn():
                         result = await STATE.graph.ainvoke(

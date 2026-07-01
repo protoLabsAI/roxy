@@ -66,6 +66,20 @@ The binary must be installed and on the `PATH` of the process running protoAgent
 The delegates panel's **Test** button performs a real ACP `initialize` handshake — so
 a wrong launch command **fails the probe** instead of showing green (it's not just a
 missing-binary check). A misconfigured delegate surfaces at Test, not at first dispatch.
+The probe resolves the command against the **same** PATH the spawn uses — the process
+PATH with the delegate's `env` PATH overlaid — so probe and dispatch never disagree.
+
+::: warning macOS desktop app & `PATH`
+A GUI app launched from Finder/Dock/`launchd` inherits only `launchd`'s minimal `PATH`
+(`/usr/bin:/bin:/usr/sbin:/sbin`), **not** your login-shell `PATH` — so Homebrew
+(`/opt/homebrew/bin`), nvm, Volta, and asdf installs (where `npx`/`node`/ACP adapters
+live) are invisible, and a `command: npx` delegate fails with `binary not on PATH`
+([#1299](https://github.com/protoLabsAI/protoAgent/issues/1299)). The desktop build now
+hands the bundled server your real login-shell `PATH`, so this works out of the box.
+If you still hit it (an unusual shell setup), either set an **absolute** `command`
+(`/opt/homebrew/bin/npx`) or add a `PATH` to the delegate **`env`** — both pass the
+probe too. The web app (terminal-launched server) is unaffected.
+:::
 
 **Claude Code has no native ACP mode.** Drive it through the
 [`claude-agent-acp`](https://www.npmjs.com/package/@agentclientprotocol/claude-agent-acp)
@@ -76,12 +90,16 @@ don't have to know the incantation. (The older `@zed-industries/claude-code-acp`
 `command: claude` directly does **not** work — `claude` isn't an ACP server, and the
 probe will tell you so.
 
-> **Caveat:** the adapter launches the `claude` binary, which **refuses to start
-> nested inside another Claude Code session** (`Error: Claude Code cannot be launched
-> inside another Claude Code session`). Run protoAgent from a normal shell / the
-> desktop app — not from within a `claude` session — when using the Claude Code agent.
-> (If you must run nested, strip `CLAUDECODE` + `CLAUDE_CODE_*` from protoAgent's
-> environment at launch — e.g. `env -u CLAUDECODE -u CLAUDE_CODE_ENTRYPOINT …`.)
+> **Nested Claude:** the adapter launches the `claude` binary, which **refuses to
+> start nested inside another Claude Code session** (`Error: Claude Code cannot be
+> launched inside another Claude Code session`). protoAgent now **strips the
+> nested-session markers** (`CLAUDECODE` and the whole `CLAUDE_CODE_*` family) from
+> the ACP launch env automatically ([#1296](https://github.com/protoLabsAI/protoAgent/issues/1296)),
+> so launching protoAgent from *within* a `claude` session — the dogfooding case —
+> works without the manual `env -u …` dance. (Partial strips were the footgun: missing
+> just one of `CLAUDE_CODE_SESSION_ID` / `CLAUDE_CODE_ENTRYPOINT` / … still tripped the
+> guard, so the agent respawned every ~2 min with no surfaced error.) A value you set
+> explicitly in the delegate `env` still wins.
 
 **Codex has no native ACP mode either.** Recent `codex` CLI (≥ 0.13x) dropped the
 `acp` subcommand — it speaks **MCP** natively, not ACP, so `command: codex, args:
@@ -141,9 +159,10 @@ Action kinds come from the ACP request (`toolCall.kind`: `read` / `edit` /
 
 ### Environment
 
-The subprocess **inherits protoAgent's environment** (plus any per-delegate `env`).
-Run protoAgent under an account whose ambient credentials you're willing to lend the
-coding agent, or scope the `workdir` to a throwaway checkout.
+The subprocess **inherits protoAgent's environment** (plus any per-delegate `env`),
+**minus** the nested-Claude markers (`CLAUDECODE` / `CLAUDE_CODE_*`) — see the caveat
+above. Run protoAgent under an account whose ambient credentials you're willing to lend
+the coding agent, or scope the `workdir` to a throwaway checkout.
 
 ## How it works
 

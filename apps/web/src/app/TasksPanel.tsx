@@ -1,6 +1,6 @@
 import { DropdownSelect, Input, Textarea } from "@protolabsai/ui/forms";
 import { Button, Empty } from "@protolabsai/ui/primitives";
-import { Dialog } from "@protolabsai/ui/overlays";
+import { Dialog, useToast } from "@protolabsai/ui/overlays";
 import {
   QueryErrorResetBoundary,
   useMutation,
@@ -13,7 +13,6 @@ import {
   ChevronDown,
   ChevronRight,
   CircleAlert,
-  Loader2,
   Play,
   Plus,
   Trash2,
@@ -21,6 +20,8 @@ import {
 import { Suspense, useEffect, useState } from "react";
 
 import { api } from "../lib/api";
+import { errMsg } from "../lib/format";
+import { onServerEvent } from "../lib/events";
 import { PanelHeader } from "@protolabsai/ui/navigation";
 import { tasksQuery, queryKeys } from "../lib/queries";
 import type { Task } from "../lib/types";
@@ -42,10 +43,11 @@ import { ScrollArea } from "@protolabsai/ui/data";
 import { StatusPill } from "./StatusPill";
 
 // The agent's task board (in-process tasks store), on the TanStack Query data
-// layer (ADR 0013): the issue list is a `useSuspenseQuery` (refetching while
-// mounted), create/start/close/reopen/delete are `useMutation`s that invalidate
-// it. The store is always initialized, so there's no init flow. Delete routes
-// through the App-owned confirm dialog via the `confirm` prop.
+// layer (ADR 0013): the issue list is a `useSuspenseQuery` that invalidates on the
+// `task.changed` bus push (the agent files/closes issues mid-turn) instead of
+// polling; create/start/close/reopen/delete are `useMutation`s that invalidate it.
+// The store is always initialized, so there's no init flow. Delete routes through
+// the App-owned confirm dialog via the `confirm` prop.
 
 type ConfirmRequest = {
   title: string;
@@ -62,13 +64,11 @@ function TaskCreateDialog({
   onClose,
   onCreate,
   busy,
-  error,
 }: {
   open: boolean;
   onClose: () => void;
   onCreate: (draft: IssueDraft) => void;
   busy: boolean;
-  error?: string | null;
 }) {
   const [draft, setDraft] = useState<IssueDraft>(emptyIssueDraft);
   // Reset to a blank draft each time the dialog opens.
@@ -90,17 +90,17 @@ function TaskCreateDialog({
           <Button
             type="button"
             variant="primary"
+            loading={busy}
             disabled={!canSubmit}
             data-testid="task-create-submit"
             onClick={() => onCreate(draft)}
           >
-            {busy ? <Loader2 className="spin" size={16} /> : <Plus size={16} />} Create task
+            {busy ? null : <Plus size={16} />} Create task
           </Button>
         </>
       }
     >
       <div className="task-create-form" data-testid="task-create-dialog">
-        {error ? <p className="settings-status">Couldn't create: {error}</p> : null}
         <label className="field">
           <span>Title</span>
           <Input
@@ -163,6 +163,13 @@ function TasksBody({ confirm }: { confirm: (req: ConfirmRequest) => void }) {
   const issues = data.issues;
   const queryClient = useQueryClient();
   const invalidate = () => queryClient.invalidateQueries({ queryKey: queryKeys.tasks });
+  // Transient action feedback is a TOAST, not an inline line — the in-progress state
+  // already shows on the Create button's pending spinner.
+  const toast = useToast();
+
+  // Live: the agent created/closed/updated an issue mid-turn — refresh off the
+  // `task.changed` bus push instead of polling every 5s (#1310), like the inbox panel.
+  useEffect(() => onServerEvent("task.changed", invalidate), [queryClient]);
 
   const [dialogOpen, setDialogOpen] = useState(false);
   const [collapsed, setCollapsed] = useState<Set<string>>(() => new Set(["closed"]));
@@ -175,7 +182,11 @@ function TasksBody({ confirm }: { confirm: (req: ConfirmRequest) => void }) {
         priority: d.priority,
         description: d.description.trim() || undefined,
       }),
-    onSuccess: () => setDialogOpen(false),
+    onSuccess: () => {
+      setDialogOpen(false);
+      toast({ tone: "success", title: "Task created", message: "Added to the board." });
+    },
+    onError: (e) => toast({ tone: "error", title: "Couldn't create task", message: errMsg(e) }),
     onSettled: invalidate,
   });
   const update = useMutation({
@@ -318,7 +329,6 @@ function TasksBody({ confirm }: { confirm: (req: ConfirmRequest) => void }) {
         onClose={() => { setDialogOpen(false); create.reset(); }}
         onCreate={(d) => create.mutate(d)}
         busy={create.isPending}
-        error={create.isError ? (create.error as Error).message : null}
       />
     </>
   );
@@ -328,7 +338,7 @@ export function TasksPanel({ confirm }: { confirm: (req: ConfirmRequest) => void
   return (
     <section className="panel side-panel tasks-panel">
       <QueryErrorResetBoundary>
-        {({ reset }) => (
+        {({ reset }: { reset: () => void }) => (
           <ErrorBoundary onReset={reset} fallback={(a) => <PanelError {...a} label="tasks" />}>
             <Suspense fallback={<PanelSkeleton label="Loading tasks…" />}>
               <TasksBody confirm={confirm} />

@@ -177,6 +177,56 @@ the thing to check first when it lands.)
   long synchronous delegation transparently detaches and becomes killable — the direct cure for
   the audited incident.
 
+### Follow-up — background batch + concurrency cap (shipped)
+- **`task_batch(run_in_background=True)`** fans a whole batch out detached: every spec spawns as
+  its own background job and the call returns immediately with the job ids, instead of blocking
+  until all finish (the foreground `task_batch` path). It's the multi-task analog of
+  `task(run_in_background=True)` and goes through the same `BackgroundManager.spawn`; each
+  completion drains back into the spawning session independently — one task-notification per job —
+  reusing Phase 1's exactly-once drain. Bad specs (missing prompt / unknown subagent) are skipped
+  inline; the good ones still spawn. With no manager configured it degrades to the foreground batch.
+- **Concurrency cap (the missing backpressure).** `BackgroundManager` now bounds concurrent
+  background turns with a semaphore that gates the self-POST in `_fire` (held for the whole turn).
+  A fan-out can no longer open one full lead-graph turn per job against the gateway at once; jobs
+  past the cap queue at the semaphore. Default 3, override `BACKGROUND_MAX_CONCURRENCY`. It applies
+  to *every* spawn — so several ad-hoc `task(run_in_background=True)` calls are bounded too. A
+  queued job's row reads `running` until a slot frees (it is accepted); `cancel` and
+  `reconcile_interrupted` both already handle a row whose turn hasn't fired yet.
+
+### Follow-up — deterministic work jobs (`spawn_work`, shipped)
+
+Phase 1 assumed every background job is an **LLM subagent turn** (§"Why self-POST"). But some
+long work is *deterministic* — a media-ingestion pipeline (fetch → transcribe → chunk → embed)
+is a fixed sequence of calls, not a reasoning task. Routing it through a self-POSTed lead-agent
+turn would spend model tokens + latency + nondeterminism just to invoke one pipeline. So the
+manager gains a second, non-turn spawn path:
+
+- **`BackgroundManager.spawn_work(origin_session, kind, description, work, detail)`** runs a plain
+  zero-arg coroutine `work()` as `asyncio.create_task`, under the **same** concurrency semaphore
+  as background turns. It reuses the durable `BackgroundStore` verbatim (`kind` is stored as
+  `subagent_type`; a work job simply has no `a2a_task_id`), so the exactly-once drain, restart
+  reconciliation, and `list`/`get`/`clear` all work unchanged.
+- **This is the deliberate exception to "self-POST, not `asyncio.create_task"** (§Decision). That
+  rationale holds for *turns* — they need the A2A task store's lifecycle/telemetry/pollable handle.
+  A deterministic job needs none of that machinery; it needs the *registry + notification*, which
+  the store already provides. So `create_task` is correct here precisely because there is no turn.
+- **Completion parity.** No A2A turn fires, so `_a2a_terminal` never runs for a work job. `_run_work`
+  therefore settles the row (`mark_complete`), publishes `background.completed` with the **same
+  payload** the terminal hook emits (so the console card is identical), and calls an injected
+  `on_terminal(job)` hook — which the server wires to the **same `_spawn_background_wake`** the turn
+  path uses (ADR 0003 idle-wake, gated by `BACKGROUND_WAKE`). All three completion channels
+  (live card, next-turn drain, autonomous wake) fire identically for a work job.
+- **Cancel.** A work job has no `a2a_task_id`; `cancel` stops its `asyncio.Task` directly and settles
+  the row (no `CancelTask` round-trip).
+
+**First consumer — `knowledge_ingest` (ADR 0031/ingestion).** The agent-facing ingest tool detaches
+any slow source — a URL fetch (web/YouTube) or media transcription (audio/video) — as a `spawn_work`
+job so it never blocks the chat turn; only a small local text/Markdown file (≤64 KB) ingests inline.
+With no manager wired it degrades to inline (blocking, but correct). This is the durable, non-blocking
+answer to "hand the agent a YouTube link / an `.mp4`" — the field-standard *return-handle → detached
+worker → reactive completion* shape (A2A task lifecycle, Microsoft Agent Framework background
+responses, classic job-queue-with-notify), reusing machinery this ADR already built.
+
 ## Consequences
 
 - **The chat stays live.** A delegation marked `run_in_background` returns in milliseconds; the
@@ -196,6 +246,10 @@ the thing to check first when it lands.)
   but `BACKGROUND_WAKE=0` disables it for cost-sensitive or non-reactive deployments.
 - **A background turn could itself spawn background turns.** Bounded in practice by focused
   prompts + the prompt contract; a hard depth fence is a later refinement.
+- **Background fan-out is bounded.** A `task_batch(run_in_background=True)` — or many single
+  `task(run_in_background=True)` calls — can't swamp the gateway: at most `BACKGROUND_MAX_CONCURRENCY`
+  turns run at once, the rest queue. Trade-off: a queued job reports `running` before its turn
+  actually starts (a small cosmetic lie the console's running-count inherits).
 - **Long jobs vs. the self-POST timeout.** `_fire` holds the connection open for the whole turn
   (like the scheduler); a job exceeding the fire timeout is marked `failed` even if still
   running. The timeout default is generous and configurable; a true submit-and-detach (A2A
