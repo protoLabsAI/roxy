@@ -16,8 +16,8 @@ from graph.settings_schema import (
 def test_schema_groups_and_values():
     cfg = LangGraphConfig()
     groups = build_schema(cfg, model_options=["a", "b"])
-    # Grouped + ordered by category: the Agent category leads, runtime first.
-    assert [g["section"] for g in groups][:3] == ["Agent runtime", "Model", "Routing"]
+    # Grouped + ordered by domain (ADR 0048): Identity leads, then Model (Model/Routing/Caching).
+    assert [g["section"] for g in groups][:3] == ["Identity", "Model", "Routing"]
     fields = [f for g in groups for f in g["fields"]]
     # Every core FIELD is present — EXCEPT ui_hidden ones, which stay in FIELDS for
     # config round-trip but aren't rendered in the settings UI (e.g. identity.name,
@@ -45,30 +45,68 @@ def test_schema_groups_and_values():
     # The fallback list carries the gateway options too (rendered as combobox rows).
     fallback = next(f for f in fields if f["key"] == "routing.fallback_models")
     assert fallback["type"] == "string_list" and fallback["options"] == ["a", "b"]
+    # #1386 — every CORE entry carries options_source so the console knows which dropdowns to
+    # refresh from a freshly-probed gateway ("Get models"). Model-backed → "models"/"models+acp".
+    assert all("options_source" in f for f in fields if f["key"] in core_keys)
+    assert model["options_source"] == "models"
+    assert next(f for f in fields if f["key"] == "routing.aux_model")["options_source"] == "models+acp"
     # The main-brain runtime select offers native + every ACP agent (incl. gemini).
     runtime = next(f for f in fields if f["key"] == "agent_runtime")
     assert runtime["type"] == "select" and runtime["options"] == ["native", *ACP_MODEL_OPTIONS]
 
 
 def test_groups_carry_category_in_taxonomy_order():
-    """ADR 0020: every group is tagged with a category, and categories appear
+    """ADR 0048: every group is tagged with a domain category, and categories appear
     contiguously in _CATEGORY_ORDER (so the console sub-nav is stable)."""
     from graph.settings_schema import _CATEGORY_ORDER
 
     groups = build_schema(LangGraphConfig())
     cats = [g["category"] for g in groups]
     assert all(cats), "every group must carry a category"
-    assert cats[0] == "Agent"
+    assert cats[0] == "Identity"
     # First-appearance order of categories matches _CATEGORY_ORDER (contiguous).
     seen: list[str] = []
     for c in cats:
         if c not in seen:
             seen.append(c)
     assert seen == [c for c in _CATEGORY_ORDER if c in seen]
-    # Known mappings hold.
+    # Known domain mappings hold (ADR 0048).
     by_section = {g["section"]: g["category"] for g in groups}
-    assert by_section["Knowledge"] == "Memory"
-    assert by_section["Middleware"] == "System"
+    assert by_section["Middleware"] == "Behavior"
+    assert by_section["Model"] == "Model"
+    assert by_section["Telemetry"] == "Box"
+    # Knowledge is split into Recall/Ingestion/History, all under the Knowledge domain.
+    assert by_section["Recall"] == "Knowledge"
+    assert by_section["Ingestion"] == "Knowledge"
+    assert by_section["History"] == "Knowledge"
+    assert "Knowledge" not in by_section  # the single 22-field wall is gone
+
+
+def test_egress_allowlist_surfaced_in_box_network():
+    """The egress allowlist (ADR 0008) is editable in Settings ▸ Box ▸ Network —
+    a host-scoped, hot-reloaded string_list (so it renders in the generic list editor)."""
+    groups = build_schema(LangGraphConfig())
+    by_key = {f["key"]: f for g in groups for f in g["fields"]}
+    e = by_key.get("egress.allowed_hosts")
+    assert e is not None, "egress.allowed_hosts must be rendered in the settings UI"
+    assert e["type"] == "string_list"
+    assert e["section"] == "Network"
+    assert e["scope"] == "host"  # box-wide default (ADR 0047)
+    assert e["restart"] is False  # set_allowed_hosts runs on live-reload
+    assert e["default"] == []
+    section_cat = {g["section"]: g["category"] for g in groups}
+    assert section_cat["Network"] == "Box"
+
+
+def test_knowledge_split_into_subsections():
+    """The Knowledge domain renders as Recall → Ingestion → History (not one wall)."""
+    groups = build_schema(LangGraphConfig())
+    kn = [g["section"] for g in groups if g["category"] == "Knowledge"]
+    assert kn == ["Recall", "Ingestion", "History"]
+    keys = {g["section"]: [f["key"] for f in g["fields"]] for g in groups if g["category"] == "Knowledge"}
+    assert "knowledge.top_k" in keys["Recall"]
+    assert "knowledge.transcribe_model" in keys["Ingestion"]
+    assert "checkpoint.db_path" in keys["History"]
 
 
 def test_secrets_are_redacted_with_is_set():

@@ -11,7 +11,6 @@ import {
   Gauge,
   Inbox,
   LayoutDashboard,
-  Loader2,
   MessageSquare,
   PanelBottom,
   PanelLeft,
@@ -59,7 +58,7 @@ import {
 import type { LucideIcon } from "lucide-react";
 import { useQuery } from "@tanstack/react-query";
 import { lazy, Suspense, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
-import type { ComponentType, LazyExoticComponent, ReactNode } from "react";
+import type { ComponentType, LazyExoticComponent, MouseEvent as ReactMouseEvent, ReactNode } from "react";
 import { FleetTurnWatch } from "./FleetTurnWatch";
 import { UpdateNotice } from "./UpdateNotice";
 import { BackgroundWatch } from "./BackgroundWatch";
@@ -73,12 +72,13 @@ import { Splash, BootGate } from "@protolabsai/ui/splash";
 import { Button } from "@protolabsai/ui/primitives";
 
 import { ActivityWidget } from "../activity/ActivityWidget";
-import { ConfirmDialog } from "@protolabsai/ui/overlays";
+import { ConfirmDialog, Tooltip } from "@protolabsai/ui/overlays";
 import { InboxWidget } from "../inbox/InboxWidget";
 import { ChatSlot } from "./ChatSlot";
-import { useAnyChatStreaming } from "../chat/chat-store";
+import { chatStore, useAnyChatStreaming } from "../chat/chat-store";
 import { KnowledgeStore } from "../knowledge/KnowledgeStore";
 import { SettingsOverlay } from "../settings/SettingsOverlay";
+import { PluginSettingsDialog } from "../plugins/PluginSettingsDialog";
 import { AppDrawer } from "./AppDrawer";
 import { HamburgerMenu } from "./HamburgerMenu";
 import { FleetSwitcher } from "./FleetSwitcher";
@@ -91,13 +91,15 @@ import { api, apiUrl, authToken, is401 } from "../lib/api";
 import { PluginView, consoleTheme } from "./PluginView";
 import { UtilityWidget } from "./UtilityWidget";
 import { AppShell, Header, UtilityBar } from "@protolabsai/ui/app-shell";
-import { CommandPalette, usePaletteHotkey } from "@protolabsai/ui/command-palette";
+import { CommandPalette } from "@protolabsai/ui/command-palette";
 import type { PaletteView } from "@protolabsai/ui/command-palette";
 import { Alert } from "@protolabsai/ui/data";
 import { useIsMobile } from "../lib/useIsMobile";
 import { useActiveTheme } from "../lib/useActiveTheme";
 import { registeredSurfaces } from "../ext"; // build-time fork seam (ADR 0038 D3); also self-loads fork surfaces
 import { ContextMenuRenderer, openContextMenu } from "../contextMenu";
+import { DocumentViewer } from "../docviewer";
+import { useGlobalKeybindings, useKbIntents } from "../keybindings";
 import { PanelHeader } from "@protolabsai/ui/navigation";
 import { brandName } from "../lib/brand";
 import { onConnectionChange, onServerEvent, onTopic } from "../lib/events";
@@ -253,6 +255,8 @@ export function App() {
   const globalSettingsSection = useUI((s) => s.globalSettingsSection);
   const openGlobalSettings = useUI((s) => s.openGlobalSettings);
   const closeGlobalSettings = useUI((s) => s.closeGlobalSettings);
+  const configurePlugin = useUI((s) => s.configurePlugin);
+  const closePluginConfig = useUI((s) => s.closePluginConfig);
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [projectPath, setProjectPath] = useLocalStorageState("protoagent.projectPath", "");
   // Shell-level runtime read (ADR 0013): non-suspense useQuery so the topbar
@@ -417,7 +421,16 @@ export function App() {
         title: "Goal failed",
         message: `${String(d.condition || "the goal")}${d.reason ? ` — ${String(d.reason)}` : ""}`,
       }));
-    return () => { offDone(); offFail(); };
+    // Watch transitions (ADR 0067) surface the same way — watch.met / watch.expired on the bus.
+    const offMet = onServerEvent("watch.met", (d) =>
+      toast({ tone: "success", title: "Watch met", message: String(d.condition || "the watch") }));
+    const offExpired = onServerEvent("watch.expired", (d) =>
+      toast({
+        tone: "error",
+        title: "Watch expired",
+        message: `${String(d.condition || "the watch")}${d.reason ? ` — ${String(d.reason)}` : ""}`,
+      }));
+    return () => { offDone(); offFail(); offMet(); offExpired(); };
   }, [toast]);
 
   // Resize + collapse are now the DS AppShell's (controlled via rightWidth/onRightWidthChange +
@@ -455,7 +468,9 @@ export function App() {
   );
   const metaFor = (id: string): RailItem | undefined => coreMeta.get(id) ?? pluginMeta.get(id);
   function railSurfaces(side: "left" | "right" | "bottom"): RailItem[] {
-    const placed = new Set([...railOrder.left, ...railOrder.right, ...railOrder.bottom]);
+    // `placed` includes the `hidden` bucket so the safety-net below never re-appends a
+    // view the operator hid (hidden = enabled-but-not-shown, ADR 0035/0036).
+    const placed = new Set([...railOrder.left, ...railOrder.right, ...railOrder.bottom, ...(railOrder.hidden ?? [])]);
     const ordered = (railOrder[side] ?? []).map(metaFor).filter((s): s is RailItem => Boolean(s));
     // Safety net: a plugin view that appeared before reconcile ran — append it for this side.
     const extra = (side === "left" ? pluginRail : side === "right" ? pluginRightPanels : pluginBottom)
@@ -472,6 +487,26 @@ export function App() {
       .map((s): RailItem => ({ id: s.id, label: s.label, icon: s.icon }));
     return [...ordered, ...extra, ...ext];
   }
+
+  // Right-click the EMPTY rail background (not an icon) → the "Hidden views" restore menu
+  // (ADR 0035/0036). The DS AppShell only fires onRailContextMenu on icons, so we catch the
+  // rail-container right-click here via event delegation (the DS classnames are the contract)
+  // and hand the resolved hidden-surface labels to the `rail-background` menu. An icon click
+  // is handled by its own `rail-surface` menu, so bail when the target is a rail button.
+  const onShellContextMenu = (e: ReactMouseEvent) => {
+    const t = e.target as HTMLElement;
+    if (t.closest(".pl-rail__btn")) return; // an icon — its own menu handles it
+    const railEl = t.closest(".pl-rail") as HTMLElement | null;
+    if (!railEl) return; // not the rail — leave the default menu
+    // Which rail was right-clicked → restore a hidden view to THIS dock (not its default).
+    const side: "left" | "right" | "bottom" = railEl.classList.contains("pl-rail--right")
+      ? "right"
+      : railEl.classList.contains("pl-rail--bottom")
+        ? "bottom"
+        : "left";
+    const hidden = (railOrder.hidden ?? []).map((id) => ({ id, label: metaFor(id)?.label ?? id }));
+    openContextMenu("rail-background", e, { side, hidden });
+  };
 
   // ── Command palette (⌘K, ADR 0057) ────────────────────────────────────────────
   // Every resolvable View becomes a "go to" command (via openView → setSurface);
@@ -499,7 +534,7 @@ export function App() {
       icon: pluginViewIcon(v.icon),
       theme: consoleTheme(),
       token: authToken(),
-      sandbox: "allow-scripts allow-forms allow-same-origin allow-popups allow-popups-to-escape-sandbox",
+      sandbox: "allow-scripts allow-forms allow-same-origin allow-popups allow-popups-to-escape-sandbox allow-pointer-lock",
     }));
   // Inline chat with the focused agent (ADR 0057) — ⌘K → a quick chat that streams via
   // api.streamChat (ephemeral context per open). Memoized so the transport (+ its
@@ -519,8 +554,12 @@ export function App() {
     [chatAgentName],
   );
   const paletteRegistry = usePaletteRegistry(paletteViews, inlinePaletteViews, paletteChat);
-  const [paletteOpen, setPaletteOpen] = useState(false);
-  usePaletteHotkey(() => setPaletteOpen((o) => !o));
+  // Palette open-state lives in the keybinding intents store now: ⌘K is a regular,
+  // rebindable keybinding (ADR 0063) that toggles it — no DS-internal hotkey hook.
+  const paletteOpen = useKbIntents((s) => s.paletteOpen);
+  const setPaletteOpen = useKbIntents((s) => s.setPaletteOpen);
+  // The single global keydown host — resolves combos against the registry (scope + overrides).
+  useGlobalKeybindings();
   // Desktop launcher handoff (ADR 0057): the frameless ⌥Space launcher window can't
   // mutate this window's store, so its navigation commands forward a serializable
   // NavIntent over a Tauri event; the main window replays it here (the Rust shell has
@@ -542,7 +581,7 @@ export function App() {
       // Knowledge is the searchable Store; its Memory settings folded into
       // Settings ▸ Workspace ▸ Memory (ADR 0048 S-C).
       case "knowledge":
-        return <KnowledgeStore onError={setError} />;
+        return <KnowledgeStore />;
       // Settings is no longer a rail surface (2026-06 consolidation) — it's a utility-bar
       // pill opening the settings dialog (SettingsOverlay). Notes is the first-party `notes`
       // plugin (ADR 0034 S4) — rendered via the default
@@ -656,7 +695,7 @@ export function App() {
     {/* Command palette (⌘K, ADR 0057) — portals over the shell; the same component
         backs the desktop quick-command (step 4). */}
     <CommandPalette open={paletteOpen} onOpenChange={setPaletteOpen} registry={paletteRegistry} />
-    <div className={`app-shell${isTauriMac ? " is-tauri-mac" : ""}`}>
+    <div className={`app-shell${isTauriMac ? " is-tauri-mac" : ""}`} onContextMenu={onShellContextMenu}>
       {/* protoLabs.studio brand bumper — DS Splash (@protolabsai/ui/splash). Holds
           2.5s then hands off via the View Transitions API cross-fade (the
           protoAgent path); shows once per tab session (sessionStorage
@@ -808,7 +847,15 @@ export function App() {
             else { setBottomPanel(id); setBottomCollapsed(false); }
           }
         }}
-        onRailContextMenu={(side, e, id) => openContextMenu("rail-surface", e, { id, side })}
+        onRailContextMenu={(side, e, id) => {
+          // A plugin view's rail id is `plugin:<pluginId>:<viewId>` — resolve the owning
+          // plugin's id + display name so the menu can offer "Configure…" (ADR 0036/0059).
+          const pluginId = id.startsWith("plugin:") ? id.split(":")[1] : undefined;
+          const pluginName = pluginId
+            ? (runtime?.plugins?.find((p) => p.id === pluginId)?.name ?? pluginId)
+            : undefined;
+          openContextMenu("rail-surface", e, { id, side, pluginId, pluginName });
+        }}
         onRailReorder={(next) => {
           // Chat can dock anywhere now — left, right, or the bottom dock. Its slot mounts
           // unconditionally on whichever dock holds it (bottomContent mirrors the side rails),
@@ -897,16 +944,17 @@ export function App() {
                 {/* Settings (far left, 2026-06 consolidation) — opens the one settings dialog
                     (SettingsOverlay). A plain pill, not a UtilityWidget, so the drawer + ⌘K
                     deep-links can open it too via the store flag (openGlobalSettings). */}
-                <button
-                  type="button"
-                  className="util-btn"
-                  aria-label="Settings"
-                  title="Settings"
-                  data-testid="settings-widget"
-                  onClick={() => openGlobalSettings()}
-                >
-                  <Settings2 size={14} />
-                </button>
+                <Tooltip label="Settings — model, plugins, knowledge & more">
+                  <button
+                    type="button"
+                    className="util-btn"
+                    aria-label="Settings"
+                    data-testid="settings-widget"
+                    onClick={() => openGlobalSettings()}
+                  >
+                    <Settings2 size={14} />
+                  </button>
+                </Tooltip>
                 {/* Widgets (bottom-left): background subagents (ADR 0050 Phase 3), the
                     inbox, and the read-only Activity feed — each a pill with a hover info
                     popover + a click dialog. */}
@@ -915,7 +963,10 @@ export function App() {
                 <ActivityWidget />
                 {/* Plugin-contributed utility widgets (`views[].utility`): a pill that opens
                     the plugin's iframe in a dialog, with hover info. Reuses PluginView. */}
-                {utilityWidgetViews.map((v) => (
+                {utilityWidgetViews.map((v) => {
+                  const pluginId = v.key.split(":")[1];
+                  const pluginName = runtime?.plugins?.find((p) => p.id === pluginId)?.name ?? pluginId;
+                  return (
                   <UtilityWidget
                     key={v.key}
                     testId={`util-widget-${v.id}`}
@@ -924,53 +975,78 @@ export function App() {
                     info={typeof v.utility === "object" && v.utility?.info ? v.utility.info : `Open ${v.label}`}
                     dialogTitle={v.label}
                     dialogWidth="min(900px, 96vw)"
+                    onContextMenu={(e) => openContextMenu("util-widget", e, { pluginId, pluginName })}
                   >
                     <div className="plugin-widget-dialog">
                       <PluginView view={v} />
                     </div>
                   </UtilityWidget>
-                ))}
+                  );
+                })}
               </>
             }
             end={
               <>
-                <button
-                  type="button"
-                  className={`util-btn ${bottomCollapsed ? "is-off" : ""}`}
-                  onClick={() => setBottomCollapsed(!bottomCollapsed)}
-                  disabled={!bottomActive}
-                  title={
+                <Tooltip
+                  label={
                     bottomActive
                       ? bottomCollapsed
                         ? "Show bottom panel"
                         : "Hide bottom panel"
                       : "No bottom panel — move a surface to the bottom dock"
                   }
-                  aria-label="Toggle bottom panel"
-                  data-testid="toggle-bottom"
                 >
-                  <PanelBottom size={14} />
-                </button>
-                <button
-                  type="button"
-                  className={`util-btn ${leftCollapsed ? "is-off" : ""}`}
-                  onClick={() => setLeftCollapsed(!leftCollapsed)}
-                  title={leftCollapsed ? "Show left panel" : "Hide left panel"}
-                  aria-label="Toggle left panel"
-                  data-testid="toggle-left"
+                  <button
+                    type="button"
+                    className={`util-btn ${bottomCollapsed ? "is-off" : ""}`}
+                    onClick={() => setBottomCollapsed(!bottomCollapsed)}
+                    disabled={!bottomActive}
+                    aria-label="Toggle bottom panel"
+                    data-testid="toggle-bottom"
+                  >
+                    <PanelBottom size={14} />
+                  </button>
+                </Tooltip>
+                <Tooltip
+                  label={
+                    leftMembers.length === 0
+                      ? "No panels in the left rail"
+                      : leftCollapsed
+                        ? "Show left panel"
+                        : "Hide left panel"
+                  }
                 >
-                  <PanelLeft size={14} />
-                </button>
-                <button
-                  type="button"
-                  className={`util-btn ${rightCollapsed ? "is-off" : ""}`}
-                  onClick={() => setRightCollapsed(!rightCollapsed)}
-                  title={rightCollapsed ? "Show side panel" : "Hide side panel"}
-                  aria-label="Toggle side panel"
-                  data-testid="toggle-right"
+                  <button
+                    type="button"
+                    className={`util-btn ${leftCollapsed ? "is-off" : ""}`}
+                    onClick={() => setLeftCollapsed(!leftCollapsed)}
+                    disabled={leftMembers.length === 0}
+                    aria-label="Toggle left panel"
+                    data-testid="toggle-left"
+                  >
+                    <PanelLeft size={14} />
+                  </button>
+                </Tooltip>
+                <Tooltip
+                  label={
+                    rightMembers.length === 0
+                      ? "No panels in the right rail"
+                      : rightCollapsed
+                        ? "Show side panel"
+                        : "Hide side panel"
+                  }
                 >
-                  <PanelRight size={14} />
-                </button>
+                  <button
+                    type="button"
+                    className={`util-btn ${rightCollapsed ? "is-off" : ""}`}
+                    onClick={() => setRightCollapsed(!rightCollapsed)}
+                    disabled={rightMembers.length === 0}
+                    aria-label="Toggle side panel"
+                    data-testid="toggle-right"
+                  >
+                    <PanelRight size={14} />
+                  </button>
+                </Tooltip>
               </>
             }
           />
@@ -1004,6 +1080,9 @@ export function App() {
         Rendered OUTSIDE the .app-shell grid: the DS Menu stays mounted to hold its ref, so
         its (closed) anchor would otherwise be a stray 4th grid row and break the layout. */}
     <ContextMenuRenderer />
+    {/* Full-screen document reader (ADR 0062) — one root host; opened from anywhere via
+        openDocument() (chat background-report card, Activity feed, future views). */}
+    <DocumentViewer />
     {/* The header drawer (hamburger) — global actions + (on mobile) surface nav. */}
     <AppDrawer
       open={drawerOpen}
@@ -1025,6 +1104,16 @@ export function App() {
       section={globalSettingsSection}
       onClose={closeGlobalSettings}
     />
+    {/* Per-plugin Configure dialog (ADR 0059) — opened from a rail context-menu "Configure…"
+        (ADR 0036). Store-driven so it can be triggered from anywhere; one root mount. */}
+    {configurePlugin && (
+      <PluginSettingsDialog
+        pluginId={configurePlugin.id}
+        pluginName={configurePlugin.name}
+        open
+        onClose={closePluginConfig}
+      />
+    )}
     </>
   );
 }

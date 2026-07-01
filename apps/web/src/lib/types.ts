@@ -24,6 +24,10 @@ export type RuntimeStatus = {
     /** Model accepts native image input (model.vision) — chat sends attached
      *  images straight to the model instead of through the extraction pipeline. */
     vision?: boolean;
+    /** A vision model is configured to describe images for a text-only chat model
+     *  (knowledge.image_describe_model, #1381) — images route through the describe
+     *  pipeline instead of erroring. */
+    image_describe?: boolean;
   };
   identity: null | {
     name: string;
@@ -244,6 +248,9 @@ export type SettingsField = {
   description?: string;
   restart: boolean;
   options: string[];
+  // Where `options` come from: "models" / "models+acp" → the gateway's model list. The Model
+  // settings "Get models" action (#1386) merges a freshly-probed list into these fields.
+  options_source?: string;
   default?: unknown;
   value?: unknown; // absent for secrets
   is_set?: boolean; // secrets only
@@ -307,8 +314,11 @@ export type ActivityEntry = {
   trigger: string;       // job id / inbox source (human label), may be ""
   priority: string;      // inbox tier when applicable, else ""
   state: string;
-  text: string;
+  text: string;          // the agent's RESPONSE
   task_id: string;
+  /** The triggering input text this turn is a response to (scheduled prompt / inbound
+   *  message / webhook body), truncated. Shown as "in response to …" (#1375). */
+  stimulus?: string;
 };
 
 export type ActivityHistory = {
@@ -330,6 +340,25 @@ export type GoalState = {
   last_checked?: number | null; // monitor: last out-of-band verifier check (epoch seconds)
   started_at?: number;
   finished_at?: number | null;
+};
+
+// A passive watch (ADR 0067) — a verifier-only objective polled out-of-band. Unlike a goal
+// (driven via a bounded continuation loop, one per session), you can hold MANY watches at
+// once, keyed by their own `id`. Mirrors the backend `Watch` (graph/watches/types.py).
+export type WatchState = {
+  id: string;
+  condition: string;
+  status: string; // active | met | expired | cleared
+  verifier?: { type?: string } & Record<string, unknown>;
+  interval_s?: number | null; // per-watch cadence override; null → config watch_interval
+  deadline?: number | null; // epoch seconds; past → expired
+  stall_after?: number | null; // N unchanged checks → on_stalled
+  run_prompt?: string; // on met, enqueued as a one-shot turn in run_session
+  run_session?: string;
+  last_reason?: string;
+  last_evidence?: string;
+  last_checked?: number | null; // last out-of-band verifier check (epoch seconds)
+  created_at?: number;
 };
 
 export type ScheduledJob = {
@@ -386,6 +415,9 @@ export type ToolEvent = {
   input?: string;
   output?: string;
   error?: boolean; // an "end" that failed (phase "failed" on the wire) → card shows the X
+  /** id of the enclosing `task` delegation when this is a subagent's own tool call —
+   *  set server-side so nesting is explicit (by id), not inferred from frame order. */
+  parentId?: string;
 };
 
 // A background subagent job (ADR 0050) as returned by GET /api/background and
@@ -413,7 +445,48 @@ export type ComponentSpec = { component: string; props: Record<string, unknown> 
 export type ChatPart =
   | { kind: "text"; text: string }
   | { kind: "reasoning"; text: string }
-  | { kind: "tools"; ids: string[] };
+  | { kind: "tools"; ids: string[] }
+  // An inline component (component-v1) at its emission position, so it renders ABOVE the
+  // answer text that streams in after it — not shoved below (#1323).
+  | { kind: "component"; spec: ComponentSpec };
+
+/** Per-turn token usage + cost, accumulated across the turn's LLM calls — lifted off the
+ *  terminal cost-v1 DataPart (A2A ext, ADR 0006). `inputTokens` is the SUM of prompt tokens
+ *  across the turn's calls (so a tool-loop turn counts each model call's prompt), NOT the live
+ *  context-window fill; it's a per-turn spend/size readout, not a context-fullness gauge. */
+export type TurnUsage = {
+  inputTokens: number;
+  outputTokens: number;
+  totalTokens: number;
+  /** Prompt tokens served from the model's cache (subset of inputTokens). */
+  cacheReadTokens: number;
+  /** Prompt tokens written to the cache this turn (subset of inputTokens). */
+  cacheCreationTokens: number;
+  costUsd?: number;
+  durationMs?: number;
+};
+
+/** Live context-window readout for a turn (terminal context-v1 DataPart, #1372). Unlike
+ *  TurnUsage (per-turn spend), `contextTokens` is the PEAK single-call prompt size — the
+ *  actual context-window fill. `compactionAtTokens` is the absolute summarization threshold
+ *  when the operator's trigger is token-based (`tokens:N`); fraction:/messages: triggers have
+ *  no surfaceable token denominator (the gateway exposes no per-model window), so the meter
+ *  shows the size without a bar. */
+export type ContextWindow = {
+  contextTokens: number;
+  compactionAtTokens?: number;
+  maxTokens?: number;
+  /** The configured compaction trigger string, for the tooltip (e.g. "tokens:120000"). */
+  trigger?: string;
+  enabled?: boolean;
+};
+
+/** Emphasis tone for a local SYSTEM NOTE (a role-"system" message without a `report`) —
+ *  e.g. a slash-command confirmation, a status line, or a warning. The reusable seam for
+ *  posting non-agent, in-thread notices is `ChatSurface.noteToThread(text, { tone })`,
+ *  exposed to forks via the slash + composer registries. Add a tone here + a matching
+ *  `.chat-note--<tone>` rule in chat.css; nothing else needs to change. */
+export type SystemNoteTone = "info" | "warning" | "danger" | "success";
 
 export type ChatMessage = {
   id?: string;
@@ -433,6 +506,21 @@ export type ChatMessage = {
   /** A2A task id for this turn — persisted so a stuck `streaming` message can be
    *  reconciled against the server's task state on reload (self-heal). */
   taskId?: string;
+  /** Background-agent report (ADR 0050/0062): the spawning job's id + title. The bubble
+   *  shows the server's preview; this lets the card open the FULL report in the document
+   *  viewer (fetched by id) instead of forcing a trip to the Activity/Background panel. */
+  report?: { jobId: string; title: string };
+  /** This turn's token usage + cost (terminal cost-v1 DataPart). Shown as a small footer
+   *  under the answer; absent on user turns and history saved before this shipped. */
+  usage?: TurnUsage;
+  /** This turn's context-window fill + compaction threshold (terminal context-v1 DataPart).
+   *  Drives the meter in the same footer; absent on user turns / pre-ship history. */
+  contextWindow?: ContextWindow;
+  /** Set on a local SYSTEM NOTE (role "system", no `report`) to tone its rendering — a
+   *  reusable, non-agent in-thread notice (slash-command confirmation, status, warning).
+   *  Posted via `noteToThread(text, { tone })`; system notes never carry the answer
+   *  action row (copy/fork/regenerate) — those are answer-only. */
+  noteTone?: SystemNoteTone;
 };
 
 // HITL (human-in-the-loop) request surfaced when a turn pauses as input-required

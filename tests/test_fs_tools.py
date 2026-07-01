@@ -15,6 +15,7 @@ class _Cfg:
     filesystem_enabled: bool = True
     filesystem_allow_run: bool = False
     filesystem_run_requires_approval: bool = True
+    filesystem_bypass_allowed: bool = True
     filesystem_projects: list = field(default_factory=list)
 
 
@@ -135,6 +136,22 @@ def test_run_command_executes_in_project_cwd(workspace):
     assert "README.md" in out
 
 
+def test_run_command_runs_via_shell(workspace):
+    """run_command goes through /bin/sh -c, so shell operators (&&, |, >, $()) work."""
+    _, a, _ = workspace
+    t = _tools(
+        _Cfg(
+            filesystem_projects=[{"name": "a", "path": str(a)}],
+            filesystem_allow_run=True,
+            filesystem_run_requires_approval=False,
+        )
+    )
+    out = asyncio.run(t["run_command"].ainvoke({"project": "a", "command": "echo one && echo two"}))
+    # Exact lines (not substrings): the old argv path would print the literal "one && echo two",
+    # so this assertion specifically fails unless the && actually chained two commands.
+    assert out.splitlines() == ["one", "two"]
+
+
 def test_run_command_declined_raises(workspace, monkeypatch):
     """A declined approval RAISES (ToolException) rather than returning a string —
     so the ToolNode stamps status="error" and the chat card shows the X, not a green
@@ -153,6 +170,50 @@ def test_run_command_declined_raises(workspace, monkeypatch):
     )
     with pytest.raises(ToolException):
         asyncio.run(t["run_command"].ainvoke({"project": "a", "command": "ls"}))
+
+
+def test_run_command_bypass_skips_approval(workspace, monkeypatch):
+    """Bypass-permissions mode (per-turn metadata + host allows): run_command runs WITHOUT the
+    approval gate. interrupt() is stubbed to DENY, so if the gate were reached the command would
+    raise — a clean run proves it was skipped."""
+    import langgraph.types
+    from graph.middleware.request_context import request_metadata_scope
+
+    _, a, _ = workspace
+    monkeypatch.setattr(langgraph.types, "interrupt", lambda payload: "denied")
+    t = _tools(
+        _Cfg(
+            filesystem_projects=[{"name": "a", "path": str(a)}],
+            filesystem_allow_run=True,
+            filesystem_run_requires_approval=True,
+            filesystem_bypass_allowed=True,
+        )
+    )
+    with request_metadata_scope({"bypass_permissions": True}):
+        out = asyncio.run(t["run_command"].ainvoke({"project": "a", "command": "ls"}))
+    assert "README.md" in out
+
+
+def test_run_command_bypass_forbidden_by_host_still_gates(workspace, monkeypatch):
+    """When the host forbids bypass (filesystem_bypass_allowed=False), caller bypass metadata is
+    IGNORED and the approval gate still fires (here stubbed to deny → raises)."""
+    import langgraph.types
+    from langchain_core.tools import ToolException
+    from graph.middleware.request_context import request_metadata_scope
+
+    _, a, _ = workspace
+    monkeypatch.setattr(langgraph.types, "interrupt", lambda payload: "denied")
+    t = _tools(
+        _Cfg(
+            filesystem_projects=[{"name": "a", "path": str(a)}],
+            filesystem_allow_run=True,
+            filesystem_run_requires_approval=True,
+            filesystem_bypass_allowed=False,
+        )
+    )
+    with request_metadata_scope({"bypass_permissions": True}):
+        with pytest.raises(ToolException):
+            asyncio.run(t["run_command"].ainvoke({"project": "a", "command": "ls"}))
 
 
 # ── config round-trip ──────────────────────────────────────────────────────────

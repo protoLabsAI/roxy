@@ -98,7 +98,7 @@ async def test_acp_probe_fails_when_handshake_fails(monkeypatch):
     async def _noop(self):
         pass
 
-    monkeypatch.setattr(AcpClient, "_ensure_started", _boom)
+    monkeypatch.setattr(AcpClient, "handshake", _boom)
     monkeypatch.setattr(AcpClient, "close", _noop)
     d = ADAPTERS["acp"].parse({"name": "x", "type": "acp", "command": sys.executable, "workdir": "/tmp"})
     res = await ADAPTERS["acp"].probe(d)
@@ -116,11 +116,33 @@ async def test_acp_probe_ok_on_successful_handshake(monkeypatch):
     async def _noop(self):
         pass
 
-    monkeypatch.setattr(AcpClient, "_ensure_started", _ok)
+    monkeypatch.setattr(AcpClient, "handshake", _ok)
     monkeypatch.setattr(AcpClient, "close", _noop)
     d = ADAPTERS["acp"].parse({"name": "x", "type": "acp", "command": sys.executable, "workdir": "/tmp"})
     res = await ADAPTERS["acp"].probe(d)
     assert res["ok"] is True and "handshake OK" in res["detail"]
+
+
+async def test_acp_probe_resolves_command_against_delegate_env_path(monkeypatch):
+    # The probe must resolve the command against the SAME PATH the real spawn uses —
+    # the delegate's env PATH overlaid on the process PATH — so a command reachable
+    # only via the delegate env doesn't red-X the Test button while the spawn would
+    # actually find it (#1299 probe-vs-spawn disagreement).
+    import shutil
+
+    seen: dict = {}
+
+    def fake_which(cmd, path=None):
+        seen["path"] = path
+        return None  # force the not-on-PATH branch (so we never spawn a real process)
+
+    monkeypatch.setattr(shutil, "which", fake_which)
+    d = ADAPTERS["acp"].parse(
+        {"name": "x", "type": "acp", "command": "npx", "workdir": "/tmp", "env": {"PATH": "/custom/bin"}}
+    )
+    res = await ADAPTERS["acp"].probe(d)
+    assert res["ok"] is False and "not on PATH" in res["error"]
+    assert seen["path"] == "/custom/bin"  # resolved against the delegate's env PATH
 
 
 def test_secret_value_wins_then_env(monkeypatch):
@@ -189,10 +211,31 @@ def test_register_no_delegates_registers_nothing(monkeypatch):
     assert r.tools == []
 
 
-def test_register_exposes_delegate_to_with_listing(monkeypatch):
+def test_register_exposes_delegate_to_and_list_agents(monkeypatch):
     r = _register([{"name": "opus", "type": "openai", "url": "https://g/v1", "model": "m"}], monkeypatch)
-    assert [t.name for t in r.tools] == ["delegate_to"]
+    assert [t.name for t in r.tools] == ["delegate_to", "list_agents"]
     assert "opus" in r.tools[0].description
+
+
+def test_registry_roster_shape():
+    reg = DelegateRegistry([{"name": "opus", "type": "openai", "url": "https://g/v1",
+                             "model": "m", "description": "a model"}])
+    assert reg.roster() == [{"name": "opus", "type": "openai", "description": "a model", "url": "https://g/v1"}]
+
+
+def test_list_agents_lists_roster_with_health(monkeypatch):
+    r = _register([{"name": "opus", "type": "openai", "url": "https://g/v1",
+                    "model": "m", "description": "a model"}], monkeypatch)
+    la = next(t for t in r.tools if t.name == "list_agents")
+    monkeypatch.setattr("plugins.delegates.health.health_snapshot", lambda: {"opus": {"ok": True}})
+    assert "🟢 opus (openai) — a model" in la.invoke({})
+
+
+def test_list_agents_unknown_health_is_neutral(monkeypatch):
+    r = _register([{"name": "opus", "type": "openai", "url": "https://g/v1", "model": "m"}], monkeypatch)
+    la = next(t for t in r.tools if t.name == "list_agents")
+    monkeypatch.setattr("plugins.delegates.health.health_snapshot", lambda: {})
+    assert "⚪ opus (openai)" in la.invoke({})
 
 
 async def test_delegate_to_unknown_and_empty(monkeypatch):
@@ -270,6 +313,95 @@ async def test_a2a_dispatch_sends_version_header(monkeypatch):
     d = ADAPTERS["a2a"].parse({"name": "p", "type": "a2a", "url": "https://p/a2a"})
     await ADAPTERS["a2a"].dispatch(d, "q")
     assert captured["headers"].get("A2A-Version") == "1.0"
+
+
+# ── a2a protocol-version negotiation ──────────────────────────────────────────
+
+
+class _CardClient(_FakeClient):
+    """Fake httpx client answering BOTH the agent-card GET (probe / version
+    pre-check) and the JSON-RPC POST (dispatch), so the a2a version pre-flight is
+    exercised fully offline."""
+
+    def __init__(self, card, rpc=None, **kw):
+        self._card = card
+        self._rpc = rpc or {"result": {"artifacts": [{"parts": [{"kind": "text", "text": "hi from peer"}]}]}}
+
+    async def get(self, url, **kw):
+        return _FakeResp(self._card)
+
+    async def post(self, url, **kw):
+        return _FakeResp(self._rpc)
+
+
+async def test_a2a_probe_returns_peer_protocol_version(monkeypatch):
+    """probe() captures the peer's advertised A2A protocol version (the native
+    supportedInterfaces field) — distinct from the peer's app `version`."""
+    import httpx
+
+    from security import policy
+
+    card = {
+        "name": "peer",
+        "version": "1.2.3",
+        "supportedInterfaces": [{"protocolBinding": "JSONRPC", "protocolVersion": "1.0"}],
+    }
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: _CardClient(card))
+    monkeypatch.setattr(policy, "check_url", lambda url: None)
+    d = ADAPTERS["a2a"].parse({"name": "p", "type": "a2a", "url": "https://p/a2a"})
+    res = await ADAPTERS["a2a"].probe(d)
+    assert res["ok"] is True
+    assert res["protocol_version"] == "1.0"
+    assert res["supported_versions"] == ["1.0"]
+    assert res["version"] == "1.2.3"  # peer APP version, distinct from the protocol version
+
+
+async def test_a2a_probe_reads_proto_free_hint(monkeypatch):
+    """probe() also understands the top-level protocolVersion/supportedVersions
+    hint a peer may expose without the proto supportedInterfaces list."""
+    import httpx
+
+    from security import policy
+
+    card = {"name": "peer", "protocolVersion": "1.0", "supportedVersions": ["1.0"]}
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: _CardClient(card))
+    monkeypatch.setattr(policy, "check_url", lambda url: None)
+    d = ADAPTERS["a2a"].parse({"name": "p", "type": "a2a", "url": "https://p/a2a"})
+    res = await ADAPTERS["a2a"].probe(d)
+    assert res["protocol_version"] == "1.0" and res["supported_versions"] == ["1.0"]
+
+
+async def test_a2a_dispatch_rejects_version_mismatch(monkeypatch):
+    """A peer that clearly advertises an A2A version we can't speak (e.g. 0.3) must
+    fail fast with a legible mismatch — not get a 1.0 call sent and wait for an
+    opaque -32009 mid-dispatch."""
+    import httpx
+
+    from security import policy
+
+    card = {"name": "old-peer", "supportedInterfaces": [{"protocolVersion": "0.3"}]}
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: _CardClient(card))
+    monkeypatch.setattr(policy, "check_url", lambda url: None)
+    d = ADAPTERS["a2a"].parse({"name": "p", "type": "a2a", "url": "https://p/a2a"})
+    with pytest.raises(DelegateError) as ei:
+        await ADAPTERS["a2a"].dispatch(d, "q")
+    msg = str(ei.value)
+    assert "0.3" in msg and "refusing" in msg.lower()
+
+
+async def test_a2a_dispatch_proceeds_when_card_omits_version(monkeypatch):
+    """An older peer / partial card that advertises no protocol version must NOT be
+    blocked by the best-effort pre-check — dispatch falls through (the -32009
+    mapping still covers a genuine incompatibility)."""
+    import httpx
+
+    from security import policy
+
+    card = {"name": "peer"}  # nothing about protocol version anywhere
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: _CardClient(card))
+    monkeypatch.setattr(policy, "check_url", lambda url: None)
+    d = ADAPTERS["a2a"].parse({"name": "p", "type": "a2a", "url": "https://p/a2a"})
+    assert await ADAPTERS["a2a"].dispatch(d, "q") == "hi from peer"
 
 
 async def test_acp_dispatch_reuses_client(monkeypatch):
@@ -352,3 +484,80 @@ async def test_health_probe_records_failure(monkeypatch):
     monkeypatch.setattr(ADAPTERS["acp"], "probe", boom)
     await H._probe_all()
     assert H._HEALTH["p"]["ok"] is False and "nope" in H._HEALTH["p"]["error"]
+
+
+# ── per-delegate backoff (remote-member health robustness) ─────────────────────
+
+
+def test_backoff_delay_grows_then_caps():
+    # healthy → base; each consecutive failure doubles; pinned at the ceiling.
+    assert H._backoff_delay(0) == H._BACKOFF_BASE_S
+    assert H._backoff_delay(1) == H._BACKOFF_BASE_S * 2
+    assert H._backoff_delay(2) == H._BACKOFF_BASE_S * 4
+    seq = [H._backoff_delay(i) for i in range(0, 8)]
+    assert seq == sorted(seq)  # monotonically non-decreasing
+    assert max(seq) == H._BACKOFF_MAX_S  # eventually caps
+    assert H._backoff_delay(100) == H._BACKOFF_MAX_S  # stays capped
+
+
+async def test_health_backoff_skips_until_due_then_resets_on_success(monkeypatch):
+    H._HEALTH.clear()
+    H._FAILURES.clear()
+    H._NEXT_DUE.clear()
+    import plugins.delegates.store as store
+
+    monkeypatch.setattr(
+        store, "merged_delegates", lambda: [{"name": "p", "type": "acp", "command": "proto", "workdir": "/tmp"}]
+    )
+    calls = {"n": 0}
+    outcome = {"ok": False}
+
+    async def probe(d):
+        calls["n"] += 1
+        return {"ok": outcome["ok"]}
+
+    monkeypatch.setattr(ADAPTERS["acp"], "probe", probe)
+
+    # t=0: first probe FAILS → backed off to base*2 out.
+    await H._probe_all(now=0.0)
+    assert calls["n"] == 1 and H._FAILURES["p"] == 1
+    assert H._NEXT_DUE["p"] == H._backoff_delay(1)  # 0 + base*2
+
+    # not yet due → skipped (a flaky peer isn't hammered every tick).
+    await H._probe_all(now=H._backoff_delay(1) - 1.0)
+    assert calls["n"] == 1
+
+    # exactly due → re-probed, fails again → window widens further.
+    due1 = H._NEXT_DUE["p"]
+    await H._probe_all(now=due1)
+    assert calls["n"] == 2 and H._FAILURES["p"] == 2
+    assert H._NEXT_DUE["p"] == due1 + H._backoff_delay(2)
+
+    # success resets to the base cadence and clears the failure count.
+    outcome["ok"] = True
+    due2 = H._NEXT_DUE["p"]
+    await H._probe_all(now=due2)
+    assert calls["n"] == 3 and "p" not in H._FAILURES
+    assert H._NEXT_DUE["p"] == due2 + H._BACKOFF_BASE_S
+
+
+async def test_health_backoff_state_pruned_with_delegate(monkeypatch):
+    H._HEALTH.clear()
+    H._FAILURES.clear()
+    H._NEXT_DUE.clear()
+    import plugins.delegates.store as store
+
+    monkeypatch.setattr(
+        store, "merged_delegates", lambda: [{"name": "p", "type": "acp", "command": "proto", "workdir": "/tmp"}]
+    )
+
+    async def boom(d):
+        raise RuntimeError("nope")
+
+    monkeypatch.setattr(ADAPTERS["acp"], "probe", boom)
+    await H._probe_all(now=0.0)
+    assert "p" in H._FAILURES and "p" in H._NEXT_DUE
+
+    monkeypatch.setattr(store, "merged_delegates", lambda: [])
+    await H._probe_all(now=1.0)
+    assert "p" not in H._HEALTH and "p" not in H._FAILURES and "p" not in H._NEXT_DUE

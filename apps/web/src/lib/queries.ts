@@ -7,6 +7,7 @@ import { api } from "./api";
 // stable and hierarchical so a mutation can invalidate a whole subtree.
 export const queryKeys = {
   goals: ["goals"] as const,
+  watches: ["watches"] as const,
   tasks: ["tasks", "issues"] as const,
   workflows: ["workflows"] as const,
   subagents: ["subagents"] as const,
@@ -23,6 +24,8 @@ export const queryKeys = {
   pluginUpdates: ["plugins", "updates"] as const,
   fleet: ["fleet"] as const,
   archetypes: ["archetypes"] as const,
+  playbooks: ["playbooks"] as const,
+  knowledge: ["knowledge"] as const,
 };
 
 // The fleet of workspace agents (ADR 0042). `running` is a live-pid probe, so poll
@@ -41,23 +44,31 @@ export const archetypesQuery = () =>
     queryFn: () => api.archetypes(),
   });
 
-// Goals the agent works toward (goal mode). Lives in the right sidebar and
-// refetches every 5s while mounted — the agent advances/clears goals mid-turn,
-// so the panel should track that without a manual refresh.
+// Goals the agent works toward (goal mode). Lives in the right sidebar; the panel
+// invalidates this on the `goal.changed` bus push (the agent set/advances/clears goals
+// mid-turn) instead of a 5s poll (#1310) — same pattern as the inbox.
 export const goalsQuery = () =>
   queryOptions({
     queryKey: queryKeys.goals,
     queryFn: () => api.goals(),
-    refetchInterval: 5_000,
   });
 
-// The agent's task board (in-process tasks store — always available). Refetches
-// while mounted so the panel tracks issues the agent files/closes mid-turn.
+// Passive watches (ADR 0067) — verifier-only objectives polled out-of-band. Lives in the
+// Work hub; the panel invalidates this on the `watch.*` bus pushes (created/checked/met/
+// expired/stalled) instead of a poll — same pattern as goals.
+export const watchesQuery = () =>
+  queryOptions({
+    queryKey: queryKeys.watches,
+    queryFn: () => api.watches(),
+  });
+
+// The agent's task board (in-process tasks store — always available). The panel
+// invalidates this on the `task.changed` bus push (issues the agent files/closes
+// mid-turn) instead of a 5s poll (#1310).
 export const tasksQuery = () =>
   queryOptions({
     queryKey: queryKeys.tasks,
     queryFn: () => api.tasks(),
-    refetchInterval: 5_000,
   });
 
 // Registered workflow recipes + the subagent registry — config, not live, so no
@@ -192,4 +203,23 @@ export const acpAgentsQuery = () =>
     queryFn: () => api.acpAgents(),
     staleTime: Infinity, // a static catalog — fetch once
     retry: false,
+  });
+
+// The skills/playbooks index (ADR 0009) — the list view (no prompt bodies). The
+// surface filters it client-side; invalidated after author/edit/promote/unshare
+// (a delete updates the cache directly since it removes a single known row).
+export const playbooksQuery = () =>
+  queryOptions({
+    queryKey: queryKeys.playbooks,
+    queryFn: () => api.playbooks(),
+  });
+
+// Knowledge-store search (ADR 0020) — server-side FTS keyed on the (debounced)
+// query string, so each term is its own cache entry. The surface reads it
+// non-suspense with `placeholderData: keepPreviousData` so typing doesn't blank
+// the list; invalidated (whole `knowledge` subtree) after curate / share / ingest.
+export const knowledgeQuery = (q: string) =>
+  queryOptions({
+    queryKey: [...queryKeys.knowledge, q] as const,
+    queryFn: () => api.knowledgeSearch(q),
   });

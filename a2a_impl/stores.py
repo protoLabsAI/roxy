@@ -35,7 +35,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 import httpx
-from sqlalchemy import bindparam, delete, select, text, update
+from sqlalchemy import bindparam, delete, or_, select, text, update
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
 from a2a.server.context import ServerCallContext
@@ -233,25 +233,16 @@ class ValidatingPushNotificationSender(BasePushNotificationSender):
 
 
 def _resolve_db_path(leaf: str) -> str:
-    """Resolve a writable SQLite path for ``leaf`` (e.g. ``a2a-tasks.db``).
+    """Resolve the writable SQLite path for ``leaf`` (e.g. ``a2a-tasks.db``).
 
-    Mirrors the bespoke stores: prefer ``/sandbox/<leaf>``; fall back to
-    ``~/.protoagent/<leaf>`` when the sandbox dir isn't writable (local dev).
-    Both run through ``scope_leaf`` for per-instance scoping (ADR 0004), so the
-    instance segment survives the fallback.
+    A file directly under the per-instance ``instance_root`` (``store(leaf)`` →
+    ``instance_root/<leaf>``), so co-located instances keep disjoint task/push DBs.
     """
-    from infra.paths import scope_leaf
+    from infra.paths import instance_paths
 
-    configured = scope_leaf(Path("/sandbox") / leaf)
-    try:
-        configured.parent.mkdir(parents=True, exist_ok=True)
-        if not os.access(configured.parent, os.W_OK):
-            raise OSError
-        return str(configured)
-    except OSError:
-        fallback = scope_leaf(Path.home() / ".protoagent" / leaf)
-        fallback.parent.mkdir(parents=True, exist_ok=True)
-        return str(fallback)
+    path = instance_paths().store(leaf)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return str(path)
 
 
 def make_sqlite_engine(db_path: str) -> AsyncEngine:
@@ -298,7 +289,15 @@ async def sweep_expired_tasks(engine: AsyncEngine, *, ttl_s: int = _DEFAULT_TTL_
 
     session_maker = async_sessionmaker(engine, expire_on_commit=False)
     async with session_maker() as session:
-        result = await session.execute(delete(TaskModel).where(TaskModel.last_updated < cutoff))
+        # Preserve resumable HITL/auth pauses (their checkpoint outlives the TTL).
+        # A NULL/absent state is not a preserved pause, so still sweep it (the
+        # JSON-path is NULL for a stateless row, and ``NOT IN`` wouldn't match it).
+        state = TaskModel.status["state"].as_string()
+        result = await session.execute(
+            delete(TaskModel)
+            .where(TaskModel.last_updated < cutoff)
+            .where(or_(state.is_(None), state.notin_(_PRESERVED_STATES)))
+        )
         await session.commit()
         return result.rowcount or 0
 
@@ -342,6 +341,11 @@ async def sweep_orphaned_push_configs(task_engine: AsyncEngine, push_engine: Asy
 # those are HITL / auth *pauses* whose LangGraph checkpoint survives the restart
 # and can resume on the next message, so failing them would be wrong.
 _INTERRUPTED_STATES = ("TASK_STATE_SUBMITTED", "TASK_STATE_WORKING")
+
+# HITL / auth *pauses* whose LangGraph checkpoint survives a restart and resumes on
+# the next message — the TTL sweep must NOT delete them (initialize_a2a_stores'
+# docstring promises this; sweep_expired_tasks now actually enforces it).
+_PRESERVED_STATES = ("TASK_STATE_INPUT_REQUIRED", "TASK_STATE_AUTH_REQUIRED")
 
 
 def _interrupted_status_blob(now: datetime) -> dict:
@@ -391,6 +395,37 @@ async def reconcile_interrupted_tasks(engine: AsyncEngine, *, now: datetime | No
         return result.rowcount or 0
 
 
+async def drop_legacy_task_table(engine: AsyncEngine) -> bool:
+    """Drop a pre-SDK bespoke ``tasks`` table so the SDK store can recreate it.
+
+    The bespoke ``a2a_task_store.py`` (removed in the #443 SDK migration) created
+    ``tasks(task_id, state, updated_at, data)``. The SDK's ``DatabaseTaskStore``
+    expects ``tasks(id, context_id, status, …)`` and creates it via
+    ``Base.metadata.create_all`` — which **skips a table that already exists**. So
+    an instance upgraded across the migration keeps the legacy table, and every
+    task op 500s with ``no such column: tasks.id`` (the console chat path included).
+
+    Detect the legacy schema (``tasks`` present but no ``id`` column) and drop it
+    — task rows are transient, regenerable state — so the subsequent
+    ``create_all`` rebuilds the correct schema. No-op when the table is absent
+    (fresh db) or already on the SDK schema. Returns True when a drop occurred.
+    """
+    async with engine.begin() as conn:
+        cols = [r[1] for r in (await conn.execute(text("PRAGMA table_info('tasks')"))).fetchall()]
+        if not cols or "id" in cols:
+            return False  # no table yet, or already the SDK schema — nothing to do
+        n = (await conn.execute(text("SELECT count(*) FROM tasks"))).scalar()
+        await conn.execute(text("DROP TABLE tasks"))
+        log.warning(
+            "[a2a] dropped legacy pre-SDK 'tasks' table (%s row(s), columns=%s) so the SDK "
+            "DatabaseTaskStore can recreate its schema — fixes 'no such column: tasks.id' on "
+            "instances upgraded across the #443 store migration",
+            n,
+            cols,
+        )
+        return True
+
+
 async def initialize_a2a_stores(
     task_store: DatabaseTaskStore,
     push_store: ValidatingPushNotificationConfigStore,
@@ -405,6 +440,13 @@ async def initialize_a2a_stores(
     ``input_required`` / ``auth_required`` pauses are left alone (resumable from
     the checkpoint).
     """
+    # Upgrade guard: a legacy bespoke ``tasks`` table would survive create_all and
+    # break every task op with "no such column: tasks.id". Drop it first so the
+    # SDK rebuilds the correct schema.
+    try:
+        await drop_legacy_task_table(task_store.engine)
+    except Exception:
+        log.exception("[a2a] legacy task-table migration check failed; continuing")
     await task_store.initialize()
     await push_store.initialize()
     try:

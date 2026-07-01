@@ -1,5 +1,166 @@
 [
   {
+    "version": "v0.77.0",
+    "date": "2026-07-01",
+    "changes": [
+      "Cross-machine fleet hardening — A2A federation is fault-transparent",
+      "Remote fleet members surface their health immediately",
+      "Discovery auto-sweeps on hub boot",
+      "config explain diagnostic",
+      "Real multi-instance fleet test harness",
+      "Artifact is now a bundled core plugin, on by default",
+      "Artifact render errors feed back to the agent",
+      "Multi-step wizard + choice-card HITL forms",
+      "The agent can ingest documents & media into its knowledge base",
+      "Two-tier instance paths (box / instance) — one resolution rule, no more double-scoping",
+      "React artifacts are more forgiving + the render loop is proactive",
+      "Docs reader: in-content cross-reference links route in-app instead of breaking the iframe",
+      "A crashed co-located fleet member is now detected and restartable",
+      "Autonomous turns no longer deadlock on a human-input pause",
+      "HITL tools are hard-denied to subagents",
+      "Settings surfaces when the agent config shadows a host-scoped field",
+      "The ⌘K command-palette chat survives being closed mid-turn",
+      "Knowledge: fleet/commons sharing + the reusable background-job primitive"
+    ]
+  },
+  {
+    "version": "v0.76.0",
+    "date": "2026-06-30",
+    "changes": [
+      "\"Manage plugins…\" in the rail context menus",
+      "Reveal toggle on secret fields",
+      "Settings true-up — one canonical config system",
+      "Settings surfaces no longer swallow load/save errors",
+      "Identity name and fleet delegates save through the canonical settings cascade"
+    ]
+  },
+  {
+    "version": "v0.75.0",
+    "date": "2026-06-29",
+    "changes": [
+      "Egress allowlist in Settings",
+      "Custom model gateway no longer blocked on the connection test",
+      "Plugin config appears without a restart"
+    ]
+  },
+  {
+    "version": "v0.74.0",
+    "date": "2026-06-29",
+    "changes": [
+      "Bypass-permissions mode",
+      "run_command runs shell operators",
+      "Slash-command notices render as system notes"
+    ]
+  },
+  {
+    "version": "v0.73.0",
+    "date": "2026-06-29",
+    "changes": [
+      "Background batch delegation",
+      "Live tool-card feed for background agents",
+      "Settings ▸ Knowledge split into sub-sections",
+      "Tools view — MCP tools grouped by server",
+      "Settings IA — domain-first",
+      "Tools view — grouped by plugin + subsystem",
+      "Built-in subagents answer natively",
+      "CI off the deprecated Node 20 action runtime",
+      "Structured-output parser retired",
+      "Concurrent same-conversation turns no longer corrupt chat history",
+      "Chat answers no longer truncated; A2A tasks return the real final answer",
+      "Subagent token streams isolated from the live chat",
+      "Cross-tab chat no longer clobbers itself",
+      "ACP coding-agent eviction race closed",
+      "Cross-context streaming guard",
+      "File uploads restore the token prompt on auth failure",
+      "Secure defaults for metrics and MCP secrets",
+      "Backend launch-hardening — ingestion SSRF guard + credential hardening",
+      "Plugin auth-bypass and event-loop hardening",
+      "Fail-safe plugin secret redaction",
+      "Operator-token storage guidance"
+    ]
+  },
+  {
+    "version": "v0.72.0",
+    "date": "2026-06-28",
+    "changes": [
+      "Context-window meter + per-turn cost/time",
+      "Vision-describe pass for text-only models",
+      "\"Get models\"",
+      "Inline components re-enabled",
+      "Per-stimulus Activity attribution",
+      "Inline action feedback → toasts",
+      "Deduped inbox/Activity now-item notifications + deliver-before-fire",
+      "Clear error for images on a text-only model",
+      "Chat-tab trash only on the hovered ✕"
+    ]
+  },
+  {
+    "version": "v0.71.0",
+    "date": "2026-06-27",
+    "changes": [
+      "Panel-focus keybindings",
+      "⌘K palette chat streams with live text↔tool interleave",
+      "Streaming answer text is full-width, no loading side-bar",
+      "No hardcoded emojis in the UI",
+      "Full-screen document viewer",
+      "Keyboard shortcuts",
+      "Quick-delete a chat tab",
+      "Hide a rail surface without disabling its plugin",
+      "Configure a plugin from its rail icon or util-bar widget",
+      "Chat tab context menu",
+      "Fork-safe console behavior seams"
+    ]
+  },
+  {
+    "version": "v0.70.0",
+    "date": "2026-06-24",
+    "changes": [
+      "Plugins can own /<name> chat control commands",
+      "\"Report a bug\" link in the hamburger menu",
+      "GitHub is no longer in core — it's a standalone plugin"
+    ]
+  },
+  {
+    "version": "v0.69.0",
+    "date": "2026-06-24",
+    "changes": [
+      "Native reasoning — the agent's thinking now streams from the model, not a forced text protocol.",
+      "Chat markdown now renders through the design system's Markdown renderer",
+      "Heavy research turns no longer wedge the server."
+    ]
+  },
+  {
+    "version": "v0.68.0",
+    "date": "2026-06-23",
+    "changes": [
+      "scripts/reset.sh — factory-reset the default (prod) instance from the CLI.",
+      "Chat tool-call rendering overhaul.",
+      "show_component (inline component rendering, ADR 0051) is temporarily disabled",
+      "The Goals and Tasks panels refresh on a bus push instead of polling every 5s.",
+      "Failed or user-cancelled task delegations now close as error cards (the X).",
+      "A subagent's own tool calls reliably nest under the delegation card.",
+      "Mid-stream output rendering no longer rescans the whole response on every chunk.",
+      "Empty-rail panel toggles fully disable.",
+      "Console-poll handlers no longer block the event loop.",
+      "The Docker image now serves the React console and stays in dep-lockstep with pyproject."
+    ]
+  },
+  {
+    "version": "v0.67.0",
+    "date": "2026-06-22",
+    "changes": [
+      "Per-agent ACP launch overrides are honored.",
+      "ACP delegate health probe is initialize-only — it no longer opens a session every 120s.",
+      "macOS desktop app finds Homebrew/nvm/Volta/asdf-installed binaries.",
+      "Workspace port assignment skips OS-occupied ports.",
+      "The per-agent theme is instance-scoped.",
+      "The browser tab favicon + theme-color follow the active per-agent theme.",
+      "ACP coding-agent subprocesses no longer leak as orphaned processes.",
+      "Dialogs no longer render their content cramped flush to the body edge.",
+      "Coding-agents guide: Codex needs the codex-acp adapter."
+    ]
+  },
+  {
     "version": "v0.66.0",
     "date": "2026-06-21",
     "changes": [

@@ -26,10 +26,15 @@ Surface:
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import glob
 import json
 import logging
 import os
 import re
+import shutil
+import signal
+from functools import lru_cache
 from pathlib import Path
 from typing import Awaitable, Callable
 
@@ -67,12 +72,17 @@ def _split_tool_title(title: str) -> tuple[str, str]:
 
 def _short_tool_name(title: str) -> str:
     """A compact card label from a (possibly verbose) ACP tool title: drop the inline
-    JSON args and a trailing ``(… MCP Server)`` source so the header stays a short
-    at-a-glance name (parity with the native runtime's clean tool names). The args +
-    source live in the card body instead."""
+    JSON args, a trailing ``(… MCP Server)`` source, and a leading ``mcp__<server>__``
+    namespace prefix, so the header stays a short at-a-glance name (parity with the
+    native runtime's clean tool names). The args + source live in the card body instead."""
     label, _ = _split_tool_title(title)
     # Drop a trailing "(… MCP Server)" source suffix only — NOT a legit "(beta)" / "(v2)".
     label = re.sub(r"\s*\([^)]*\b(?:MCP|server)\b[^)]*\)\s*$", "", label, flags=re.IGNORECASE).strip()
+    # Drop the `mcp__<server>__` prefix some agents (Claude Code) put on MCP tools —
+    # `mcp__protoagent-operator__current_time` → `current_time` — so the card reads as the
+    # bare tool name like the native runtime, not the wire-namespaced one. Non-greedy so it
+    # peels only the mcp+server segment; a non-namespaced name (`read_file`) is untouched.
+    label = re.sub(r"^mcp__.+?__", "", label).strip()
     return (label or (title or "").strip() or "tool")[:80]
 
 
@@ -109,6 +119,117 @@ _STDOUT_LINE_LIMIT = 32 * 1024 * 1024  # 32 MB
 # JSON-RPC error code the agent returns from `session/new` when it has no
 # resolved auth (ACP `AUTH_REQUIRED`). The client surfaces an actionable message.
 AUTH_REQUIRED = -32000
+
+# Env markers Claude Code sets so a nested `claude` can detect "am I already running
+# inside another Claude Code session?". When protoAgent's own server was launched from
+# within a Claude Code session (the dogfooding case), these are inherited — and the
+# claude-agent-acp backend we spawn then hits the *"cannot be launched inside another
+# Claude Code session"* guard, evicting + respawning every ~2 min with zero progress
+# and no surfaced error (#1296). Stripped from the ACP launch env: ``CLAUDECODE`` plus
+# the whole ``CLAUDE_CODE_*`` family (SESSION_ID / CHILD_SESSION / EXECPATH / ENTRYPOINT
+# / …). Harmless for non-Claude agents (proto/codex don't read them).
+_NESTED_CLAUDE_ENV_EXACT = frozenset({"CLAUDECODE"})
+_NESTED_CLAUDE_ENV_PREFIX = "CLAUDE_CODE_"
+
+
+# Node-based ACP backends (the `claude` agent launches via `npx`; codex-acp too) need
+# `node` on PATH. A protoAgent server started as a service — systemd, launchd, a bare
+# `nohup` — gets a MINIMAL PATH that never picked up the user's Node install: nvm / fnm /
+# volta / asdf / nodenv all prepend their bin dir from the *shell rc*, which a service
+# never sources. That's the #1 cause of "agent binary not found: 'npx'". So when `node`
+# isn't already resolvable on the launch PATH, we discover the version-manager bin dirs
+# and append them — making node tooling reachable regardless of how the server was started.
+_NODE_TOOL_BASENAMES = frozenset({"npx", "node", "npm", "pnpm", "yarn", "bun", "corepack"})
+
+
+def _version_sort_key(bin_dir: str) -> tuple[int, ...]:
+    """Sort key for a version-manager node `bin` dir, newest-first. The version is the
+    dir component holding the semver (``…/node/v22.22.0/bin`` → ``v22.22.0``; fnm's
+    ``…/<ver>/installation/bin`` → the grandparent). Non-versioned dirs sort last."""
+    p = Path(bin_dir)
+    for name in (p.parent.name, p.parent.parent.name):
+        nums = re.findall(r"\d+", name)
+        if nums:
+            return tuple(int(n) for n in nums[:3])
+    return (0,)
+
+
+@lru_cache(maxsize=1)
+def _discovered_node_dirs() -> tuple[str, ...]:
+    """Existing node `bin` dirs from the common version managers + standard locations,
+    most-preferred first (newest version), for augmenting a minimal launch PATH. Only
+    dirs that actually contain a ``node`` executable are returned. Cached — the
+    filesystem probe runs once per process. Best-effort: any error yields fewer dirs."""
+    home = Path.home()
+    cands: list[str] = []
+
+    def _versioned(root: str | os.PathLike, pattern: str) -> None:
+        try:
+            hits = glob.glob(os.path.join(str(root), pattern))
+        except OSError:
+            return
+        cands.extend(sorted(hits, key=_version_sort_key, reverse=True))
+
+    # nvm: ~/.nvm/versions/node/<ver>/bin   (NVM_DIR overrides the location)
+    _versioned(os.environ.get("NVM_DIR") or home / ".nvm", "versions/node/*/bin")
+    # fnm: <root>/node-versions/<ver>/installation/bin
+    for fnm_root in (os.environ.get("FNM_DIR"), home / ".local/share/fnm", home / ".fnm"):
+        if fnm_root:
+            _versioned(fnm_root, "node-versions/*/installation/bin")
+    # Single shim/bin dirs: volta, asdf, nodenv, homebrew, common system.
+    cands.append(str(Path(os.environ.get("VOLTA_HOME") or home / ".volta") / "bin"))
+    cands.append(str(Path(os.environ.get("ASDF_DATA_DIR") or home / ".asdf") / "shims"))
+    cands.append(str(home / ".nodenv" / "shims"))
+    cands.extend(["/opt/homebrew/bin", "/usr/local/bin"])
+
+    out: list[str] = []
+    seen: set[str] = set()
+    for d in cands:
+        if d in seen:
+            continue
+        seen.add(d)
+        if os.path.exists(os.path.join(d, "node")) or os.path.exists(os.path.join(d, "node.exe")):
+            out.append(d)
+    return tuple(out)
+
+
+def _launch_env(extra: dict[str, str] | None) -> dict[str, str]:
+    """Build the subprocess environment for an ACP agent: the server's own ``os.environ``
+    with the nested-Claude markers stripped (see above), then the delegate's ``env``
+    overlaid last — so an operator who *deliberately* sets one of these in the delegate
+    env still wins. Finally, if ``node`` isn't resolvable on the resulting PATH, append the
+    discovered node version-manager dirs so a service-launched server can still find npx."""
+    env = {
+        k: v
+        for k, v in os.environ.items()
+        if k not in _NESTED_CLAUDE_ENV_EXACT and not k.startswith(_NESTED_CLAUDE_ENV_PREFIX)
+    }
+    env.update(extra or {})
+
+    path = env.get("PATH") or os.defpath
+    if shutil.which("node", path=path) is None:
+        # APPEND (not prepend): an explicitly-configured PATH still wins for anything it
+        # already provides; we only add fallbacks for what it's missing.
+        present = path.split(os.pathsep)
+        extra_dirs = [d for d in _discovered_node_dirs() if d not in present]
+        if extra_dirs:
+            env["PATH"] = os.pathsep.join([path, *extra_dirs])
+    return env
+
+
+def _missing_binary_message(command: str) -> str:
+    """The AcpError text for a launch that hit FileNotFoundError. For a node tool we add
+    the service-PATH hint, since a systemd/launchd server not seeing nvm/fnm node is by
+    far the most common cause."""
+    msg = f"agent binary not found: {command!r} (is it installed and on PATH?)"
+    if os.path.basename(command) in _NODE_TOOL_BASENAMES:
+        msg += (
+            " — if protoAgent runs as a service (systemd/launchd), its PATH likely doesn't "
+            "include your Node install: nvm/fnm/volta set PATH from your shell rc, which "
+            "services don't source. Add the node bin dir to the service PATH, or install "
+            "the agent's CLI on the system PATH."
+        )
+    return msg
 
 
 class AcpError(Exception):
@@ -187,12 +308,26 @@ class AcpClient:
     # -- lifecycle -----------------------------------------------------------
 
     async def _ensure_started(self) -> None:
+        """Start the agent for a real dispatch: spawn + ``initialize`` + open the
+        session (reattach or new). Idempotent — a no-op when already up."""
         async with self._start_lock:
             if self._proc is not None and self._proc.returncode is None:
                 return
             await self._start()
 
-    async def _start(self) -> None:
+    async def handshake(self) -> None:
+        """Start the agent for a *liveness check only*: spawn + run the ACP
+        ``initialize`` round-trip and STOP — no ``session/new``, no ``session/load``,
+        no session state touched. The genuinely cheap, side-effect-free probe the
+        health prober wants (#1300; the old probe went through ``_ensure_started``,
+        which also opened a real session every 120s). The caller ``close()``s it.
+        Idempotent — a no-op when already up."""
+        async with self._start_lock:
+            if self._proc is not None and self._proc.returncode is None:
+                return
+            await self._start(open_session=False)
+
+    async def _start(self, *, open_session: bool = True) -> None:
         if not Path(self.cwd).is_dir():
             raise AcpError(f"workdir does not exist: {self.cwd}")
         try:
@@ -203,18 +338,38 @@ class AcpClient:
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
-                env={**os.environ, **(self.env or {})},
+                # Strip the inherited nested-Claude markers (CLAUDECODE / CLAUDE_CODE_*)
+                # so a spawned Claude backend doesn't refuse to launch "inside another
+                # Claude Code session" (#1296); the delegate's env is overlaid last.
+                env=_launch_env(self.env),
+                # Put the agent in its OWN session/process group so teardown can kill
+                # the WHOLE tree (the adapter *and* the backend it spawns). Without
+                # this, terminate() signals only the adapter; its child reparents to
+                # init and leaks — the codex-acp / claude-agent-acp orphan pile that
+                # piled up to ~20 GB. POSIX-only (start_new_session ⇒ setsid()).
+                start_new_session=True,
                 # Raise the per-line buffer ceiling — ACP messages exceed the 64 KB
                 # default and would otherwise raise LimitOverrunError (kills the turn).
                 limit=_STDOUT_LINE_LIMIT,
             )
         except FileNotFoundError as exc:
-            raise AcpError(f"agent binary not found: {self.command!r} (is it installed and on PATH?)") from exc
+            raise AcpError(_missing_binary_message(self.command)) from exc
 
-        self._reader_task = asyncio.create_task(self._read_loop())
-        self._stderr_task = asyncio.create_task(self._drain_stderr())
-        await self._initialize()
-        await self._open_session()
+        # The subprocess now exists. If the handshake raises OR the caller's wait_for
+        # cancels us mid-initialize (the health prober's 45s probe timeout), reap the
+        # tree we just spawned instead of leaking it — close() is idempotent.
+        try:
+            self._reader_task = asyncio.create_task(self._read_loop())
+            self._stderr_task = asyncio.create_task(self._drain_stderr())
+            await self._initialize()
+            # The probe path (handshake) stops here — a liveness check must NOT open a
+            # session. A real dispatch opens (reattaches or news) the session.
+            if open_session:
+                await self._open_session()
+        except BaseException:
+            with contextlib.suppress(Exception):
+                await self.close()
+            raise
         logger.info(
             "[acp/%s] up (pid=%s, session=%s, cwd=%s)",
             self.name,
@@ -223,32 +378,61 @@ class AcpClient:
             self.cwd,
         )
 
+    @staticmethod
+    def _signal_group(proc: asyncio.subprocess.Process, sig: int) -> None:
+        """Send ``sig`` to the subprocess's whole process GROUP (the agent plus the
+        backend it spawned), falling back to the bare process if the group is already
+        gone. Synchronous syscall + swallows ProcessLookup, so it's safe to call from
+        a teardown/cancel path where the event loop won't run our coroutines."""
+        try:
+            os.killpg(os.getpgid(proc.pid), sig)
+        except (ProcessLookupError, PermissionError, OSError):
+            with contextlib.suppress(ProcessLookupError, OSError):
+                proc.send_signal(sig)
+
+    def kill_now(self) -> None:
+        """Synchronously SIGKILL the agent's whole process group — no awaits, so it's
+        safe from a CancelledError handler where awaiting cleanup would itself be
+        cancelled. The zombie is reaped later by ``proc.wait()`` / the child watcher.
+        Use this on the hard-stop path (operator stops the turn); ``close()`` is the
+        graceful one."""
+        proc = self._proc
+        if proc and proc.returncode is None:
+            self._signal_group(proc, signal.SIGKILL)
+        for task in (self._reader_task, self._stderr_task):
+            if task and not task.done():
+                task.cancel()
+
     async def close(self) -> None:
-        """Cancel the I/O tasks and reap the subprocess. Crucially this ``await``s
+        """Cancel the I/O tasks and reap the subprocess TREE. Crucially this ``await``s
         ``proc.wait()`` so the child is reaped *while the loop is alive* — without
         it the subprocess transport lingers and its ``__del__`` fires after the loop
         closes ("Event loop is closed"), and the stderr-drain task leaks.
 
         Sends a best-effort ``session/close`` first — the graceful, spec-aligned
-        shutdown (and what matters if an agent ever serves multiple sessions per
-        process) before the SIGTERM that actually frees this one-process-per-session."""
-        await self._close_session()
+        shutdown — then SIGTERM→SIGKILL the agent's whole PROCESS GROUP, not just the
+        direct child, so the backend it spawned dies with it instead of reparenting to
+        init. The kill is a synchronous syscall, so even if this runs on a cancelled
+        task the tree still dies."""
+        with contextlib.suppress(Exception):
+            await self._close_session()
         for task in (self._reader_task, self._stderr_task):
             if task and not task.done():
                 task.cancel()
         proc = self._proc
         if proc and proc.returncode is None:
+            self._signal_group(proc, signal.SIGTERM)
             try:
-                proc.terminate()
                 await asyncio.wait_for(proc.wait(), timeout=5.0)
             except asyncio.TimeoutError:
-                try:
-                    proc.kill()
+                self._signal_group(proc, signal.SIGKILL)
+                with contextlib.suppress(Exception):
                     await proc.wait()
-                except ProcessLookupError:
-                    pass
-            except ProcessLookupError:
-                pass
+            except asyncio.CancelledError:
+                # We're being torn down — guarantee the tree is dead, then let the
+                # cancellation propagate (don't swallow it).
+                self._signal_group(proc, signal.SIGKILL)
+                raise
         # Close the subprocess transport too, so its pipe transports don't linger to
         # a post-loop-close GC — reaping the process (above) leaves the stdin write-
         # pipe transport open, whose __del__ then fires "Event loop is closed".
@@ -389,8 +573,18 @@ class AcpClient:
         method = msg.get("method")
         rid = msg.get("id")
         if method == "session/request_permission":
+            params = msg.get("params") or {}
             resolver = self._permission or self._auto_allow
-            option_id = resolver(msg.get("params") or {})
+            option_id = resolver(params)
+            # Trace the decision — a permission the resolver can't answer (→ cancelled)
+            # can leave the agent blocked, a prime suspect for the idle freeze (#1296).
+            kind = str(((params.get("toolCall") or {}).get("kind") or "")).lower()
+            logger.info(
+                "[acp/%s] request_permission kind=%s → %s",
+                self.name,
+                kind or "?",
+                "selected" if option_id else "cancelled",
+            )
             outcome = {"outcome": "selected", "optionId": option_id} if option_id else {"outcome": "cancelled"}
             await self._respond(rid, {"outcome": outcome})
         else:
@@ -535,6 +729,16 @@ class AcpClient:
                     f"client so their ACP versions match."
                 )
             self._protocol_version = negotiated
+        # Log the handshake outcome so the ACP round-trip (initialize → session →
+        # prompt → permission → result) is traceable from the server log — an idle
+        # freeze with no diagnostics is the hard-to-debug half of #1296.
+        logger.info(
+            "[acp/%s] initialize OK (protocol v%s, loadSession=%s, authMethods=%d)",
+            self.name,
+            self._protocol_version,
+            bool(self._agent_capabilities.get("loadSession")),
+            len(self._auth_methods),
+        )
 
     async def _open_session(self) -> None:
         """Reattach the persisted session when possible, else start a fresh one.
@@ -653,6 +857,13 @@ class AcpClient:
         self._on_tool = tool_callback
         self._on_text = text_callback
         self._on_thought = thought_callback
+        logger.info(
+            "[acp/%s] → session/prompt (session=%s, %d chars, timeout=%ss)",
+            self.name,
+            self._session_id,
+            len(text),
+            int(timeout),
+        )
         try:
             result = await self._request(
                 "session/prompt",

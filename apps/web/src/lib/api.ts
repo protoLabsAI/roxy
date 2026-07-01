@@ -8,6 +8,7 @@ import type {
   ChatMessage,
   ComponentSpec,
   ConfigPayload,
+  ContextWindow,
   DelegateProbe,
   DelegateTypeSpec,
   DelegateView,
@@ -35,6 +36,8 @@ import type {
   TelemetrySummary,
   TelemetryTurn,
   ToolEvent,
+  TurnUsage,
+  WatchState,
   WorkflowRunResult,
   WorkflowSummary,
 } from "./types";
@@ -78,6 +81,7 @@ type A2AFrame = {
     };
     artifactUpdate?: {
       taskId?: string;
+      contextId?: string;
       artifact?: { parts?: A2APart[] };
       append?: boolean;
       lastChunk?: boolean;
@@ -98,6 +102,25 @@ type A2AFrame = {
     message?: string;
   };
 };
+
+/**
+ * Defense-in-depth for streaming (follow-up to the subagent-stream-isolation fix #1394).
+ *
+ * The a2a SDK stamps EVERY frame it emits — `task`, `statusUpdate`, `artifactUpdate` — with
+ * the originating `contextId`, and a single console turn streams exactly ONE context (the
+ * `sessionId` it sent as the message `contextId`; the server echoes it back unchanged). So a
+ * frame carrying a DIFFERENT contextId is cross-talk from a concurrent turn or a detached
+ * background job and must never be rendered into this turn's message. Returns true for such a
+ * foreign frame. A frame with no contextId (an older server / the A2A 0.3 flat shape that
+ * omits it) is never treated as foreign — the guard degrades to a no-op rather than dropping
+ * legitimate output.
+ */
+export function frameIsForeign(frame: A2AFrame, expectedContextId: string): boolean {
+  const r = frame.result;
+  if (!r) return false;
+  const cid = r.task?.contextId ?? r.statusUpdate?.contextId ?? r.artifactUpdate?.contextId ?? r.contextId;
+  return !!cid && cid !== expectedContextId;
+}
 
 function defaultApiBase() {
   if (typeof window === "undefined") return "";
@@ -341,12 +364,15 @@ async function requestForm<T>(path: string, form: FormData, opts: { host?: boole
     body: form,
   });
   if (!response.ok) {
+    // Read the body ONCE (a Response stream can't be read twice — calling
+    // .json() then .text() throws "body stream already read", which masked the
+    // real HTTP detail and skipped the 401 AuthGate). Mirror `request`.
+    const raw = await response.text().catch(() => "");
     let detail = `${response.status} ${response.statusText}`;
     try {
-      const payload = (await response.json()) as { detail?: string };
-      detail = payload.detail || detail;
+      detail = (JSON.parse(raw) as { detail?: string }).detail || raw || detail;
     } catch {
-      detail = await response.text();
+      detail = raw || detail;
     }
     if (response.status === 401) notifyAuthRequired();
     throw new ApiError(response.status, detail || "request failed");
@@ -365,6 +391,8 @@ const TOOL_CALL_MIME = "application/vnd.protolabs.tool-call-v1+json";
 const HITL_MIME = "application/vnd.protolabs.hitl-v1+json";
 const COMPONENT_MIME = "application/vnd.protolabs.component-v1+json";
 const REASONING_MIME = "application/vnd.protolabs.reasoning-v1+json";
+const COST_MIME = "application/vnd.protolabs.cost-v1+json";
+const CONTEXT_MIME = "application/vnd.protolabs.context-v1+json";
 
 type RawPart = {
   kind?: string;
@@ -399,7 +427,15 @@ function dataByMime(parts: RawPart[] | undefined, mime: string): unknown {
  * single ever-overwriting card — the "only one tool at a time" symptom. */
 function toolEventFromParts(parts?: RawPart[]): ToolEvent | null {
   const d = dataByMime(parts, TOOL_CALL_MIME) as
-    | { toolCallId?: string; name?: string; phase?: string; args?: string; result?: string; error?: string }
+    | {
+        toolCallId?: string;
+        name?: string;
+        phase?: string;
+        args?: string;
+        result?: string;
+        error?: string;
+        parentToolCallId?: string;
+      }
     | null;
   if (!d) return null;
   return {
@@ -410,6 +446,8 @@ function toolEventFromParts(parts?: RawPart[]): ToolEvent | null {
     // A "failed" end carries the error text in `error`; fall back to it for the body.
     output: d.result ?? d.error,
     error: d.phase === "failed" || Boolean(d.error),
+    // Set only for a subagent's own tool calls → nest under the `task` card by id.
+    ...(d.parentToolCallId ? { parentId: d.parentToolCallId } : {}),
   };
 }
 
@@ -431,6 +469,61 @@ export function hitlFromParts(parts?: RawPart[]): HitlPayload | null {
 function reasoningFromParts(parts?: RawPart[]): string | null {
   const d = dataByMime(parts, REASONING_MIME) as { text?: string } | null;
   return d?.text || null;
+}
+
+/** Decode the terminal cost-v1 DataPart (A2A ext) → this turn's token usage + cost, or null.
+ * Wire shape: `{ usage: {input_tokens, output_tokens, cache_read_input_tokens,
+ * cache_creation_input_tokens}, costUsd?, durationMs? }`. The snake_case `usage` fields are
+ * mapped to the camelCase `TurnUsage` the console renders; totalTokens is derived. */
+export function costFromParts(parts?: RawPart[]): TurnUsage | null {
+  const d = dataByMime(parts, COST_MIME) as
+    | {
+        usage?: {
+          input_tokens?: number;
+          output_tokens?: number;
+          cache_read_input_tokens?: number;
+          cache_creation_input_tokens?: number;
+        };
+        costUsd?: number;
+        durationMs?: number;
+      }
+    | null;
+  if (!d || !d.usage) return null;
+  const inputTokens = Number(d.usage.input_tokens || 0);
+  const outputTokens = Number(d.usage.output_tokens || 0);
+  return {
+    inputTokens,
+    outputTokens,
+    totalTokens: inputTokens + outputTokens,
+    cacheReadTokens: Number(d.usage.cache_read_input_tokens || 0),
+    cacheCreationTokens: Number(d.usage.cache_creation_input_tokens || 0),
+    ...(typeof d.costUsd === "number" ? { costUsd: d.costUsd } : {}),
+    ...(typeof d.durationMs === "number" ? { durationMs: d.durationMs } : {}),
+  };
+}
+
+/** Decode the terminal context-v1 DataPart (#1372) → the turn's context-window fill +
+ * compaction threshold, or null. `compactionAtTokens` / `maxTokens` are present only when the
+ * server could resolve a token denominator (token-based trigger); otherwise the meter shows
+ * the raw size. */
+export function contextFromParts(parts?: RawPart[]): ContextWindow | null {
+  const d = dataByMime(parts, CONTEXT_MIME) as
+    | {
+        contextTokens?: number;
+        compactionAtTokens?: number;
+        maxTokens?: number;
+        trigger?: string;
+        enabled?: boolean;
+      }
+    | null;
+  if (!d || typeof d.contextTokens !== "number") return null;
+  return {
+    contextTokens: d.contextTokens,
+    ...(typeof d.compactionAtTokens === "number" ? { compactionAtTokens: d.compactionAtTokens } : {}),
+    ...(typeof d.maxTokens === "number" ? { maxTokens: d.maxTokens } : {}),
+    ...(typeof d.trigger === "string" ? { trigger: d.trigger } : {}),
+    ...(typeof d.enabled === "boolean" ? { enabled: d.enabled } : {}),
+  };
 }
 
 function textFromTerminalTask(result: NonNullable<A2AFrame["result"]>) {
@@ -533,6 +626,15 @@ async function consumeSse(
 export const api = {
   runtimeStatus() {
     return request<RuntimeStatus>("/api/runtime/status");
+  },
+
+  // Short-lived HMAC token for the SSE EventSource, which can't send an
+  // Authorization header. Bearer-gated; in open mode the server returns "" and
+  // accepts a tokenless /api/events. events.ts fetches this before each
+  // (re)connect. Same slug routing as /api/events so the token is signed by
+  // whichever server actually terminates the stream (host or a proxied member).
+  sseToken() {
+    return request<{ token: string }>("/api/sse-token");
   },
 
   // Gracefully restart the server process (POST /api/restart) — the server drains and
@@ -872,6 +974,30 @@ export const api = {
     });
   },
 
+  // Operator goal-set (ADR 0066) — the trusted operator channel. `/api` is operator-tier by
+  // the ADR 0066 path ceiling, so this accepts ANY verifier type (unlike the plugin-only SDK
+  // path). A rejected verifier / disabled goal mode comes back as HTTP 400 (request() throws,
+  // so the caller's onError surfaces the reason); the happy path returns {ok:true, message}.
+  setGoal(body: { session_id: string; condition: string; verifier: unknown }) {
+    return request<{ ok: boolean; message?: string; error?: string }>("/api/goals", {
+      method: "POST",
+      body,
+    });
+  },
+
+  // Watches (ADR 0067) — passive verifier-only objectives, many at once, keyed by id. The
+  // panel invalidates this on the `watch.*` bus pushes (created/checked/met/expired/stalled)
+  // instead of polling — same pattern as goals.
+  watches() {
+    return request<{ watches: WatchState[]; enabled: boolean }>("/api/watches");
+  },
+
+  clearWatch(id: string) {
+    return request<{ cleared: boolean }>(`/api/watches/${encodeURIComponent(id)}`, {
+      method: "DELETE",
+    });
+  },
+
   chatCommands() {
     return request<{ commands: SlashCommand[] }>("/api/chat/commands");
   },
@@ -1043,6 +1169,10 @@ export const api = {
       onReasoning?: (delta: string) => void;
       onToolCall?: (evt: ToolEvent) => void;
       onComponent?: (spec: ComponentSpec) => void;
+      // This turn's token usage + cost — lifted off the terminal cost-v1 DataPart.
+      onCost?: (usage: TurnUsage) => void;
+      // This turn's context-window fill + compaction threshold — terminal context-v1 DataPart.
+      onContext?: (ctx: ContextWindow) => void;
       onInputRequired?: (payload: HitlPayload) => void;
       // Terminal failure (A2A `TASK_STATE_FAILED`) — e.g. the model rejected the
       // turn (bad API key → 401). Carries the gateway's error text. Without this
@@ -1051,7 +1181,12 @@ export const api = {
       onFailed?: (message: string) => void;
       onDone?: () => void;
     } = {},
-    opts: { images?: { b64: string; mime: string; name: string }[]; model?: string; reasoningEffort?: string } = {},
+    opts: {
+      images?: { b64: string; mime: string; name: string }[];
+      model?: string;
+      reasoningEffort?: string;
+      bypassPermissions?: boolean;
+    } = {},
   ) {
     // One A2A SendStreamingMessage body + one frame dispatcher, shared by the desktop
     // (Tauri-relayed) and browser (fetch SSE) paths so both decode turns identically.
@@ -1071,11 +1206,12 @@ export const api = {
           contextId: sessionId,
           // Per-turn overrides ride the A2A message metadata (server/chat.py reads them):
           // the tab's chosen model + the /effort reasoning level.
-          ...((opts.model || opts.reasoningEffort)
+          ...((opts.model || opts.reasoningEffort || opts.bypassPermissions)
             ? {
                 metadata: {
                   ...(opts.model ? { model: opts.model } : {}),
                   ...(opts.reasoningEffort ? { reasoning_effort: opts.reasoningEffort } : {}),
+                  ...(opts.bypassPermissions ? { bypass_permissions: true } : {}),
                 },
               }
             : {}),
@@ -1086,6 +1222,9 @@ export const api = {
       if (frame.error?.message) throw new Error(frame.error.message);
       const result = frame.result;
       if (!result) return;
+      // Drop any frame stamped with a different contextId than this turn's — cross-talk from
+      // a concurrent turn or background job can't leak into this message (see frameIsForeign).
+      if (frameIsForeign(frame, sessionId)) return;
       const task = result.task ?? (result.kind === "task" ? result : undefined);
       const statusUpdate = result.statusUpdate ?? (result.kind === "status-update" ? result : undefined);
       const artifactUpdate = result.artifactUpdate ?? (result.kind === "artifact-update" ? result : undefined);
@@ -1115,8 +1254,15 @@ export const api = {
         }
       }
       if (artifactUpdate) {
-        const text = textFromParts(artifactUpdate.artifact?.parts);
+        const aParts = artifactUpdate.artifact?.parts;
+        const text = textFromParts(aParts);
         if (text) handlers.onText?.(text, artifactUpdate.append !== false);
+        // The terminal answer artifact also carries the cost-v1 + context-v1 DataParts
+        // (a2a_impl executor) — surface this turn's spend and its context-window fill.
+        const usage = costFromParts(aParts);
+        if (usage) handlers.onCost?.(usage);
+        const ctx = contextFromParts(aParts);
+        if (ctx) handlers.onContext?.(ctx);
       }
     };
 

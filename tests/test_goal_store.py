@@ -64,21 +64,48 @@ def test_all_empty_and_skips_corrupt(tmp_path):
 
 
 def test_resolve_base_is_instance_scoped(monkeypatch, tmp_path):
-    """Two agents on one machine must not share a goals dir (ADR 0004) — else
-    scheduled/activity turns (shared session id) collide and goals leak across
-    agents. _resolve_base namespaces by PROTOAGENT_INSTANCE."""
+    """Two agents on one machine must not share a goals dir (ADR 0004) — the default
+    sits at instance_root/goals, so a different PROTOAGENT_INSTANCE → a different dir."""
+    import infra.paths as paths
     from graph.goals import store as goal_store
 
-    monkeypatch.setenv("GOAL_PATH", str(tmp_path))
+    monkeypatch.delenv("GOAL_PATH", raising=False)
+    monkeypatch.setenv("PROTOAGENT_BOX_ROOT", str(tmp_path))
 
     monkeypatch.setenv("PROTOAGENT_INSTANCE", "alpha")
+    paths.reset_instance_paths()
     base_a = goal_store._resolve_base()
     monkeypatch.setenv("PROTOAGENT_INSTANCE", "beta")
+    paths.reset_instance_paths()
     base_b = goal_store._resolve_base()
     assert base_a != base_b
-    assert base_a.name == tmp_path.name and base_a.parent.name == "alpha"
-    assert base_b.parent.name == "beta"
+    assert base_a == tmp_path / "alpha" / "goals"
+    assert base_b == tmp_path / "beta" / "goals"
 
-    # No instance id → unscoped (single-instance back-compat).
-    monkeypatch.delenv("PROTOAGENT_INSTANCE", raising=False)
-    assert goal_store._resolve_base() == tmp_path
+    # GOAL_PATH is an explicit override — used verbatim, no scoping.
+    monkeypatch.setenv("GOAL_PATH", str(tmp_path / "explicit"))
+    paths.reset_instance_paths()
+    assert goal_store._resolve_base() == tmp_path / "explicit"
+
+
+def test_set_and_clear_publish_goal_changed(tmp_path, monkeypatch):
+    """A goal write/clear pushes `goal.changed` on the bus so the console Goals panel
+    invalidates live instead of polling every 5s (#1310)."""
+    from graph.plugins import host
+
+    events: list[tuple] = []
+    monkeypatch.setattr(host.HOST, "publish", lambda topic, data: events.append((topic, data)))
+    store = GoalStore(tmp_path)
+    store.set(GoalState(session_id="s1", condition="x"))
+    assert store.clear("s1") is True
+    assert [t for t, _ in events] == ["goal.changed", "goal.changed"]
+    assert events[0][1]["session_id"] == "s1"
+
+
+def test_clear_missing_does_not_publish(tmp_path, monkeypatch):
+    from graph.plugins import host
+
+    events: list[tuple] = []
+    monkeypatch.setattr(host.HOST, "publish", lambda topic, data: events.append((topic, data)))
+    assert GoalStore(tmp_path).clear("nope") is False
+    assert events == []  # nothing was cleared → no event

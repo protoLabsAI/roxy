@@ -15,6 +15,8 @@ import dataclasses
 import textwrap
 from pathlib import Path
 
+import pytest
+
 from graph.config import LangGraphConfig, SubagentDef
 from graph.config_io import (
     apply_updates_to_yaml,
@@ -23,6 +25,18 @@ from graph.config_io import (
 )
 
 EXAMPLE_PATH = "config/langgraph-config.example.yaml"
+
+
+@pytest.fixture(autouse=True)
+def _isolate_from_installed_plugins(monkeypatch):
+    """Freeze the CORE config surface, independent of whatever plugins a dev has installed.
+
+    ``from_yaml`` resolves ``plugin_config`` by DISCOVERING installed plugins (ADR 0019),
+    and ``config_to_dict`` reflects it — so a dev with any plugin under ``config/plugins/``
+    (dev-local, gitignored state) gets extra sections and these goldens spuriously fail,
+    while CI (no plugins installed) is green. Plugin-config resolution has its own tests;
+    here we pin it empty so the golden means the same thing everywhere."""
+    monkeypatch.setattr("graph.config._resolve_plugin_config", lambda *a, **k: {})
 
 
 # ---------------------------------------------------------------------------
@@ -36,6 +50,7 @@ FROM_YAML_EXAMPLE_FIELDS = {
     "a2a_description": "",
     "a2a_require_routable_url": False,
     "a2a_skills": [],
+    "acp_agents": {},
     "agent_runtime": "native",
     "api_base": "http://gateway:4000/v1",
     "audit_middleware": True,
@@ -63,10 +78,12 @@ FROM_YAML_EXAMPLE_FIELDS = {
     "egress_allowed_hosts": [],
     "embed_model": "qwen3-embedding",
     "transcribe_model": "whisper-1",
+    "image_describe_model": "",
     "enforcement_disallowed_tools": [],
     "enforcement_enabled": False,
     "enforcement_rate_limits": {},
     "filesystem_allow_run": True,
+    "filesystem_bypass_allowed": True,
     "filesystem_enabled": True,
     "filesystem_projects": [],
     "filesystem_run_requires_approval": True,
@@ -76,7 +93,6 @@ FROM_YAML_EXAMPLE_FIELDS = {
     "goal_enabled": True,
     "goal_eval_model": "",
     "goal_max_iterations": 8,
-    "goal_monitor_interval": 60,
     "goal_no_progress_limit": 3,
     "goal_verify_timeout": 120.0,
     "identity_name": "protoagent",
@@ -163,7 +179,7 @@ FROM_YAML_EXAMPLE_FIELDS = {
 }
 
 # Fields handled by their own dedicated assertions, not the golden map.
-_GOLDEN_EXEMPT = {"api_key", "auth_token", "plugin_config"}
+_GOLDEN_EXEMPT = {"api_key", "auth_token", "federation_token", "plugin_config"}
 
 # config_to_dict(from_yaml(example)) exact output — freezes the now-FIELDS-
 # complete emitted surface (B1 PR-3) so a later change shows up as a reviewable
@@ -193,6 +209,9 @@ CONFIG_TO_DICT_GOLDEN = {
         "keep_messages": 20,
         "model": "",
         "trigger": "fraction:0.8",
+    },
+    "egress": {
+        "allowed_hosts": [],
     },
     "fleet": {
         "port_base": 7870,
@@ -232,6 +251,7 @@ CONFIG_TO_DICT_GOLDEN = {
         "min_score": 0.0,
         "recall_preview_chars": 1000,
         "rrf_k": 60,
+        "image_describe_model": "",
         "scope": "",
         "top_k": 5,
         "transcribe_model": "whisper-1",
@@ -353,6 +373,7 @@ EMITTED_ATTRS = {
     "knowledge_db_path",
     "embed_model",
     "transcribe_model",
+    "image_describe_model",
     "knowledge_top_k",
     "knowledge_vector_k",
     "knowledge_rrf_k",
@@ -464,6 +485,7 @@ def test_from_yaml_example_golden():
     # Redacted / unpinned fields get dedicated assertions.
     assert cfg.api_key == ""
     assert cfg.auth_token == ""
+    assert cfg.federation_token == ""  # ADR 0066 secret — redacted, no example value
     assert isinstance(cfg.plugin_config, dict)
 
     # Every other dataclass field must match the captured golden exactly.

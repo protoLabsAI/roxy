@@ -5,6 +5,8 @@
 // legacy theme.css without resetting base styles (incremental migration, ADR 0037 D4).
 module.exports = {
   presets: [require("@protolabsai/design/tailwind")],
+  // (The streamdown dist scan is gone — the DS `<Markdown>` owns markdown chrome styling
+  // via its self-contained markdown.css; streamdown's Tailwind classes are inert here.)
   content: ["./index.html", "./src/**/*.{ts,tsx}"],
   corePlugins: { preflight: false },
   theme: {

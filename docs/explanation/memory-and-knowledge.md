@@ -51,11 +51,12 @@ Everything that writes to the store funnels through `KnowledgeStore.add_chunk`:
 
 ### The reasoning guardrail
 
-The agent thinks inside `<scratch_pad>` and answers inside `<output>` (the
-[output protocol](output-protocol.md)). `add_chunk` **strips
-`<scratch_pad>`/`<think>` from every write** — so the model's internal reasoning
-can never reach the store (and never gets recycled into a later prompt via
-retrieval). A chunk that is *only* reasoning is dropped, not stored empty.
+The agent reasons natively — on the gateway's `reasoning_content` channel, not in
+the answer text (see [model output](output-protocol.md)). As a defense-in-depth
+guardrail, `add_chunk` **strips any leaked `<scratch_pad>`/`<think>` from every
+write** — so reasoning a provider leaks into content can never reach the store (and
+never gets recycled into a later prompt via retrieval). A chunk that is *only*
+reasoning is dropped, not stored empty.
 
 ## Retrieval
 
@@ -109,7 +110,8 @@ All under the `knowledge:` block (see [Configuration](../reference/configuration
 | `embeddings` | `true` | hybrid semantic + keyword search (vs keyword-only) |
 | `embed_model` | `qwen3-embedding` | gateway embedding model (set per your gateway) |
 | `facts` | `true` | extract semantic facts during the harvest pass |
-| `top_k` | `5` | how many chunks retrieval injects per turn |
+| `top_k` | `10` | how many chunks retrieval injects per turn |
+| `scope` | `scoped` | tier ([ADR 0041](../adr/0041-workspaces-and-tiered-stores.md)): `scoped` (private) · `shared` (host commons) · `layered` (read commons ∪ private, write private). See [Tune the knowledge store → Sharing across a fleet](../guides/knowledge.md#sharing-knowledge-across-a-fleet-the-commons) |
 | `middleware.knowledge` | `true` | turn the whole subsystem on/off |
 
 Tip: enabling embeddings is measurable — add a recall eval and compare keyword vs
@@ -118,6 +120,8 @@ hybrid via `evals.sweep`. See [Eval your fork](../guides/evals.md).
 ## See also
 
 - [ADR 0021 — Agent memory: extract, don't dump](../adr/0021-agent-memory-architecture.md)
-- [Output protocol](output-protocol.md) — the `<scratch_pad>`/`<output>` contract the guardrail enforces
+- [ADR 0041 — Workspaces & tiered stores](../adr/0041-workspaces-and-tiered-stores.md) — the private/commons tiering behind `knowledge.scope`
+- [Run a fleet](../guides/fleet.md) — sharing a knowledge commons across many agents on one host
+- [Model output](output-protocol.md) — native reasoning + the leaked-reasoning guard this enforces
 - [Skills](../guides/skills.md) — procedural memory (Playbooks)
 - [Starter tools](../reference/starter-tools.md) — the `memory_*` tools

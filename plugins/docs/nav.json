@@ -50,6 +50,14 @@
           "title": "Goal mode"
         },
         {
+          "path": "guides/watches.md",
+          "title": "Watches"
+        },
+        {
+          "path": "guides/file-github-issues.md",
+          "title": "File GitHub issues (/issue)"
+        },
+        {
           "path": "guides/scheduler.md",
           "title": "Schedule future work"
         },
@@ -109,6 +117,10 @@
           "title": "Spawn CLI coding agents (ACP)"
         },
         {
+          "path": "guides/coder.md",
+          "title": "Verifier-grounded coder (coder_solve)"
+        },
+        {
           "path": "guides/fleet.md",
           "title": "Fleet (many agents on one host)"
         },
@@ -159,6 +171,10 @@
           "title": "Command palette (⌘K)"
         },
         {
+          "path": "guides/phone-access.md",
+          "title": "Access from your phone (LAN / Tailscale)"
+        },
+        {
           "path": "guides/headless.md",
           "title": "Run headless (API + A2A)"
         }
@@ -170,6 +186,10 @@
         {
           "path": "guides/deploy.md",
           "title": "Deploy via GHCR"
+        },
+        {
+          "path": "guides/deploy-docker.md",
+          "title": "Deploy in Docker (seed + UI override)"
         },
         {
           "path": "guides/releasing.md",
@@ -518,7 +538,7 @@
         },
         {
           "path": "adr/0048-settings-ia-two-scope-homes.md",
-          "title": "ADR 0048 — Settings IA: two scope-based homes (Host/App + Workspace)"
+          "title": "ADR 0048 — Settings & console-configuration IA (domain-first, scope-as-badge)"
         },
         {
           "path": "adr/0049-bundle-pin-lifecycle.md",
@@ -567,6 +587,38 @@
         {
           "path": "adr/0060-skill-progressive-disclosure.md",
           "title": "0060 — Skills: progressive disclosure (always-on index + load on demand)"
+        },
+        {
+          "path": "adr/0061-frontend-extension-registries.md",
+          "title": "0061 — Frontend extension registries (fork-safe console behavior seams)"
+        },
+        {
+          "path": "adr/0062-full-screen-document-viewer.md",
+          "title": "ADR 0062 — Full-screen document viewer surface"
+        },
+        {
+          "path": "adr/0063-keybinding-system.md",
+          "title": "ADR 0063 — Scoped, user-rebindable keybinding system"
+        },
+        {
+          "path": "adr/0064-coder-execution-grounded-code-solve.md",
+          "title": "0064 — `coder`: execution-grounded code-solve (the board's verifier-grounded coder)"
+        },
+        {
+          "path": "adr/0065-two-tier-instance-paths.md",
+          "title": "0065 — Two-tier instance paths (box / instance) + single resolution rule"
+        },
+        {
+          "path": "adr/0066-goal-trust-operator-channel.md",
+          "title": "0066 — Goal trust-gate Phase 2: federation token + operator `/api` channel"
+        },
+        {
+          "path": "adr/0067-standalone-watch-primitive.md",
+          "title": "0067 — Standalone `watch` primitive (many concurrent watches)"
+        },
+        {
+          "path": "adr/0068-developer-flags-and-panel.md",
+          "title": "0068 — Developer flags & the Developer panel (gating pre-release functionality)"
         },
         {
           "path": "adr/index.md",

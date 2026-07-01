@@ -33,11 +33,65 @@ fn pick_free_port() -> u16 {
 #[derive(Default)]
 struct SidecarProcess(Mutex<Option<CommandChild>>);
 
+/// Split a `:`-delimited PATH string and append each new, non-empty dir to `entries`,
+/// preserving order and skipping duplicates.
+#[cfg(target_os = "macos")]
+fn dedup_push_path(entries: &mut Vec<String>, raw: &str) {
+    for dir in raw.split(':') {
+        if !dir.is_empty() && !entries.iter().any(|e| e == dir) {
+            entries.push(dir.to_string());
+        }
+    }
+}
+
+/// Ask the user's interactive login shell for its `PATH`
+/// (`$SHELL -ilc 'printf %s "$PATH"'`). `None` if `$SHELL` is unknown, the shell
+/// errors, or it returns nothing — callers fall back to a fixed prefix.
+#[cfg(target_os = "macos")]
+fn login_shell_path() -> Option<String> {
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
+    let output = std::process::Command::new(&shell)
+        .args(["-ilc", "printf %s \"$PATH\""])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if path.is_empty() {
+        None
+    } else {
+        Some(path)
+    }
+}
+
+/// The PATH to hand the bundled sidecar on macOS. A GUI app launched from
+/// Finder/Dock/`launchd` only inherits `launchd`'s minimal PATH
+/// (`/usr/bin:/bin:/usr/sbin:/sbin`), so Homebrew (`/opt/homebrew/bin`), nvm, Volta,
+/// and asdf bin dirs — where `npx`, `node`, and ACP coding-agent adapters live — are
+/// invisible to the server, and a delegate launch command like `npx` fails with
+/// "binary not on PATH" (#1299). Compose: the login-shell PATH (covers nvm/Volta/asdf),
+/// then the common Homebrew/local dirs (belt-and-suspenders if shell resolution failed),
+/// then whatever the process already inherited (never drop a dir that already worked).
+#[cfg(target_os = "macos")]
+fn augmented_sidecar_path() -> String {
+    let mut entries: Vec<String> = Vec::new();
+    if let Some(shell_path) = login_shell_path() {
+        dedup_push_path(&mut entries, &shell_path);
+    }
+    dedup_push_path(&mut entries, "/opt/homebrew/bin:/usr/local/bin");
+    if let Ok(existing) = std::env::var("PATH") {
+        dedup_push_path(&mut entries, &existing);
+    }
+    entries.join(":")
+}
+
 /// Launch the bundled protoAgent server (console UI tier) as a sidecar.
 ///
 /// The frozen binary is read-only, so its writable state (live config,
 /// secrets, setup marker) is pointed at the per-user app-config dir via
-/// `PROTOAGENT_CONFIG_DIR`. Failures are logged, not fatal — the window still
+/// `PROTOAGENT_HOME` — the per-user dir becomes the instance root, so config
+/// lands under `<dir>/config`. Failures are logged, not fatal — the window still
 /// opens (and shows the API error) rather than the whole app refusing to boot.
 fn spawn_sidecar<R: Runtime>(app: &AppHandle<R>, port: u16) {
     let config_dir = match app.path().app_config_dir() {
@@ -60,7 +114,8 @@ fn spawn_sidecar<R: Runtime>(app: &AppHandle<R>, port: u16) {
         }
     };
     let port_arg = port.to_string();
-    let command = command
+    #[allow(unused_mut)] // `mut` is only used on the macOS PATH branch below.
+    let mut command = command
         // The desktop renders the React operator console, so run the server in
         // its 'console' UI tier (API + A2A + console, no Gradio) — ADR 0010.
         // (Was the now-deprecated --headless / PROTOAGENT_HEADLESS alias.)
@@ -69,7 +124,15 @@ fn spawn_sidecar<R: Runtime>(app: &AppHandle<R>, port: u16) {
         // So the sidecar exits if we die without a clean kill (the frozen
         // onefile's child process otherwise outlives us, holding its port).
         .env("PROTOAGENT_PARENT_PID", std::process::id().to_string())
-        .env("PROTOAGENT_CONFIG_DIR", config_dir.to_string_lossy().to_string());
+        .env("PROTOAGENT_HOME", config_dir.to_string_lossy().to_string());
+
+    // A Finder/Dock/launchd launch strips PATH down to launchd's minimal set, hiding
+    // Homebrew/nvm/Volta/asdf — so delegate launch commands (`npx`, ACP adapters) fail
+    // with "binary not on PATH" (#1299). Hand the sidecar the user's real PATH.
+    #[cfg(target_os = "macos")]
+    {
+        command = command.env("PATH", augmented_sidecar_path());
+    }
 
     let (mut rx, child) = match command.spawn() {
         Ok(pair) => pair,
@@ -484,13 +547,30 @@ pub fn run() {
             let init = format!(
                 "window.__PROTOAGENT_API_BASE__ = \"http://127.0.0.1:{port}\";"
             );
+            // A `target="_blank"` / `window.open` from a (sandboxed) plugin iframe asks
+            // the host to spawn a child window. We don't host child windows, so without
+            // a handler WKWebView silently drops the request and the click does nothing
+            // — e.g. the GitHub plugin's PR/issue links were dead in the desktop app.
+            // Open external http(s) links in the system browser (shell:allow-open) and
+            // deny the in-app window. (Browsers handle this implicitly via allow-popups;
+            // the desktop shell has to do it explicitly.)
+            let link_opener = app.handle().clone();
             let mut win = WebviewWindowBuilder::new(app, "main", WebviewUrl::default())
                 .title("protoAgent")
                 .inner_size(1280.0, 820.0)
                 .min_inner_size(980.0, 640.0)
                 .resizable(true)
                 .center()
-                .initialization_script(&init);
+                .initialization_script(&init)
+                .on_new_window(move |url, _features| {
+                    let target = url.as_str();
+                    if target.starts_with("http://") || target.starts_with("https://") {
+                        if let Err(e) = link_opener.shell().open(target, None) {
+                            log::error!("desktop: failed to open external link {target}: {e}");
+                        }
+                    }
+                    tauri::webview::NewWindowResponse::Deny
+                });
             // Invisible title bar (macOS): no opaque chrome — content fills the
             // frame and the native traffic lights float top-left. The web shell
             // restores window-dragging + insets its topbar for the lights

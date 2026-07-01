@@ -65,6 +65,11 @@ def ask_human(question: str) -> str:
     from this call so you can continue. Do NOT use it for narration or status —
     only for an answer you must wait on. Phrase ``question`` as a clear,
     self-contained ask.
+
+    Autonomous turns (scheduled / inbox / background) have no operator watching the
+    chat, so don't block on a human here — prefer proceeding with your best judgment
+    and stating the assumption. (If you do ask on such a turn, the runtime
+    auto-answers it so the turn can't deadlock.)
     """
     # LangGraph HITL: interrupt() checkpoints the graph at this exact point. On
     # resume (Command(resume=answer)) it returns the operator's reply. Requires a
@@ -80,17 +85,47 @@ def request_user_input(title: str, steps: list[dict], description: str = "") -> 
     """Ask the operator for **structured** input via a form dialog, then continue
     with their response. Use when you need specific values, choices, credentials,
     or config — anything better captured as form fields than free text. The task
-    pauses (surfaced as ``input-required``) until they submit; their response (a
-    JSON object keyed by field name) is returned from this call.
+    pauses (surfaced as ``input-required``) until they submit; their response (the
+    submitted fields, as a JSON object) is returned from this call.
 
-    ``steps`` is a list of form steps — multiple steps render as a wizard. Each
-    step is ``{"schema": <JSON Schema draft-07 of the fields>, "uiSchema"?: <layout
-    hints>, "title"?: str, "description"?: str}``. Phrase the ask clearly and only
-    request fields you actually need. For a single free-text or yes/no question,
-    use ``ask_human`` instead.
+    ``steps`` is a list of form steps. Multiple steps render as a sequential
+    **wizard** (one step per screen with Back / Next and a progress indicator); the
+    operator advances through them and the final step submits every step's answers
+    together as one object. Use several steps to pace a longer series of questions;
+    use one step for a simple form. Each step is ``{"schema": <JSON Schema draft-07
+    of the step's fields>, "title"?: str, "description"?: str}`` — supply at least
+    one step that defines fields.
+
+    Field types (per property in a step's ``schema.properties``):
+    - text / number / boolean → ``{"type": "string"|"number"|"integer"|"boolean"}``;
+      add ``"format": "textarea"`` for multi-line text.
+    - **single-choice cards** (preferred for "pick one of these") →
+      ``{"type": "string", "oneOf": [{"const": "pg", "title": "Postgres",
+      "description": "Durable, multi-writer"}, {"const": "sqlite", "title": "SQLite",
+      "description": "Zero-config"}]}``. Each option shows its label + description as
+      a selectable card. (A bare ``"enum": [...]`` renders as a plain dropdown.)
+    - **multi-choice cards** ("pick any") → wrap the same options in an array:
+      ``{"type": "array", "items": {"oneOf": [...]}}`` → the value is a list.
+    Mark a field required via the step schema's ``"required": [...]``; required
+    fields gate Next / Submit.
+
+    Phrase the ask clearly and only request fields you actually need. For a single
+    free-text or yes/no question, use ``ask_human`` instead. As with ``ask_human``,
+    don't block on this in an autonomous turn — there may be no operator to submit
+    the form (the runtime auto-answers it there).
     """
     import json
     from langgraph.types import interrupt
+
+    # A form with no steps renders as a bare free-text box (the console treats zero-step
+    # payloads as an ask_human prompt), silently dropping the structured contract — guide
+    # the model back instead of degrading. The LLM reads this and retries.
+    if not steps:
+        return (
+            "Error: request_user_input needs at least one form step. Pass "
+            'steps=[{"schema": {"type": "object", "properties": {…}, "required": […]}}], '
+            "or use ask_human for a single free-text or yes/no question."
+        )
 
     response = interrupt(
         {
@@ -107,11 +142,16 @@ def request_user_input(title: str, steps: list[dict], description: str = "") -> 
 
 @tool
 def show_component(component: str, props: dict, title: str = "") -> str:
-    """Render a structured UI component inline in the chat (ADR 0051).
+    """Render structured data as a typed widget INLINE in the chat (ADR 0051).
 
-    Use this to present structured data as a real widget instead of a markdown blob —
-    a comparison table, a status/metrics block, a plan/timeline. Data-only and safe;
-    for free-form generated HTML use an artifact instead.
+    Pick this over a markdown blob when the data fits a curated shape — a comparison
+    ``table``, a ``keyvalue`` status/metrics block, or a ``timeline`` of steps. It renders
+    inline in your answer, data-only and safe (no sandbox).
+
+    For free-form or custom-rendered visuals — a chart, a Mermaid diagram, bespoke
+    HTML/React/SVG — use ``show_artifact`` instead (it renders generated CODE in a separate
+    sandboxed panel). Rule of thumb: a data SHAPE (table / metrics / steps) → this tool;
+    a generated VISUAL → an artifact.
 
     Args:
         component: one of ``"table"``, ``"keyvalue"``, ``"timeline"``.
@@ -247,9 +287,16 @@ async def web_search(query: str, max_results: int = 5) -> str:
     except ImportError:
         return "Error: the 'ddgs' package is not installed. Add `ddgs>=9.0` to requirements.txt and rebuild the image."
 
-    try:
+    # ddgs.text() is a SYNCHRONOUS network call — running it inline would block the asyncio
+    # event loop for the whole search. Under a fan-out (e.g. task_batch's parallel
+    # researchers) those blocking searches serialise on the loop and starve everything else,
+    # incl. the cancel/tasks API. Offload to a worker thread so the loop stays responsive.
+    def _run_search() -> list:
         with DDGS() as ddgs:
-            results = list(ddgs.text(query, max_results=max_results))
+            return list(ddgs.text(query, max_results=max_results))
+
+    try:
+        results = await asyncio.to_thread(_run_search)
     except Exception as e:
         return f"Error: DuckDuckGo search failed: {e}"
 
@@ -337,7 +384,10 @@ async def fetch_url(url: str, max_chars: int = _MAX_OUTPUT_CHARS) -> str:
     ctype = (resp.headers.get("content-type") or "").lower()
 
     if "html" in ctype or content.lstrip().startswith(b"<"):
-        text = _extract_text_from_html(content)
+        # BeautifulSoup parsing of up to _MAX_FETCH_BYTES (2MB) is CPU-heavy and synchronous;
+        # inline it would block the event loop per fetch. Offload to a thread so concurrent
+        # fetches (and the rest of the server) keep making progress.
+        text = await asyncio.to_thread(_extract_text_from_html, content)
     else:
         try:
             text = content.decode(resp.encoding or "utf-8", errors="replace")
@@ -412,6 +462,7 @@ SCHEDULER_TOOL_NAMES: tuple[str, ...] = (
 )
 MEMORY_TOOL_NAMES: tuple[str, ...] = (
     "memory_ingest",
+    "knowledge_ingest",
     "memory_recall",
     "memory_list",
     "memory_stats",
@@ -454,8 +505,49 @@ def _build_inbox_tools(inbox_store) -> list:
     return [check_inbox]
 
 
-def _build_memory_tools(knowledge_store) -> list:
-    """Bind memory tools to a ``KnowledgeStore``. Returns a list."""
+class _KnowledgeIngestError(Exception):
+    """An expected, user-legible ``knowledge_ingest`` failure (missing dependency,
+    unsupported type, no text, no such file). Its message is safe to show verbatim —
+    the inline path returns it; a background work job settles ``failed`` with it."""
+
+
+# A small local text/Markdown file ingests inline (instant); everything else — any URL
+# fetch, PDF, or audio/video transcription — goes to a background job (ADR 0050) so it
+# never blocks the chat turn.
+_INLINE_INGEST_EXTS = frozenset(
+    {".txt", ".text", ".log", ".md", ".markdown", ".mdown", ".mkd", ".mdx", ".rst", ".csv", ".tsv"}
+)
+_INLINE_INGEST_MAX_BYTES = 64 * 1024
+
+
+def _ingest_should_inline(src: str, is_url: bool) -> bool:
+    """True when a source is cheap enough to ingest on the turn (a small local text/
+    Markdown file); False for URLs and anything that fetches / transcribes / parses."""
+    if is_url:
+        return False
+    from pathlib import Path
+
+    try:
+        p = Path(src).expanduser()
+        if not p.is_file():
+            return True  # let the inline path return the clean "no such file" error at once
+        return p.suffix.lower() in _INLINE_INGEST_EXTS and p.stat().st_size <= _INLINE_INGEST_MAX_BYTES
+    except OSError:
+        return True
+
+
+def _build_memory_tools(knowledge_store, graph_config=None, background_mgr=None) -> list:
+    """Bind memory tools to a ``KnowledgeStore``. Returns a list.
+
+    ``graph_config`` (the ``LangGraphConfig``) is threaded so ``knowledge_ingest``
+    can build the gateway speech-to-text / vision functions for audio/video/image
+    sources. It's optional — without it those media paths report "not configured"
+    and the text/URL/PDF paths work unchanged.
+
+    ``background_mgr`` (ADR 0050) lets ``knowledge_ingest`` run a slow source (any URL
+    fetch or media transcription) as a detached background job instead of blocking the
+    turn. Optional — without it the tool ingests inline (blocking, but correct).
+    """
 
     @tool
     async def memory_ingest(
@@ -486,6 +578,141 @@ def _build_memory_tools(knowledge_store) -> list:
         if chunk_id is None:
             return "Error: failed to store chunk (knowledge store unavailable)."
         return f"Stored chunk {chunk_id} in {domain!r}."
+
+    async def _do_ingest(src: str, dom: str, title: str | None, is_url: bool) -> str:
+        """Run the ingestion pipeline for one source and store it; return a one-line
+        summary. Raises ``_KnowledgeIngestError`` (legible message) on an expected
+        failure. Shared by the inline path and the background work job."""
+        import asyncio
+        from pathlib import Path
+
+        from ingestion import (
+            MissingDependency,
+            UnsupportedSource,
+            extract_bytes,
+            extract_url,
+        )
+        from knowledge import add_document
+
+        # Gateway STT/vision for media — None if no model is configured, which makes
+        # audio/video/image raise a clean "not configured" error while text/URL/PDF/
+        # YouTube paths are unaffected.
+        transcribe = describe = None
+        if graph_config is not None:
+            try:
+                from graph.llm import create_describe_image_fn, create_transcribe_fn
+
+                transcribe = create_transcribe_fn(graph_config)
+                describe = create_describe_image_fn(graph_config)
+            except Exception:  # noqa: BLE001 — media stays optional; text/URL unaffected
+                pass
+
+        try:
+            if is_url:
+                result = await asyncio.to_thread(extract_url, src, transcribe=transcribe)
+                origin = src
+            else:
+                path = Path(src).expanduser()
+                if not path.is_file():
+                    raise _KnowledgeIngestError(
+                        f"No such file: {src} — pass an http(s) URL or an existing local file path."
+                    )
+                data = await asyncio.to_thread(path.read_bytes)
+                result = await asyncio.to_thread(
+                    extract_bytes, path.name, data, None, transcribe=transcribe, describe=describe
+                )
+                origin = str(path)
+        except MissingDependency as exc:
+            raise _KnowledgeIngestError(
+                f"Can't ingest that source — a required dependency or model isn't available: {exc}"
+            ) from exc
+        except UnsupportedSource as exc:
+            raise _KnowledgeIngestError(f"Unsupported source type: {exc}") from exc
+        except _KnowledgeIngestError:
+            raise
+        except Exception as exc:  # noqa: BLE001 — surface extraction failure, never crash
+            raise _KnowledgeIngestError(f"Extraction failed: {exc}") from exc
+
+        heading = (title or "").strip() or result.title or None
+        ids = await asyncio.to_thread(
+            lambda: add_document(
+                knowledge_store,
+                result.text,
+                domain=dom,
+                heading=heading,
+                source=origin,
+                source_type=result.source_type,
+            )
+        )
+        if not ids:
+            raise _KnowledgeIngestError("Nothing ingested — no text could be extracted from that source.")
+        label = heading or origin
+        return f"Ingested {label!r} ({result.source_type}, {len(result.text)} chars) → {len(ids)} chunk(s) in {dom!r}."
+
+    @tool
+    async def knowledge_ingest(
+        source: str,
+        domain: str = "general",
+        title: str | None = None,
+        state: Annotated[Any, InjectedState] = None,
+    ) -> str:
+        """Fetch, extract, and store a URL or local file into long-term knowledge.
+
+        Unlike ``memory_ingest`` (which stores text you already have), this runs the
+        full ingestion pipeline: it pulls the SOURCE, turns it into text, and chunks +
+        embeds it for recall. Reach for this the moment the operator hands you a link or
+        a file to "remember", "read", "ingest", "add to the knowledge base", or
+        "summarize and keep". Do NOT web_search / fetch_url a YouTube or media link
+        yourself — this is the only path that gets a transcript or decodes a file.
+
+        Handles URLs (web articles + YouTube transcripts), documents (PDF, text,
+        Markdown), media (audio + video, transcribed via the gateway) and images
+        (described via the gateway vision model).
+
+        **Anything that fetches over the network or transcribes media runs in the
+        BACKGROUND** (ADR 0050): the call returns immediately with a job id and you're
+        notified when it finishes indexing, so a long video never blocks the
+        conversation. Only a small local text/Markdown file ingests inline (instant).
+        Tell the operator it's underway — do not wait or poll for it.
+
+        Args:
+            source: an ``http(s)`` URL (including YouTube) OR a local file path.
+            domain: knowledge bucket to file it under (default ``"general"``).
+            title: optional heading; otherwise the source's own title is used.
+
+        Returns a one-line summary when it ran inline, or a "started in the background"
+        acknowledgement (with the job id) when the work was detached.
+        """
+        from pathlib import Path
+
+        src = (source or "").strip()
+        if not src:
+            return "Error: provide a URL or a local file path to ingest."
+        dom = (domain or "general").strip() or "general"
+        is_url = src.lower().startswith(("http://", "https://"))
+
+        # Fast local text ingests inline; a network fetch / media transcription (which
+        # can take minutes) becomes a background job so it never blocks the turn. With no
+        # background manager wired, fall back to inline (blocking, but correct).
+        if background_mgr is None or _ingest_should_inline(src, is_url):
+            try:
+                return await _do_ingest(src, dom, title, is_url)
+            except _KnowledgeIngestError as exc:
+                return str(exc)
+
+        label = (title or "").strip() or (src if is_url else Path(src).expanduser().name)
+        job_id = await background_mgr.spawn_work(
+            origin_session=_session_id_from(state) or "",
+            kind="ingest",
+            description=f"Ingest {label}",
+            detail=src,
+            work=lambda: _do_ingest(src, dom, title, is_url),
+        )
+        return (
+            f"Ingesting {label!r} into knowledge (domain {dom!r}) in the background — job {job_id}. "
+            "It runs on its own and I'll report the result back to this conversation when it's "
+            "indexed; no need to wait or poll."
+        )
 
     @tool
     async def memory_recall(query: str, k: int = 5) -> str:
@@ -565,7 +792,7 @@ def _build_memory_tools(knowledge_store) -> list:
             return f"No memory chunk #{cid} found — nothing deleted."
         return f"Forgot memory chunk #{cid}." + (f" ({reason})" if reason else "")
 
-    return [memory_ingest, memory_recall, memory_list, memory_stats, forget_memory]
+    return [memory_ingest, knowledge_ingest, memory_recall, memory_list, memory_stats, forget_memory]
 
 
 # ── scheduler tools ──────────────────────────────────────────────────────────
@@ -865,6 +1092,132 @@ def _build_set_goal_tool():
     return set_goal
 
 
+def _build_goal_plan_tool():
+    """The agent records its running plan for the active goal (goal loop). Replaces the
+    retired ``<goal_plan>`` continuation tag — the plan is persisted to the goal state /
+    plan artifact and fed back into the next continuation prompt."""
+
+    @tool
+    def update_goal_plan(
+        plan: str,
+        state: Annotated[Any, InjectedState] = None,
+    ) -> str:
+        """Record/refresh your running plan for THIS session's active goal.
+
+        Call this during a goal continuation turn to carry a coherent plan across
+        iterations (what's done, what's next, what failed) — it is persisted and fed
+        back to you in the next continuation. Returns a message; it's a harmless no-op
+        when goal mode is off or no goal is active.
+        """
+        from runtime.state import STATE
+
+        if STATE.goal_controller is None:
+            return "Goal mode is not enabled."
+        session_id = _session_id_from(state)  # injected graph state, not the contextvar
+        if not session_id:
+            return "No active session — update_goal_plan can only run during a turn."
+        _ok, msg = STATE.goal_controller.record_plan(session_id, plan)
+        return msg
+
+    return update_goal_plan
+
+
+def _build_abandon_goal_tool():
+    """The agent explicitly gives up on the active goal (goal loop). Replaces the retired
+    ``<goal_unachievable/>`` tag — recorded on the goal state and honoured AFTER the
+    verifier runs, so a goal the world already satisfies still finishes ``achieved``."""
+
+    @tool
+    def abandon_goal(
+        reason: str,
+        state: Annotated[Any, InjectedState] = None,
+    ) -> str:
+        """Flag THIS session's active goal as unachievable and stop the goal loop.
+
+        Call this only when you determine the goal is impossible or out of scope, with a
+        one-line `reason`. The goal is finished ``unachievable`` after your turn — unless
+        the verifier finds it already met, which wins. Returns a message; it's a harmless
+        no-op when goal mode is off or no goal is active.
+        """
+        from runtime.state import STATE
+
+        if STATE.goal_controller is None:
+            return "Goal mode is not enabled."
+        session_id = _session_id_from(state)  # injected graph state, not the contextvar
+        if not session_id:
+            return "No active session — abandon_goal can only run during a turn."
+        _ok, msg = STATE.goal_controller.request_abandon(session_id, reason)
+        return msg
+
+    return abandon_goal
+
+
+def _build_watch_tools():
+    """Watch primitive (ADR 0067) — the agent supervises MANY external conditions at once.
+    Each watch is polled out-of-band; on met it can run a follow-up prompt back in this
+    session. Plugin-verifier only (like set_goal): the agent can't open a shell/eval watch."""
+
+    @tool
+    def create_watch(
+        condition: str,
+        check: str,
+        check_args: dict | None = None,
+        run_prompt: str = "",
+        watch_id: str | None = None,
+        state: Annotated[Any, InjectedState] = None,
+    ) -> str:
+        """Create a WATCH: poll `condition` on a cadence (ground-truthed by the plugin verifier
+        `check`), and when it's met run `run_prompt` (if given) as a follow-up turn in THIS
+        session. Use watches to supervise many things at once (a deploy, CI, a metric) — each a
+        separate watch, all polled in parallel. Only plugin verifiers are allowed; shell/test/
+        data watches are operator-only. `watch_id` defaults to a slug of the condition (pass one
+        to hold two watches on the same condition). Returns the watch status, or an error.
+        """
+        from runtime.state import STATE
+
+        if STATE.watch_controller is None:
+            return "Watch mode is not available."
+        session_id = _session_id_from(state)  # injected graph state, not the contextvar
+        from graph.goals.verifiers import plugin_verifier_names
+
+        known = plugin_verifier_names()
+        if check not in known:
+            avail = ", ".join(known) if known else "(none registered — enable a plugin that contributes a verifier)"
+            return f"Error: unknown plugin verifier {check!r}. Available verifiers: {avail}."
+        ok, msg, _w = STATE.watch_controller.create(
+            condition=condition,
+            verifier={"type": "plugin", "check": check, "args": check_args or {}},
+            watch_id=watch_id,
+            run_prompt=run_prompt or "",
+            run_session=session_id or "",
+            trusted=False,
+        )
+        return msg
+
+    @tool
+    def list_watches() -> str:
+        """List every watch for this agent (id · status · condition · verifier). Returns a
+        human-readable summary, or a note when there are none."""
+        from runtime.state import STATE
+
+        if STATE.watch_controller is None:
+            return "Watch mode is not available."
+        watches = STATE.watch_controller.list_watches()
+        return "\n".join(w.status_line() for w in watches) if watches else "No watches."
+
+    @tool
+    def clear_watch(watch_id: str) -> str:
+        """Remove a watch by its id (from list_watches). Returns whether it existed."""
+        from runtime.state import STATE
+
+        if STATE.watch_controller is None:
+            return "Watch mode is not available."
+        cleared = STATE.watch_controller.clear(watch_id)
+        return f"Watch {watch_id!r} cleared." if cleared else f"No watch {watch_id!r} to clear."
+
+    return [create_watch, list_watches, clear_watch]
+
+
 @tool
 def load_skill(name: str) -> str:
     """Load the full step-by-step procedure for a skill.
@@ -1060,25 +1413,50 @@ def _build_curation_tools():
     return [recent_activity, list_skills, save_skill]
 
 
-def get_all_tools(knowledge_store=None, scheduler=None, inbox_store=None, tasks_store=None, goal_enabled=False):
+# Lead-only HITL tools: each pauses the lead A2A turn via a LangGraph interrupt that only the
+# lead turn's runner resumes. A subagent runs on a checkpointer-less graph, so binding one
+# would fail opaquely mid-delegation — graph.agent hard-denies these from every subagent's
+# tool set (``_subagent_tools``) regardless of its allowlist. Keep this in sync if a new
+# interrupt-based tool is added.
+HITL_TOOL_NAMES = frozenset({"ask_human", "request_user_input"})
+
+
+def get_all_tools(
+    knowledge_store=None,
+    scheduler=None,
+    inbox_store=None,
+    tasks_store=None,
+    goal_enabled=False,
+    graph_config=None,
+    background_mgr=None,
+):
     """Return every LangChain tool the lead agent + subagents can use.
 
     Optional dependencies:
 
     - ``knowledge_store`` enables the memory tools (memory_ingest,
-      memory_recall, memory_list, memory_stats).
+      knowledge_ingest, memory_recall, memory_list, memory_stats).
     - ``scheduler`` enables the scheduler tools (schedule_task,
       list_schedules, cancel_schedule). Accepts any backend that
       implements ``scheduler.interface.SchedulerBackend``.
+    - ``graph_config`` (the ``LangGraphConfig``) lets ``knowledge_ingest``
+      build the gateway STT/vision functions for audio/video/image sources.
+      Optional — without it, only the text/URL/PDF/YouTube ingest paths work.
+    - ``background_mgr`` (ADR 0050) lets ``knowledge_ingest`` run a slow
+      source (URL fetch / media transcription) as a detached background job
+      instead of blocking the turn. Optional — without it it ingests inline.
 
     Pass ``None`` to disable either subsystem — the lead agent runs
     fine with just the four keyless general tools.
     """
-    # ask_human is a lead-agent HITL tool — it pauses the A2A turn via a
-    # LangGraph interrupt that only the lead turn's runner resumes. Subagents
-    # (run outside that runner) must not get it, so it's gated by allowlist:
-    # present in the full set for the lead agent, absent from subagent allowlists.
-    tools = [current_time, calculator, web_search, fetch_url, ask_human, request_user_input, show_component, load_skill]
+    # ask_human AND request_user_input are lead-agent HITL tools (HITL_TOOL_NAMES) — each
+    # pauses the A2A turn via a LangGraph interrupt that only the lead turn's runner resumes.
+    # Subagents (run outside that runner, on a graph with no checkpointer) must not get either:
+    # they're absent from every subagent allowlist in graph/subagents/config.py AND hard-denied
+    # in graph.agent._subagent_tools, so a fork can't enable one via a tools list either.
+    # show_component (inline component rendering, ADR 0051 / #1323): table/keyvalue/timeline
+    # widgets rendered inline in chat by the console's extensible component registry.
+    tools = [current_time, calculator, web_search, fetch_url, ask_human, request_user_input, load_skill, show_component]
     # GitHub read tools (PRs/issues/commits) moved to the first-party `github`
     # plugin (opt-in) — not everyone needs them. Enable with plugins.enabled: [github].
     # Notes tools now ship with the first-party `notes` plugin (ADR 0034 S4):
@@ -1092,7 +1470,7 @@ def get_all_tools(knowledge_store=None, scheduler=None, inbox_store=None, tasks_
     # 0018/0019) — an installed comms plugin registers its tools when a token is set;
     # nothing to wire here.
     if knowledge_store is not None:
-        tools.extend(_build_memory_tools(knowledge_store))
+        tools.extend(_build_memory_tools(knowledge_store, graph_config, background_mgr))
     if scheduler is not None:
         tools.extend(_build_scheduler_tools(scheduler))
     if inbox_store is not None:
@@ -1101,6 +1479,9 @@ def get_all_tools(knowledge_store=None, scheduler=None, inbox_store=None, tasks_
         tools.extend(_build_task_tools(tasks_store))
     if goal_enabled:
         tools.append(_build_set_goal_tool())  # ADR 0028 — agent owns a plugin-verified goal
+        tools.append(_build_goal_plan_tool())  # goal loop — record running plan (retired <goal_plan>)
+        tools.append(_build_abandon_goal_tool())  # goal loop — explicit give-up (retired <goal_unachievable>)
+        tools.extend(_build_watch_tools())  # ADR 0067 — many concurrent supervised watches
     # ADR 0054 — curation tools for the dream/distill subagents (read-only activity
     # + skill inventory + additive-only skill creation). Self-gate on STATE at call
     # time; present in the full set so the subagent allowlists can pick them up.

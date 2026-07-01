@@ -23,6 +23,7 @@ class AppState:
     checkpoint_path: Any = None
     checkpoint_prune_task: Any = None
     monitor_goals_task: Any = None  # ADR 0030 monitor-goal cadence loop
+    watch_task: Any = None  # ADR 0067 watch cadence loop
     # Stores / registries bound into the active graph.
     knowledge_store: Any = None
     skills_index: Any = None
@@ -43,13 +44,17 @@ class AppState:
     mcp_tools: list = field(default_factory=list)
     mcp_meta: list = field(default_factory=list)
     plugin_tools: list = field(default_factory=list)
+    # tool name -> owning plugin display name (Tools tab grouping); mirrors plugin_tools.
+    plugin_tool_owner: dict = field(default_factory=dict)
     plugin_skill_dirs: list = field(default_factory=list)
     plugin_middleware: list = field(default_factory=list)  # resolved AgentMiddleware instances (ADR 0032)
     plugin_late_tool_factories: list = field(default_factory=list)  # (all_tools, config) -> tool|list (late seam)
     plugin_workflow_dirs: list = field(default_factory=list)  # *.yaml recipe dirs (ADR 0027)
     plugin_a2a_skills: list = field(default_factory=list)  # A2A card skills from plugins (#570)
+    plugin_chat_commands: dict = field(default_factory=dict)  # token -> handler; user-only /<name> control commands
     thread_id_resolver: object = None  # (request_metadata, session_id) -> str (#571)
     plugin_routers: list = field(default_factory=list)
+    plugin_public_paths: list = field(default_factory=list)  # manifest auth-exempt prefixes
     # The live FastAPI app + the (plugin_id, prefix) keys already mounted on it —
     # lets a config reload hot-mount a newly-enabled plugin's routes (no restart).
     fastapi_app: object = None
@@ -64,6 +69,7 @@ class AppState:
     background_mgr: Any = None  # ADR 0050 — detached background subagent jobs
     cache_warmer: Any = None
     goal_controller: Any = None
+    watch_controller: Any = None  # ADR 0067 — standalone watch primitive
     main_loop: Any = None
     # The port this process actually bound to (populated by _main).
     active_port: int = 7870

@@ -51,25 +51,20 @@ def _resolve_plugin_config(data: dict, secrets: dict, config_dir: Path) -> dict:
     For every plugin that claims a top-level section, merge: manifest defaults ⊕
     the (secret-stripped) YAML section ⊕ the secrets overlay for its secret keys.
     Best-effort — never breaks config load. Returns ``{section: resolved_dict}``.
+
+    Plugins live at ``instance_paths().plugins_dir`` — the instance tier's own
+    plugins root (a sibling of ``config/``, honoring ``PROTOAGENT_PLUGINS_DIR`` and
+    the config ``plugins.dir`` override). No de-scope dance: the instance root IS
+    the scoped leaf, so config and plugins share one tier. (``config_dir`` is kept
+    for call compatibility but no longer determines the plugins location.)
     """
     try:
+        from infra.paths import instance_paths
+
         from graph.plugins.pconfig import discover_plugin_config, plugin_roots_from
 
         plugins = data.get("plugins") or {}
-        # Discover installed plugins from the UNSCOPED live plugins dir. A
-        # PROTOAGENT_INSTANCE-scoped config lives at `<base>/<instance_id>/`, but
-        # installs are unscoped under `<base>/plugins` (and the loader discovers them
-        # there). So de-scope the config dir — drop the instance-id leaf — before
-        # computing roots; otherwise a scoped instance loads its installed plugins but
-        # never resolves their config sections (db_path/settings silently default,
-        # breaking per-instance board isolation — ADR 0055 P0). De-scoping only when
-        # the dir IS the instance leaf keeps the default + tests (custom config_dir)
-        # unchanged.
-        from infra.paths import instance_id as _instance_id
-
-        iid = _instance_id()
-        live_dir = config_dir.parent if (iid and config_dir.name == iid) else config_dir
-        roots = plugin_roots_from(live_dir, str(plugins.get("dir") or ""))
+        roots = plugin_roots_from(instance_paths().plugins_dir, str(plugins.get("dir") or ""))
         schemas = discover_plugin_config(
             roots,
             set(plugins.get("enabled") or []),
@@ -146,22 +141,49 @@ def _env_default(name: str, default, cast=str):
         return default
 
 
+def _host_scoped_fields():
+    """The host-scoped (ADR 0047 ``scope=="host"``) settings fields — the single
+    source for both the host-layer filter and the shadow check, so they can't drift."""
+    from graph.settings_schema import FIELDS
+
+    return [f for f in FIELDS if getattr(f, "scope", "agent") == "host"]
+
+
 def _filter_to_host_keys(raw: dict) -> dict:
     """Keep only the host-scoped FIELDS keys present in a raw host-config doc.
 
     The Host file can set box-shared defaults but **cannot inject agent-only
     settings** (ADR 0047 D1/D4) — anything outside the ``scope=="host"`` set is
     dropped here before the merge."""
-    from graph.settings_schema import FIELDS
-
     out: dict = {}
-    for f in FIELDS:
-        if getattr(f, "scope", "agent") != "host":
-            continue
+    for f in _host_scoped_fields():
         found, val = _get_dotted(raw, f.key)
         if found:
             _set_dotted(out, f.key, val)
     return out
+
+
+def _warn_shadowed_host_keys(host_layer: dict, agent_data: dict) -> None:
+    """Warn when the agent leaf overrides a host-scoped (box-shared) key with a
+    different, non-empty value. The agent wins (ADR 0047), so the box default in
+    ``host-config.yaml`` is silently *shadowed* — otherwise invisible until you read
+    the merge (issue #1459). Best-effort: a provenance warning must never break boot."""
+    try:
+        for f in _host_scoped_fields():
+            h_found, h_val = _get_dotted(host_layer, f.key)
+            a_found, a_val = _get_dotted(agent_data, f.key)
+            if h_found and a_found and a_val not in (None, "") and a_val != h_val:
+                log.warning(
+                    "config: agent leaf overrides host-scoped %r — the box default %r is "
+                    "shadowed by the agent value %r, which wins. Remove %r from the agent "
+                    "config (langgraph-config.yaml) to use the box default.",
+                    f.key,
+                    h_val,
+                    a_val,
+                    f.key,
+                )
+    except Exception:  # noqa: BLE001 — never let a provenance warning break config load
+        pass
 
 
 def _load_host_layer() -> dict:
@@ -357,7 +379,6 @@ class LangGraphConfig:
     goal_enabled: bool = True
     goal_max_iterations: int = 8  # continuation budget per goal
     goal_no_progress_limit: int = 3  # identical verifier evidence N times -> unachievable
-    goal_monitor_interval: int = 60  # seconds between out-of-band monitor-goal checks (ADR 0030)
     goal_eval_model: str = ""  # blank = main model (llm verifier / fuzzy goals)
     goal_verify_timeout: float = 120.0  # seconds for command/test/ci verifiers
 
@@ -390,6 +411,11 @@ class LangGraphConfig:
     # as-is; video has its audio track pulled by ffmpeg first. Blank disables
     # audio/video ingestion (they error with a clear message).
     transcribe_model: str = "whisper-1"
+    # Vision model used to DESCRIBE attached images for a text-only chat model (#1381) —
+    # the screenshot is sent to this vision-capable gateway model, its description + any
+    # transcribed text is inlined as context the chat model can read. Blank disables image
+    # attachments on non-vision models (they error with a clear "switch models" message).
+    image_describe_model: str = ""
     # Semantic recall (ADR 0021): when True, the knowledge store is the
     # HybridKnowledgeStore (FTS5 + vector embeddings via `embed_model`, fused
     # with RRF). On by default — semantic recall finds paraphrases keyword search
@@ -544,6 +570,12 @@ class LangGraphConfig:
     # LangGraph loop (default). "acp:<agent>" (e.g. "acp:codex", "acp:claude") = an
     # external coding agent drives the turn over ACP, mounting the operator MCP bus.
     agent_runtime: str = "native"
+    # ACP launch overrides (ADR 0033) — per-agent ``{command, args}`` from the YAML
+    # ``acp.agents`` block, e.g. ``acp: {agents: {claude: {command: claude-agent-acp}}}``.
+    # ``runtime.acp_runtime.adapter_for`` reads this to override the built-in default
+    # adapter (an ``npx -y …`` fetch) with a locally-installed binary. Empty = use the
+    # defaults. Not a settings-UI field — an advanced, machine-local launch knob.
+    acp_agents: dict = field(default_factory=dict)
 
     # Plugins — drop-in packages (manifest + register()) that contribute tools
     # and bundled skills. Run IN-PROCESS with the agent's privileges, so a
@@ -604,6 +636,14 @@ class LangGraphConfig:
     # Kept in YAML rather than env so the drawer can manage it.
     auth_token: str = ""
 
+    # Optional federation token (ADR 0066) — a SECOND credential handed to
+    # semi-trusted A2A peers. It reaches only the /a2a + /v1 consumer surfaces;
+    # the /api operator surface (plugin install, config rewrite, subagent runs,
+    # the operator goal set-path) is denied it. Blank = no federation tier
+    # (single-token mode; every bearer holder is the operator). Env fallback:
+    # A2A_FEDERATION_TOKEN.
+    federation_token: str = ""
+
     # OS-level autostart — ``True`` means the server launches on user
     # login (macOS LaunchAgent today; Linux/Windows TBD). Managed by
     # ``autostart.py``; the field here is the source of truth for
@@ -655,6 +695,12 @@ class LangGraphConfig:
     filesystem_enabled: bool = True
     filesystem_allow_run: bool = True
     filesystem_run_requires_approval: bool = True
+    # Escape hatch (off by default per-turn): when True (default), an operator may toggle
+    # bypass-permissions mode per-turn via A2A ``message.metadata.bypass_permissions`` to
+    # auto-approve ``run_command`` — for trusted-autonomous / container runs. Set False to
+    # FORBID bypass entirely regardless of caller metadata (locked-down hosts); the approval
+    # gate is then always enforced.
+    filesystem_bypass_allowed: bool = True
     filesystem_projects: list[dict] = field(default_factory=list)
 
     # Egress allowlist (ADR 0008) — deny-by-default outbound-host allowlist
@@ -716,6 +762,9 @@ class LangGraphConfig:
 
         # Host is the base; the agent leaf overlays it (agent wins). No host layer ⇒
         # merged is exactly the agent doc — the pre-cascade input, unchanged.
+        if host_layer:
+            # Surface silent shadowing of a box default by the agent leaf (issue #1459).
+            _warn_shadowed_host_keys(host_layer, agent_data)
         merged = _deep_merge_dicts(copy.deepcopy(host_layer), agent_data) if host_layer else agent_data
 
         secrets = _load_secrets_doc(p.parent)
@@ -753,6 +802,7 @@ class LangGraphConfig:
         skills = data.get("skills", {})
         mcp = data.get("mcp", {})
         operator_mcp = data.get("operator_mcp", {})
+        acp = data.get("acp", {}) or {}
         plugins = data.get("plugins", {})
         identity = data.get("identity", {})
         # `or {}` (not a default arg): a section present but empty/commented in
@@ -774,6 +824,7 @@ class LangGraphConfig:
         # value still lets create_llm / set_a2a_token fall back to env.
         secret_api_key = secrets.get("model", {}).get("api_key")
         secret_auth_token = secrets.get("auth", {}).get("token")
+        secret_federation_token = secrets.get("auth", {}).get("federation_token")
 
         config = cls(
             model_provider=model.get("provider", cls.model_provider),
@@ -821,7 +872,6 @@ class LangGraphConfig:
             goal_enabled=data.get("goal", {}).get("enabled", cls.goal_enabled),
             goal_max_iterations=data.get("goal", {}).get("max_iterations", cls.goal_max_iterations),
             goal_no_progress_limit=data.get("goal", {}).get("no_progress_limit", cls.goal_no_progress_limit),
-            goal_monitor_interval=data.get("goal", {}).get("monitor_interval", cls.goal_monitor_interval),
             goal_eval_model=data.get("goal", {}).get("eval_model", cls.goal_eval_model),
             goal_verify_timeout=data.get("goal", {}).get("verify_timeout", cls.goal_verify_timeout),
             subagent_max_concurrency=subagents.get("max_concurrency", cls.subagent_max_concurrency),
@@ -854,6 +904,7 @@ class LangGraphConfig:
             workflow_dir=data.get("workflows", {}).get("dir", cls.workflow_dir),
             embed_model=knowledge.get("embed_model", cls.embed_model),
             transcribe_model=knowledge.get("transcribe_model", cls.transcribe_model),
+            image_describe_model=knowledge.get("image_describe_model", cls.image_describe_model),
             knowledge_embeddings=knowledge.get("embeddings", cls.knowledge_embeddings),
             knowledge_top_k=knowledge.get("top_k", cls.knowledge_top_k),
             knowledge_vector_k=knowledge.get("vector_k", cls.knowledge_vector_k),
@@ -887,6 +938,7 @@ class LangGraphConfig:
             operator_mcp_enabled=operator_mcp.get("enabled", cls.operator_mcp_enabled),
             operator_mcp_tools=list(operator_mcp.get("tools", []) or []),
             agent_runtime=str(data.get("agent_runtime", cls.agent_runtime) or "native"),
+            acp_agents=dict(acp.get("agents", {}) or {}),
             plugins_enabled=list(plugins.get("enabled", []) or []),
             plugins_disabled=list(plugins.get("disabled", []) or []),
             plugins_dir=plugins.get("dir", cls.plugins_dir),
@@ -899,6 +951,7 @@ class LangGraphConfig:
             a2a_require_routable_url=bool(a2a.get("require_routable_url", False)),
             instance_id=data.get("instance", {}).get("id", "") or data.get("instance_id", cls.instance_id),
             auth_token=secret_auth_token or auth.get("token", cls.auth_token),
+            federation_token=secret_federation_token or auth.get("federation_token", cls.federation_token),
             autostart_on_boot=runtime.get("autostart_on_boot", cls.autostart_on_boot),
             # Box runtime (Host layer, ADR 0047 D8) — file > env > default. The env
             # fallback only fires when the merged dict omits the key (zero-migration).
@@ -917,6 +970,9 @@ class LangGraphConfig:
             filesystem_allow_run=data.get("filesystem", {}).get("allow_run", cls.filesystem_allow_run),
             filesystem_run_requires_approval=data.get("filesystem", {}).get(
                 "run_requires_approval", cls.filesystem_run_requires_approval
+            ),
+            filesystem_bypass_allowed=data.get("filesystem", {}).get(
+                "bypass_allowed", cls.filesystem_bypass_allowed
             ),
             filesystem_projects=list(data.get("filesystem", {}).get("projects", []) or []),
             egress_allowed_hosts=list(data.get("egress", {}).get("allowed_hosts", []) or []),

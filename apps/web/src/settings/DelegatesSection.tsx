@@ -1,16 +1,16 @@
 import "./settings.css";
 import "./delegates.css";
 
-import { DropdownSelect, Input, RadioCard, RadioCardGroup, Textarea } from "@protolabsai/ui/forms";
+import { DropdownSelect, Input, RadioCard, RadioCardGroup, SecretInput, Textarea } from "@protolabsai/ui/forms";
 import { Badge, Button } from "@protolabsai/ui/primitives";
-import { Dialog } from "@protolabsai/ui/overlays";
+import { Dialog, useToast } from "@protolabsai/ui/overlays";
 
 import { StatusDot } from "@protolabsai/ui/data";
 
 import { StatusPill } from "../app/StatusPill";
 import { HelpLink } from "../app/ui-kit";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Loader2, Pencil, Plug, Plus, ShieldCheck, Trash2 } from "lucide-react";
+import { Pencil, Plug, Plus, ShieldCheck, Trash2 } from "lucide-react";
 import { useMemo, useState } from "react";
 
 import { api } from "../lib/api";
@@ -54,9 +54,9 @@ function coerce(field: DelegateFieldSpec, raw: unknown): unknown {
 function probeLine(p: DelegateProbe): string {
   if (p.ok) {
     const lat = p.latency_ms != null ? ` (${p.latency_ms} ms)` : "";
-    return `✓ ${p.detail || "reachable"}${lat}`;
+    return `${p.detail || "reachable"}${lat}`;
   }
-  return `✗ ${p.error || "unreachable"}`;
+  return `${p.error || "unreachable"}`;
 }
 
 export function DelegatesSection() {
@@ -65,8 +65,9 @@ export function DelegatesSection() {
   const types = useQuery(delegateTypesQuery());
   const [editing, setEditing] = useState<DelegateView | null>(null);
   const [adding, setAdding] = useState(false);
-  const [status, setStatus] = useState("");
+  // Per-row probe chips (test results) stay inline; transient add/remove/save feedback toasts.
   const [probes, setProbes] = useState<Record<string, DelegateProbe>>({});
+  const toast = useToast();
 
   const invalidate = () => qc.invalidateQueries({ queryKey: queryKeys.delegates });
   const closeForm = () => { setAdding(false); setEditing(null); };
@@ -74,10 +75,10 @@ export function DelegatesSection() {
   const remove = useMutation({
     mutationFn: (name: string) => api.deleteDelegate(name),
     onSuccess: (r) => {
-      setStatus(r.message || "deleted");
+      toast({ tone: "success", title: "Delegate removed", message: r.message || "Removed." });
       void invalidate();
     },
-    onError: (e) => setStatus(`delete failed: ${errMsg(e)}`),
+    onError: (e) => toast({ tone: "error", title: "Remove failed", message: errMsg(e) }),
   });
 
   const testRow = useMutation({
@@ -129,14 +130,14 @@ export function DelegatesSection() {
                     </span>
                   ) : null}
                   {d.name} <Badge status="neutral">{d.type}</Badge>
-                  {!d.configured ? <StatusPill label="⚠ unconfigured" tone="warning" /> : null}
+                  {!d.configured ? <StatusPill label="unconfigured" tone="warning" /> : null}
                   {d.has_secret ? <StatusPill label="secret set" tone="muted" /> : null}
                 </strong>
                 <span>{p ? probeLine(p) : d.description || d.error || ""}</span>
               </div>
               <div className="issue-actions">
-                <Button icon variant="ghost" title="Test" onClick={() => testRow.mutate(d)} disabled={testRow.isPending}>
-                  {testRow.isPending && testRow.variables?.name === d.name ? <Loader2 className="spin" size={15} /> : <ShieldCheck size={15} />}
+                <Button icon variant="ghost" title="Test" onClick={() => testRow.mutate(d)} loading={testRow.isPending && testRow.variables?.name === d.name} disabled={testRow.isPending}>
+                  <ShieldCheck size={15} />
                 </Button>
                 <Button icon variant="ghost" title="Edit" onClick={() => { setEditing(d); setAdding(false); }}>
                   <Pencil size={15} />
@@ -150,8 +151,6 @@ export function DelegatesSection() {
         })}
         {!delegates.length ? <p className="setting-desc">No delegates yet — add one below.</p> : null}
       </div>
-
-      {status ? <p className="settings-inline-status">{status}</p> : null}
 
       <div className="settings-group-actions">
         <Button type="button" onClick={() => { setEditing(null); setAdding(true); }} disabled={!typeSpecs.length}>
@@ -174,7 +173,7 @@ export function DelegatesSection() {
           spec={typeSpecs}
           initial={editing}
           onClose={closeForm}
-          onSaved={(msg) => { closeForm(); setStatus(msg); void invalidate(); }}
+          onSaved={(msg) => { closeForm(); toast({ tone: "success", title: "Delegate saved", message: msg }); void invalidate(); }}
         />
       </Dialog>
     </section>
@@ -290,12 +289,12 @@ function DelegateForm({
       {err ? <p className="settings-status">{err}</p> : null}
 
       <div className="settings-group-actions">
-        <Button type="button" onClick={() => test.mutate()} disabled={test.isPending}>
-          {test.isPending ? <Loader2 className="spin" size={15} /> : <Plug size={15} />} Test
+        <Button type="button" onClick={() => test.mutate()} loading={test.isPending}>
+          {test.isPending ? null : <Plug size={15} />} Test
         </Button>
         <Button type="button" onClick={onClose}>Cancel</Button>
-        <Button variant="primary" type="button" onClick={() => save.mutate()} disabled={save.isPending || !name.trim()}>
-          {save.isPending ? <Loader2 className="spin" size={15} /> : null} Save
+        <Button variant="primary" type="button" onClick={() => save.mutate()} loading={save.isPending} disabled={!name.trim()}>
+          Save
         </Button>
       </div>
     </div>
@@ -328,8 +327,7 @@ function DelegateField({
     control = <Textarea rows={3} placeholder={field.placeholder} {...common} />;
   } else if (field.kind === "secret") {
     control = (
-      <Input
-        type="password"
+      <SecretInput
         autoComplete="new-password"
         placeholder={hasStoredSecret ? "•••••••• (set — leave blank to keep)" : field.placeholder || "unset"}
         {...common}

@@ -116,7 +116,7 @@ def _default_stubs() -> dict:
         "graph": {},
         "graph.sdk": {},  # run_subagent / subagent_types / config / complete
         "graph.config": {"LangGraphConfig": type("LangGraphConfig", (), {})},
-        "graph.config_io": {"SECRETS_YAML_PATH": Path("config/secrets.yaml")},
+        "graph.config_io": {"secrets_yaml_path": lambda: Path("config/secrets.yaml")},
         "graph.goals": {},
         "graph.goals.types": {
             "VerifyResult": type("VerifyResult", (), {"__init__": lambda self, **kw: self.__dict__.update(kw)})
@@ -179,6 +179,7 @@ class FakeRegistry:
         self.workflow_dirs: list = []
         self.verifiers: dict = {}
         self.goal_hooks: list = []
+        self.watch_hooks: list = []
         self.knowledge_stores: dict = {}
         self.embedders: dict = {}
         self.handlers: dict = {}  # topic -> [handlers]
@@ -222,6 +223,9 @@ class FakeRegistry:
 
     def register_goal_hook(self, *, on_achieved=None, on_failed=None) -> None:
         self.goal_hooks.append((on_achieved, on_failed))
+
+    def register_watch_hook(self, *, on_met=None, on_expired=None, on_stalled=None) -> None:
+        self.watch_hooks.append((on_met, on_expired, on_stalled))
 
     def register_knowledge_store(self, name: str, factory) -> None:
         self.knowledge_stores[name] = factory

@@ -17,6 +17,133 @@
   white-space: normal;
 }
 
+/* The summary-chip frame (`.pl-toolcard-summary*`) is the DS `ToolCardSummary` — styled
+   by the `@protolabsai/ui` styles bundle imported in main.tsx (ships ≥0.47.1). */
+
+/* `task → researcher` — the subagent type in the delegation card header. */
+.tool-subagent {
+  color: var(--pl-color-fg-muted);
+}
+
+/* "· 3 tools" — running count of a delegation's nested subagent tools, in the header. */
+.tool-nested-count {
+  color: var(--pl-color-fg-subtle);
+  font-variant-numeric: tabular-nums;
+}
+
+/* Reasoning rendered as a tool-style card (ReasoningCard) — same DS ToolCard chrome,
+   collapsed by default, so the model's native thinking stacks evenly with the tool cards
+   instead of dominating the thread. */
+.reasoning-card {
+  margin: 0 0 0.6em; /* match the tool-call column's bottom margin */
+}
+.reasoning-card .pl-toolcard__status--done {
+  display: none; /* reasoning isn't a pass/fail result — keep only the streaming spinner */
+}
+.reasoning-text {
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-size: 0.82rem;
+  line-height: 1.55;
+  color: var(--pl-color-fg-muted);
+  max-height: 340px;
+  overflow: auto;
+}
+
+/* WorkBlock — folds an agentic turn's whole reason→tool timeline behind ONE disclosure so
+   the final answer leads. While streaming, the most-recent tool stays exposed below the
+   summary (`.work-spotlight`); both sit tightly in the `.work` container. */
+.work {
+  display: flex;
+  flex-direction: column;
+  gap: var(--pl-space-2);
+  margin: 0 0 0.6em;
+}
+.work-block,
+.work-spotlight .tool-calls {
+  margin: 0;
+}
+.work-timeline {
+  display: flex;
+  flex-direction: column;
+  gap: var(--pl-space-2);
+}
+/* Inside the timeline the nested tool lists + reasoning cards stack on the flex gap, not
+   their own bottom margins. */
+.work-timeline .tool-calls,
+.work-timeline .reasoning-card {
+  margin: 0;
+}
+.work-text {
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-size: 0.85rem;
+  line-height: 1.5;
+  color: var(--pl-color-fg-muted);
+}
+
+/* WorkBlock header: the turn's work tallied as icon + count chips (reasoning / tools /
+   skill loads), in the DS ToolCard name slot. Hover surfaces the breakdown tooltip. */
+.work-stats {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+}
+.work-stat-label {
+  font-weight: 500;
+}
+.work-stat {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  color: var(--pl-color-fg-muted);
+  font-variant-numeric: tabular-nums;
+}
+.work-stat svg {
+  flex: none;
+  opacity: 0.85;
+}
+/* Tooltip breakdown — one line per work kind, with the tool/skill names dimmed. */
+.work-breakdown {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  font-size: 0.78rem;
+  line-height: 1.45;
+  max-width: 280px;
+}
+.work-breakdown-detail {
+  color: var(--pl-color-fg-subtle);
+}
+
+/* Spotlight: while the turn streams, the slot holds the MOST-RECENT tool — kept up until a
+   newer one replaces it (so it's never empty: no blank gap between tools or during the
+   answer tail). The next tool crossfades in; the previous one drops into the chip below. */
+.tool-spotlight {
+  display: flex;
+  flex-direction: column;
+  gap: var(--pl-space-2);
+  min-height: 30px; /* ~ one collapsed ToolCard head row */
+}
+.tool-spotlight > * {
+  animation: tool-spotlight-in var(--pl-motion-base, 160ms) var(--pl-motion-ease, ease) both;
+}
+@keyframes tool-spotlight-in {
+  from {
+    opacity: 0;
+    transform: translateY(-2px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .tool-spotlight > * {
+    animation: none;
+  }
+}
+
 /* Tier 2: Stop a running subagent delegation. Rides the DS header `actions` slot
    (.pl-toolcard__actions) as a compact, error-toned text button — quiet until
    hover so a long delegation reads as "running" first, "abortable" on intent. */

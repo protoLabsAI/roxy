@@ -24,10 +24,12 @@ from a2a_impl import auth
 def _reset_guard():
     """Each test seeds the guard itself; reset module state around it."""
     auth._BEARER[0] = None
+    auth._FEDERATION[0] = None
     auth._API_KEY[0] = ""
     auth._ALLOWED_ORIGINS[0] = None
     yield
     auth._BEARER[0] = None
+    auth._FEDERATION[0] = None
     auth._API_KEY[0] = ""
     auth._ALLOWED_ORIGINS[0] = None
 
@@ -155,11 +157,38 @@ def test_ac2_healthz_public(monkeypatch):
     assert _client_multi().get("/healthz").status_code == 200
 
 
-# AC3: /metrics is public
-def test_ac3_metrics_public(monkeypatch):
+# AC3: /metrics is gated when a token is configured, public only in open mode,
+# and can be re-opened for an anonymous scraper via PROTOAGENT_PUBLIC_METRICS=1.
+def test_ac3_metrics_gated_when_token_set(monkeypatch):
     monkeypatch.delenv("A2A_AUTH_TOKEN", raising=False)
+    monkeypatch.delenv("PROTOAGENT_PUBLIC_METRICS", raising=False)
+    auth.configure(bearer_token="secret", api_key="", allowed_origins_raw="")
+    c = _client_multi()
+    assert c.get("/metrics").status_code == 401
+    assert c.get("/metrics", headers={"Authorization": "Bearer secret"}).status_code == 200
+
+
+def test_metrics_public_in_open_mode(monkeypatch):
+    monkeypatch.delenv("A2A_AUTH_TOKEN", raising=False)
+    monkeypatch.delenv("PROTOAGENT_PUBLIC_METRICS", raising=False)
+    auth.configure(bearer_token=None, api_key="", allowed_origins_raw="")
+    assert _client_multi().get("/metrics").status_code == 200
+
+
+def test_metrics_public_optin_env(monkeypatch):
+    monkeypatch.delenv("A2A_AUTH_TOKEN", raising=False)
+    monkeypatch.setenv("PROTOAGENT_PUBLIC_METRICS", "1")
     auth.configure(bearer_token="secret", api_key="", allowed_origins_raw="")
     assert _client_multi().get("/metrics").status_code == 200
+
+
+def test_metrics_gated_when_only_api_key_set(monkeypatch):
+    monkeypatch.delenv("A2A_AUTH_TOKEN", raising=False)
+    monkeypatch.delenv("PROTOAGENT_PUBLIC_METRICS", raising=False)
+    auth.configure(bearer_token=None, api_key="k", allowed_origins_raw="")
+    c = _client_multi()
+    assert c.get("/metrics").status_code == 401
+    assert c.get("/metrics", headers={"x-api-key": "k"}).status_code == 200
 
 
 # AC4: /.well-known/agent-card.json is public
@@ -167,6 +196,41 @@ def test_ac4_agent_card_public(monkeypatch):
     monkeypatch.delenv("A2A_AUTH_TOKEN", raising=False)
     auth.configure(bearer_token="secret", api_key="", allowed_origins_raw="")
     assert _client_multi().get("/.well-known/agent-card.json").status_code == 200
+
+
+# A plugin-declared public prefix is exempted; a core path can never be, and the
+# set replaces cleanly (reload-safe).
+def test_plugin_public_prefix_exempts_only_namespaced(monkeypatch):
+    monkeypatch.delenv("A2A_AUTH_TOKEN", raising=False)
+    auth.configure(bearer_token="secret", api_key="", allowed_origins_raw="")
+    try:
+        auth.set_public_prefixes(["/plugins/example/status"])
+        c = _client_multi()
+        assert c.get("/plugins/example/status").status_code == 200   # now exempt (e.g. a webhook)
+        assert c.post("/plugins/example/status").status_code == 200
+        assert c.get("/api/config").status_code == 401               # core path untouched
+        # A plugin cannot exempt a core path — set_public_prefixes drops it.
+        auth.set_public_prefixes(["/api/config"])
+        assert _client_multi().get("/api/config").status_code == 401
+    finally:
+        auth.set_public_prefixes([])  # reset module state for other tests
+        assert _client_multi().get("/plugins/example/status").status_code == 401
+
+
+def test_set_public_prefixes_rejects_core_route_prefix(monkeypatch):
+    """A plugin can't strip the gate off a core /api/plugins/<verb> route by
+    declaring it a public_path — the namespace boundary needs a trailing slash
+    after the <id> segment (defence-in-depth vs the id=='install' bypass)."""
+    monkeypatch.delenv("A2A_AUTH_TOKEN", raising=False)
+    auth.configure(bearer_token="secret", api_key="", allowed_origins_raw="")
+    try:
+        auth.set_public_prefixes(["/api/plugins/install", "/api/plugins/", "/plugins/install"])
+        c = _client_multi()
+        assert c.post("/api/plugins/install").status_code == 401  # core route stays gated
+        auth.set_public_prefixes(["/api/plugins/myplugin/webhook"])
+        assert c.get("/api/plugins/myplugin/webhook").status_code != 401  # real subtree exempt
+    finally:
+        auth.set_public_prefixes([])
 
 
 # AC5: /app is public (SPA served without auth)
@@ -376,9 +440,9 @@ def test_public_paths_stay_public_when_token_set(monkeypatch):
     monkeypatch.delenv("A2A_AUTH_TOKEN", raising=False)
     auth.configure(bearer_token="secret", api_key="", allowed_origins_raw="")
     c = _client_multi()
-    # Public allowlist paths are always accessible.
+    # Public allowlist paths are always accessible (/metrics is conditional now —
+    # covered by the metrics-policy tests above — so it is intentionally omitted).
     assert c.get("/healthz").status_code == 200
-    assert c.get("/metrics").status_code == 200
     assert c.get("/.well-known/agent-card.json").status_code == 200
     assert c.get("/app").status_code == 200
     assert c.get("/manifest.json").status_code == 200
@@ -425,11 +489,91 @@ def test_open_bind_optin_allowed_with_warning():
 # ── 7. _is_public coverage ───────────────────────────────────────────────────
 
 
+# ── 8. federation token + /api path ceiling (ADR 0066) ───────────────────────
+
+
+def _fed_configured():
+    auth.configure(bearer_token="op-secret", api_key="", allowed_origins_raw="", federation_token="fed-secret")
+
+
+def test_federation_token_denied_api_operator_surface():
+    _fed_configured()
+    c = _client_multi()
+    fed = {"Authorization": "Bearer fed-secret"}
+    # The /api operator surface (+ fleet-proxied variants) is 403 for a federation credential —
+    # even though the token itself is valid (the R1 path ceiling).
+    assert c.post("/api/config", headers=fed).status_code == 403
+    assert c.post("/api/subagents/run", headers=fed).status_code == 403
+    assert c.get("/active/foo/api/config", headers=fed).status_code == 403
+    assert c.get("/agents/slug/api/config", headers=fed).status_code == 403
+
+
+def test_federation_token_allowed_consumer_surface():
+    _fed_configured()
+    c = _client_multi()
+    fed = {"Authorization": "Bearer fed-secret"}
+    # /a2a + /v1 are the federation/consumer surfaces — a federation token passes.
+    assert c.post("/a2a", headers=fed).status_code == 200
+    assert c.post("/v1/chat/completions", headers=fed).status_code == 200
+
+
+def test_operator_token_reaches_everything():
+    _fed_configured()
+    c = _client_multi()
+    op = {"Authorization": "Bearer op-secret"}
+    assert c.post("/api/config", headers=op).status_code == 200
+    assert c.post("/api/subagents/run", headers=op).status_code == 200
+    assert c.post("/a2a", headers=op).status_code == 200
+    assert c.post("/v1/chat/completions", headers=op).status_code == 200
+
+
+def test_federation_invalid_token_still_401():
+    _fed_configured()
+    c = _client_multi()
+    bad = {"Authorization": "Bearer nope"}
+    assert c.post("/api/config", headers=bad).status_code == 401  # neither token → 401, not 403
+    assert c.post("/a2a", headers=bad).status_code == 401
+
+
+def test_single_token_mode_unchanged_no_ceiling():
+    # No federation token → the bearer holder is the operator everywhere (backward-compat).
+    auth.configure(bearer_token="op-secret", api_key="", allowed_origins_raw="")
+    c = _client_multi()
+    op = {"Authorization": "Bearer op-secret"}
+    assert c.post("/api/config", headers=op).status_code == 200
+    assert c.post("/a2a", headers=op).status_code == 200
+    # The would-be federation token is simply invalid in single-token mode.
+    assert c.post("/api/config", headers={"Authorization": "Bearer fed-secret"}).status_code == 401
+
+
+def test_federation_inert_in_open_mode():
+    # federation_token set but no operator bearer → open mode; the tier is inert.
+    auth.configure(bearer_token=None, api_key="", allowed_origins_raw="", federation_token="fed-secret")
+    assert auth._BEARER[0] is None
+    assert _client_multi().post("/api/config").status_code == 200  # open — no 403
+
+
+@pytest.mark.parametrize(
+    "path,operator",
+    [
+        ("/api/config", True),
+        ("/api/goals", True),
+        ("/api/plugins/install", True),
+        ("/active/slug/api/config", True),
+        ("/agents/x/api/events", True),
+        ("/a2a", False),
+        ("/v1/chat/completions", False),
+        ("/healthz", False),
+    ],
+)
+def test_requires_operator_classification(path, operator):
+    assert auth._requires_operator(path) is operator
+
+
 @pytest.mark.parametrize(
     "path,expected",
     [
         ("/healthz", True),
-        ("/metrics", True),
         ("/.well-known/agent-card.json", True),
         ("/.well-known/other", True),
         ("/app", True),

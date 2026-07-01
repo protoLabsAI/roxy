@@ -18,7 +18,16 @@ import pytest
 
 import plugins.coding_agent as P
 from plugins.coding_agent import _make_permission
-from plugins.coding_agent.acp_client import AcpClient, AcpError, _short_tool_name, _split_tool_title
+from plugins.coding_agent import acp_client
+from plugins.coding_agent.acp_client import (
+    AcpClient,
+    AcpError,
+    _launch_env,
+    _missing_binary_message,
+    _short_tool_name,
+    _split_tool_title,
+    _version_sort_key,
+)
 
 
 def test_short_tool_name_peels_inline_args_and_mcp_source():
@@ -32,6 +41,13 @@ def test_short_tool_name_peels_inline_args_and_mcp_source():
     assert _short_tool_name("Skill: Use skill: 'browser-automation'") == "Skill: Use skill: 'browser-automation'"
     # A legit, non-MCP trailing parenthetical is PRESERVED (only "(… MCP Server)" is peeled).
     assert _short_tool_name("search (beta)") == "search (beta)"
+    # Claude Code's `mcp__<server>__<tool>` namespace prefix is peeled to the bare tool.
+    assert _short_tool_name("mcp__protoagent-operator__current_time") == "current_time"
+    assert _short_tool_name("mcp__proto_ops__list_issues") == "list_issues"
+    # …even with inline args attached.
+    assert _short_tool_name('mcp__protoagent-operator__fetch_url: {"url":"https://x"}') == "fetch_url"
+    # A non-namespaced native tool name is untouched.
+    assert _short_tool_name("read_file") == "read_file"
     # Defensive cap so an unbounded title can never blow out the header.
     assert len(_short_tool_name("x" * 500)) <= 80
 
@@ -131,6 +147,74 @@ async def test_close_reaps_the_subprocess(fake_agent, tmp_path):
     assert client._stderr_task is not None and client._stderr_task.done()  # not leaked
 
 
+# ── handshake-only liveness check + launch-env hygiene ────────────────────────
+
+# Records (to a marker) every CLAUDECODE / CLAUDE_CODE_* var visible in its env at
+# initialize time, so a test can prove the launch env stripped the inherited ones.
+_ENV_PROBE_AGENT = r"""
+import sys, json, os
+MARKER = os.environ.get("ENV_MARKER", "")
+def send(obj):
+    sys.stdout.write(json.dumps(obj) + "\n"); sys.stdout.flush()
+while True:
+    line = sys.stdin.readline()
+    if not line:
+        break
+    line = line.strip()
+    if not line:
+        continue
+    msg = json.loads(line)
+    if msg.get("method") == "initialize":
+        leaked = sorted(k for k in os.environ if k == "CLAUDECODE" or k.startswith("CLAUDE_CODE_"))
+        if MARKER:
+            with open(MARKER, "w") as fh:
+                fh.write(json.dumps(leaked))
+        send({"jsonrpc": "2.0", "id": msg.get("id"), "result": {"protocolVersion": 1}})
+"""
+
+
+async def test_handshake_runs_initialize_without_opening_a_session(fake_agent, tmp_path):
+    """handshake() runs ONLY the ACP initialize round-trip — no session/new or
+    session/load — so the health prober's liveness check is genuinely
+    side-effect-free (#1300). The process is up and initialize negotiated, but no
+    session id was ever assigned."""
+    client = AcpClient(sys.executable, [str(fake_agent)], cwd=str(tmp_path), name="probe")
+    try:
+        await client.handshake()
+        assert client._proc is not None and client._proc.returncode is None  # up
+        assert client._protocol_version == 1  # initialize completed
+        assert client._session_id is None  # but NO session was opened
+    finally:
+        await client.close()
+
+
+async def test_launch_env_strips_inherited_nested_claude_markers(tmp_path, monkeypatch):
+    """The ACP launch env strips the inherited CLAUDECODE / CLAUDE_CODE_* markers so a
+    spawned Claude backend doesn't refuse to launch "inside another Claude Code
+    session" (#1296) — but a value explicitly set in the delegate env still wins."""
+    script = tmp_path / "env_agent.py"
+    script.write_text(_ENV_PROBE_AGENT, encoding="utf-8")
+    marker = tmp_path / "env.marker"
+    monkeypatch.setenv("CLAUDECODE", "1")
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "parent-sess")
+    monkeypatch.setenv("CLAUDE_CODE_ENTRYPOINT", "cli")
+    client = AcpClient(
+        sys.executable,
+        [str(script)],
+        cwd=str(tmp_path),
+        name="env",
+        # ENV_MARKER survives (not a CLAUDE_CODE_* var); the explicit CHILD_SESSION
+        # overlays the (stripped) inherited markers and must reach the child.
+        env={"ENV_MARKER": str(marker), "CLAUDE_CODE_CHILD_SESSION": "keepme"},
+    )
+    try:
+        await client.handshake()
+    finally:
+        await client.close()
+    leaked = json.loads(marker.read_text(encoding="utf-8"))
+    assert leaked == ["CLAUDE_CODE_CHILD_SESSION"]  # inherited stripped, explicit kept
+
+
 async def test_acp_client_readonly_policy_denies_edit(fake_agent, tmp_path):
     # A readonly policy must reject the fake's `edit` permission request — the
     # client picks the reject_once option, which the fake echoes back.
@@ -152,6 +236,70 @@ async def test_acp_client_missing_binary_raises_acp_error(tmp_path):
     client = AcpClient("definitely-not-a-real-binary-xyz", [], cwd=str(tmp_path))
     with pytest.raises(AcpError):
         await client.prompt("hi", timeout=10.0)
+
+
+# ── PATH augmentation for service-launched servers (nvm/fnm node not on PATH) ────────
+
+
+def _fake_node_dir(tmp_path) -> str:
+    """A dir that looks like a node bin dir (has an executable `node`)."""
+    d = tmp_path / "nodebin"
+    d.mkdir()
+    node = d / "node"
+    node.write_text("#!/bin/sh\n")
+    node.chmod(0o755)
+    return str(d)
+
+
+def test_launch_env_appends_node_dir_when_node_missing(tmp_path, monkeypatch):
+    """A service PATH that can't see node gets the discovered node dirs appended, so an
+    ACP agent that launches via `npx` can still find node — the systemd/nvm fix (#1)."""
+    node_dir = _fake_node_dir(tmp_path)
+    monkeypatch.setattr(acp_client, "_discovered_node_dirs", lambda: (node_dir,))
+    monkeypatch.setenv("PATH", "/usr/bin:/bin")  # minimal, no node
+    env = _launch_env(None)
+    assert env["PATH"].endswith(node_dir)  # appended, not prepended
+    assert env["PATH"].startswith("/usr/bin:/bin")  # original PATH preserved & wins
+
+
+def test_launch_env_leaves_path_when_node_already_resolvable(tmp_path, monkeypatch):
+    """If node is already on PATH, don't touch it — no override of a working setup."""
+    node_dir = _fake_node_dir(tmp_path)
+    extra_dir = str(tmp_path / "should-not-be-added")
+    monkeypatch.setattr(acp_client, "_discovered_node_dirs", lambda: (extra_dir,))
+    monkeypatch.setenv("PATH", node_dir)  # node IS resolvable here
+    env = _launch_env(None)
+    assert env["PATH"] == node_dir  # untouched
+    assert extra_dir not in env["PATH"]
+
+
+def test_launch_env_no_node_dirs_discovered_is_safe(monkeypatch):
+    """Nothing discovered → PATH is left as-is (the error path still fires later)."""
+    monkeypatch.setattr(acp_client, "_discovered_node_dirs", lambda: ())
+    monkeypatch.setenv("PATH", "/usr/bin:/bin")
+    assert _launch_env(None)["PATH"] == "/usr/bin:/bin"
+
+
+def test_missing_binary_message_hints_at_service_path_for_node_tools():
+    """The error for a node tool points at the service-PATH gap; a non-node binary doesn't."""
+    npx = _missing_binary_message("npx")
+    assert "npx" in npx and "service" in npx and "nvm" in npx
+    # the hint also fires when the command is an absolute path to a node tool
+    assert "nvm" in _missing_binary_message("/home/u/.nvm/versions/node/v22/bin/npx")
+    codex = _missing_binary_message("codex")
+    assert "codex" in codex and "service" not in codex  # not a node tool → no node hint
+
+
+def test_version_sort_key_orders_newest_first():
+    """nvm/fnm version dirs sort newest-first so the preferred node wins on PATH."""
+    dirs = [
+        "/h/.nvm/versions/node/v18.20.0/bin",
+        "/h/.nvm/versions/node/v22.22.0/bin",
+        "/h/.nvm/versions/node/v20.16.0/bin",
+    ]
+    assert sorted(dirs, key=_version_sort_key, reverse=True)[0].endswith("v22.22.0/bin")
+    # fnm layout (version is the grandparent of bin) still parses
+    assert _version_sort_key("/h/.fnm/node-versions/v21.7.0/installation/bin") == (21, 7, 0)
 
 
 async def test_acp_client_bad_workdir_raises_acp_error():

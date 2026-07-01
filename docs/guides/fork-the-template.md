@@ -15,8 +15,9 @@ brand, window/tab title, agent card, and system prompt:
 
 - `identity.name` in `config/langgraph-config.yaml` (or the setup wizard), and
 - `config/SOUL.md` for persona — it's loaded into the system prompt, so you don't
-  edit `graph/prompts.py`. (Keep the `<scratch_pad>`/`<output>` protocol block if
-  you ever do touch prompts — the A2A handler's output extraction depends on it.)
+  edit `graph/prompts.py`. (The model answers natively — there is no
+  `<scratch_pad>`/`<output>` protocol to preserve; reasoning streams on the gateway's
+  `reasoning_content` channel.)
 
 **Do NOT `sed` the internal `protoagent` identifier.** It's the stable template
 name for logger namespaces, the `~/.protoagent` data dir, `PROTOAGENT_*` env
@@ -44,8 +45,7 @@ re-sync cleanly. Until the variable is set, releases won't fire (intentional).
 ## 2. Tools — keep / drop / add (config + plugins, no core edit)
 
 The starter tools ship by default: `current_time`, `calculator`, `web_search`,
-`fetch_url` (keyless general) plus the memory, scheduler, notes, GitHub, and
-tasks tools.
+`fetch_url` (keyless general) plus the memory, scheduler, notes, and tasks tools.
 
 - **Drop** the ones you don't want via config — list them under `tools.disabled`
   in `config/langgraph-config.yaml` (live-reloadable). No `get_all_tools()` edit.
@@ -55,12 +55,20 @@ tasks tools.
 (Editing `tools/lg_tools.py::get_all_tools()` directly still works, but it's a
 core edit that conflicts on every upstream re-sync — prefer config + plugins.)
 
-Integrations are *plugins*. The bundled ones (e.g. `plugins/telegram`, `plugins/github`)
-turn off with `plugins: { disabled: [telegram] }` — no directory delete, no core edit.
-Integrations like **Discord**, **Google**, and **Slack** install as **external** plugins
+Integrations are *plugins*. The bundled ones (e.g. `plugins/telegram`) turn off with
+`plugins: { disabled: [telegram] }` — no directory delete, no core edit. Integrations
+like **GitHub**, **Discord**, **Google**, and **Slack** install as **external** plugins
 from their own repos (browse + install in Settings ▸ Plugins ▸ Discover).
 
 See the [starter tools reference](/reference/starter-tools) for the shapes of the shipped ones.
+
+**Customize the console without editing core, too.** The frontend has the same fork-safe
+seam as the backend (ADR 0061): drop a `src/ext/<name>.tsx` that calls `registerSurface`
+(a rail panel), `registerSlashCommand` (a client-side `/<name>`), `registerComposerAction`
+(a composer button), `registerPaletteCommand` (a ⌘K command), or `createUISlice` (its own
+persisted UI state) — no edit to `App.tsx` / `ChatSurface.tsx` / `uiStore.ts`, so upstream
+pulls stay conflict-free. (Untrusted UI still goes through sandboxed plugin iframe views —
+see [Building a plugin view](/guides/building-react-plugin-views).)
 
 ## 3. Configure subagents (optional)
 

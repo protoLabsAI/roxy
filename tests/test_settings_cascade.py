@@ -10,6 +10,7 @@ PROTOAGENT_HOST_CONFIG is defaulted to an absent path by conftest, so tests star
 with NO host layer and opt in by pointing it at a temp file.
 """
 
+import logging
 import textwrap
 from pathlib import Path
 
@@ -64,6 +65,37 @@ def test_host_cannot_inject_agent_scoped_key(tmp_path, monkeypatch):
     cfg = LangGraphConfig.from_yaml(path)
     assert cfg.goal_enabled is True  # host's agent-scoped goal.enabled IGNORED (default)
     assert cfg.model_name == "host-model"  # host's host-scoped key DID apply
+
+
+def test_agent_shadowing_host_key_warns(tmp_path, monkeypatch, caplog):
+    """A host-scoped key set in BOTH layers with differing values logs a shadow warning
+    (issue #1459): the agent wins, so the box default is silently overridden — surface it."""
+    _host_yaml(tmp_path, "model:\n  api_base: http://host-gw/v1\n", monkeypatch)
+    path = _agent_yaml(tmp_path, "model:\n  api_base: http://agent-gw/v1\n")
+    with caplog.at_level(logging.WARNING, logger="protoagent.config"):
+        cfg = LangGraphConfig.from_yaml(path)
+    assert cfg.api_base == "http://agent-gw/v1"  # agent wins (unchanged behavior)
+    msgs = [r.getMessage() for r in caplog.records]
+    assert any("shadow" in m.lower() and "model.api_base" in m for m in msgs), msgs
+
+
+def test_no_shadow_warning_when_values_match(tmp_path, monkeypatch, caplog):
+    """No noise when the agent leaf merely repeats the host value — nothing is shadowed."""
+    _host_yaml(tmp_path, "model:\n  api_base: http://same-gw/v1\n", monkeypatch)
+    path = _agent_yaml(tmp_path, "model:\n  api_base: http://same-gw/v1\n")
+    with caplog.at_level(logging.WARNING, logger="protoagent.config"):
+        LangGraphConfig.from_yaml(path)
+    assert not any("shadow" in r.getMessage().lower() for r in caplog.records)
+
+
+def test_no_shadow_warning_when_agent_silent(tmp_path, monkeypatch, caplog):
+    """A host default the agent never sets is plain inheritance, not a shadow — no warning."""
+    _host_yaml(tmp_path, "model:\n  api_base: http://host-gw/v1\n", monkeypatch)
+    path = _agent_yaml(tmp_path, "goal:\n  enabled: true\n")
+    with caplog.at_level(logging.WARNING, logger="protoagent.config"):
+        cfg = LangGraphConfig.from_yaml(path)
+    assert cfg.api_base == "http://host-gw/v1"  # inherited
+    assert not any("shadow" in r.getMessage().lower() for r in caplog.records)
 
 
 def test_host_cannot_set_a_secret(tmp_path, monkeypatch):
@@ -165,14 +197,14 @@ def test_build_schema_agent_override_of_host_field_shows_as_agent_source():
 
 
 def _point_config_at(tmp_path, monkeypatch):
-    """Repoint the live agent leaf (CONFIG_YAML_PATH) + secrets at a temp dir so a
+    """Repoint the live agent leaf (config_yaml_path) + secrets at a temp dir so a
     save touches a scratch file, not the repo's config/. Returns the leaf path."""
     import graph.config_io as cio
 
     leaf = tmp_path / "langgraph-config.yaml"
     secrets = tmp_path / "secrets.yaml"
-    monkeypatch.setattr(cio, "CONFIG_YAML_PATH", leaf, raising=False)
-    monkeypatch.setattr(cio, "SECRETS_YAML_PATH", secrets, raising=False)
+    monkeypatch.setattr(cio, "config_yaml_path", lambda: leaf)
+    monkeypatch.setattr(cio, "secrets_yaml_path", lambda: secrets)
     return leaf
 
 
@@ -207,8 +239,12 @@ def test_host_layer_save_writes_host_config(tmp_path, monkeypatch):
     assert hp.exists()
     written = _yaml.safe_load(hp.read_text())
     assert written["model"]["name"] == "box-default-model"
-    # The agent leaf was NOT touched by the host write.
-    assert not leaf.exists()
+    # The host value was NOT written into the agent leaf (plugin-schema discovery may
+    # seed a fresh template leaf, exactly as boot does — but the host key never leaks
+    # into it, so it can't shadow the host default).
+    if leaf.exists():
+        leaf_doc = _yaml.safe_load(leaf.read_text()) or {}
+        assert (leaf_doc.get("model") or {}).get("name") != "box-default-model"
 
     # Cascade: a config loaded from a silent agent leaf inherits the host default.
     leaf.write_text("goal:\n  enabled: true\n")
@@ -336,7 +372,7 @@ def test_agent_layer_save_unchanged(tmp_path, monkeypatch):
     written = _yaml.safe_load(leaf.read_text())
     assert written["model"]["name"] == "agent-model"
     assert "api_key" not in written["model"]  # secret split out, as always
-    secrets = _yaml.safe_load(cio.SECRETS_YAML_PATH.read_text())
+    secrets = _yaml.safe_load(cio.secrets_yaml_path().read_text())
     assert secrets["model"]["api_key"] == "sk-secret"
     assert not hp.exists()  # host file never created by an agent save
 

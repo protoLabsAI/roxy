@@ -25,47 +25,52 @@ def ws_root(tmp_path, monkeypatch):
 # ── Fleet: the create-side / run-side plugin-dir alignment (the bug's seam) ──────
 
 
-def test_run_exec_wires_plugin_dirs_unscoped(ws_root):
-    """A member's PROTOAGENT_PLUGINS_DIR is ``<ws>/plugins`` — UN-scoped, co-located
-    with its config dir (``<ws>``). The double-scope bug nested the config under
-    ``<ws>/<id>/`` while the plugins stayed at ``<ws>/plugins``, so the member's
-    plugin-config resolver looked in the wrong dir. Pin them to the same root."""
+def test_run_exec_wires_home_and_instance(ws_root):
+    """A member launches with ``PROTOAGENT_HOME=<ws>`` (so config at ``<ws>/config``,
+    plugins at ``<ws>/plugins``, lock at ``<ws>/plugins.lock`` all derive from one
+    instance root) + ``PROTOAGENT_INSTANCE=<id>`` (data-store scope). The single root
+    is what deletes the old double-scope bug class."""
     s = manager.create("alpha")
     ws = ws_root / s["id"]
     env, _argv = manager.run_exec("alpha", [])
-    assert env["PROTOAGENT_CONFIG_DIR"] == str(ws)
-    assert env["PROTOAGENT_PLUGINS_DIR"] == str(ws / "plugins")
-    assert env["PROTOAGENT_PLUGINS_LOCK"] == str(ws / "plugins.lock")
+    assert env["PROTOAGENT_HOME"] == str(ws)
+    assert env["PROTOAGENT_INSTANCE"] == s["id"]
+    # The member's config + plugins both derive from <ws> (config/ + plugins/ siblings).
+    assert (ws / "config" / "langgraph-config.yaml").exists()
 
 
-# ── Path: plugin_roots_from joins config_dir (the wrong-dir computation) ─────────
+# ── Path: plugin_roots_from uses the instance plugins root ───────────────────────
 
 
-def test_plugin_roots_from_joins_config_dir(tmp_path):
-    """``plugin_roots_from(config_dir)`` resolves the live plugins root as
-    ``config_dir/plugins`` — the join a nested config_dir poisoned. A dir override
-    wins over the default."""
+def test_plugin_roots_from_uses_plugins_root(tmp_path):
+    """``plugin_roots_from(plugins_root)`` returns the given live plugins root (e.g.
+    ``instance_paths().plugins_dir``) as the live root; a dir override wins over it.
+    The bundle root is the in-tree ``app_root/plugins``."""
     from graph.plugins.pconfig import plugin_roots_from
 
-    roots = plugin_roots_from(tmp_path)
+    roots = plugin_roots_from(tmp_path / "plugins")
     assert roots[-1] == tmp_path / "plugins"
-    overridden = plugin_roots_from(tmp_path, str(tmp_path / "elsewhere"))
+    overridden = plugin_roots_from(tmp_path / "plugins", str(tmp_path / "elsewhere"))
     assert overridden[-1] == tmp_path / "elsewhere"
 
 
-# ── Path: host_config_path's scope_leaf branch (cascade tests always override) ───
+# ── Path: host_config_path is BOX-tier, shared by every instance on the machine ──
 
 
-def test_host_config_path_scoped_per_instance(monkeypatch):
-    """``host_config_path()`` scope_leafs per instance when ``PROTOAGENT_HOST_CONFIG``
-    isn't set, so co-located hubs stay isolated (#813). The settings-cascade tests
-    always pin an explicit path, so this branch was never exercised."""
+def test_host_config_path_is_box_shared(monkeypatch, tmp_path):
+    """``host_config_path()`` is the BOX-tier Host layer (``box_root/host-config.yaml``),
+    NOT under the instance root — every instance the machine owns reads the one
+    machine-wide Host config (that's the point of the layer). The settings-cascade tests
+    always pin an explicit ``PROTOAGENT_HOST_CONFIG``, so this branch was never exercised."""
     import infra.paths as paths
 
     monkeypatch.delenv("PROTOAGENT_HOST_CONFIG", raising=False)
+    monkeypatch.setenv("PROTOAGENT_BOX_ROOT", str(tmp_path))
     monkeypatch.setenv("PROTOAGENT_INSTANCE", "hub-9")
+    paths.reset_instance_paths()
     p = paths.host_config_path()
-    assert p.name == "host-config.yaml" and "hub-9" in p.parts
+    assert p == tmp_path / "host-config.yaml"  # box-shared — NOT under the hub-9 instance root
+    assert "hub-9" not in p.parts
 
 
 # ── Shared skills (ADR 0041): behavioral commons, not just the path string ───────

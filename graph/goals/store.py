@@ -2,9 +2,9 @@
 
 Goals outlive a single graph run (and the frequent graph rebuilds the server
 does on config reload), so state is written to disk keyed by ``session_id``.
-Path resolution mirrors the memory/knowledge subsystems: ``GOAL_PATH`` env →
-``/sandbox/goals`` → ``~/.protoagent/goals`` fallback when the sandbox path
-isn't writable (e.g. running locally without ``/sandbox``).
+Path resolution mirrors the memory/knowledge subsystems: ``GOAL_PATH`` env
+(verbatim) → the per-instance ``instance_root/goals`` store → a temp dir as a
+last resort if nothing is writable.
 """
 
 from __future__ import annotations
@@ -20,21 +20,32 @@ from graph.goals.types import GoalState
 log = logging.getLogger(__name__)
 
 
+def _publish(topic: str, data: dict) -> None:
+    """Best-effort bus push so the console Goals panel can invalidate live on a change
+    instead of polling every 5s (#1310). No-op when the host hasn't wired a publisher
+    (unit tests / standalone use); a bus hiccup must never break a goal write."""
+    try:
+        from graph.plugins.host import HOST
+
+        if HOST.publish:
+            HOST.publish(topic, data)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def _resolve_base() -> Path:
-    # Per-instance scoping (ADR 0004): namespace by PROTOAGENT_INSTANCE so two
-    # agents on one machine don't share a goals dir — without this, scheduled /
+    # Per-instance (ADR 0004): the default sits at ``instance_root/goals`` so two
+    # agents on one machine don't share a goals dir — without isolation, scheduled /
     # activity turns (shared session id "system:activity") collide and goals leak
-    # across agents. No-op when PROTOAGENT_INSTANCE is unset (single instance).
-    from infra.paths import scope_leaf
+    # across agents. ``GOAL_PATH`` env overrides verbatim.
+    from infra.paths import instance_paths
 
     candidates = []
     env = os.environ.get("GOAL_PATH", "").strip()
     if env:
-        candidates.append(Path(env))
-    candidates.append(Path("/sandbox/goals"))
-    candidates.append(Path.home() / ".protoagent" / "goals")
-    for raw in candidates:
-        path = scope_leaf(raw)
+        candidates.append(Path(env).expanduser())
+    candidates.append(instance_paths().store("goals"))
+    for path in candidates:
         try:
             path.mkdir(parents=True, exist_ok=True)
             # confirm writable
@@ -45,7 +56,7 @@ def _resolve_base() -> Path:
         except OSError:
             continue
     # Last resort: a temp dir (keeps the server alive even if nothing is writable).
-    fallback = scope_leaf(Path(tempfile.gettempdir()) / "protoagent_goals")
+    fallback = Path(tempfile.gettempdir()) / "protoagent_goals"
     fallback.mkdir(parents=True, exist_ok=True)
     return fallback
 
@@ -116,6 +127,7 @@ class GoalStore:
                 json.dump(state.to_dict(), fh, indent=2, default=str)
             os.rename(tmp_path, path)
             tmp_path = None
+            _publish("goal.changed", {"session_id": state.session_id})
         except OSError as exc:
             log.error("[goal] write failed for session %s: %s", state.session_id, exc)
         finally:
@@ -133,6 +145,7 @@ class GoalStore:
         path = self._path(session_id)
         try:
             path.unlink()
+            _publish("goal.changed", {"session_id": session_id})
             return True
         except FileNotFoundError:
             return False

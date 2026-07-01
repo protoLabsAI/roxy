@@ -104,6 +104,29 @@ def test_extract_bytes_content_type_sniff():
     assert r.source_type == "html" and "From header" in r.text
 
 
+def test_extract_bytes_image_describes_via_injected_fn():
+    # An image is described by the injected vision fn → its text becomes the content (#1381).
+    seen = {}
+
+    def describe(data, mime, name):
+        seen.update(data=data, mime=mime, name=name)
+        return "A login screen with an error toast: 'Invalid API key'."
+
+    r = extract_bytes("Screenshot.png", b"\x89PNG\r\n\x1a\nfakebytes", describe=describe)
+    assert r.source_type == "image"
+    assert "Invalid API key" in r.text
+    assert seen["mime"] == "image/png" and seen["name"] == "Screenshot.png"
+
+
+def test_extract_bytes_image_without_describe_fn_gives_clear_error():
+    # No describe model configured → a clear, actionable message (not a generic reject).
+    with pytest.raises(UnsupportedSource, match="can't see images"):
+        extract_bytes("Screenshot.png", b"\x89PNG\r\n\x1a\nfakebytes")
+    # Content-type sniffing routes a no-extension image the same way.
+    with pytest.raises(UnsupportedSource, match="can't see images"):
+        extract_bytes("clip", b"\xff\xd8\xffjpegish", content_type="image/jpeg")
+
+
 # ── PDF (pypdf logic, reader monkeypatched) ───────────────────────────────────
 
 
@@ -179,6 +202,22 @@ def test_extract_url_youtube(monkeypatch):
 def test_extract_url_empty_raises():
     with pytest.raises(UnsupportedSource):
         extract_url("   ")
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://169.254.169.254/latest/meta-data/",  # cloud-metadata (link-local)
+        "http://127.0.0.1:7870/api/config",  # loopback
+        "http://[::1]/x",  # loopback (v6)
+        "file:///etc/passwd",  # no host / non-http scheme
+    ],
+)
+def test_http_fetch_blocks_internal_ssrf(url):
+    """The real URL fetcher applies the egress SSRF guard before any network I/O —
+    internal / metadata / loopback targets are refused (literal IPs need no DNS)."""
+    with pytest.raises(UnsupportedSource):
+        engine._http_fetch(url)
 
 
 # ── audio / video (gateway STT, injected transcribe + ffmpeg) ─────────────────

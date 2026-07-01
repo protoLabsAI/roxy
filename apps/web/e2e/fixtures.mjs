@@ -6,6 +6,9 @@
 // constants to assert against, so the contract can't drift between the two.
 
 export const TOOL_CALL_MIME = "application/vnd.protolabs.tool-call-v1+json";
+export const COST_MIME = "application/vnd.protolabs.cost-v1+json";
+export const CONTEXT_MIME = "application/vnd.protolabs.context-v1+json";
+export const COMPONENT_MIME = "application/vnd.protolabs.component-v1+json";
 
 export const RUNTIME_STATUS = {
   setup_complete: true,
@@ -18,6 +21,8 @@ export const RUNTIME_STATUS = {
     name: "protolabs/reasoning",
     api_base: "https://api.proto-labs.ai/v1",
     api_key_configured: true,
+    vision: true, // a vision-capable model: attached images go inline (the happy path)
+    image_describe: true, // a describe model is configured (#1381) — see image-attach.spec
     temperature: 0.2,
     max_tokens: 2048,
     max_iterations: 8,
@@ -77,8 +82,8 @@ export const SUBAGENTS = [
 export const ACTIVITY_HISTORY = {
   context_id: "system:activity",
   entries: [
-    { id: 1, created_at: "2026-06-05T09:00:00+00:00", origin: "scheduler", trigger: "daily-brief", priority: "", state: "completed", text: "3 PRs merged overnight, CI green.", task_id: "t1" },
-    { id: 2, created_at: "2026-06-05T09:05:00+00:00", origin: "inbox", trigger: "ci", priority: "now", state: "completed", text: "Build failed on main — investigating.", task_id: "t2" },
+    { id: 1, created_at: "2026-06-05T09:00:00+00:00", origin: "scheduler", trigger: "daily-brief", priority: "", state: "completed", text: "3 PRs merged overnight, CI green.", task_id: "t1", stimulus: "Summarize overnight repo activity and CI status." },
+    { id: 2, created_at: "2026-06-05T09:05:00+00:00", origin: "inbox", trigger: "ci", priority: "now", state: "completed", text: "Build failed on main — investigating.", task_id: "t2", stimulus: "CI webhook: build #4821 failed on main (test_a2a_handler)." },
   ],
   messages: [
     { role: "user", content: "morning standup" },
@@ -194,10 +199,13 @@ export const NOTES_WORKSPACE = {
 export const SETTINGS_SCHEMA = [
   {
     section: "Model",
-    category: "Agent",
+    category: "Model",
     fields: [
-      // model.name is host-scoped + inherited from the host layer (inheritance badge).
-      { key: "model.name", label: "Primary model", type: "select", section: "Model", restart: false, description: "", options: ["protolabs/reasoning", "protolabs/fast"], value: "protolabs/reasoning", default: "protolabs/reasoning", scope: "host", source: "host" },
+      // model.name is host-scoped + inherited from the host layer (inheritance badge). Its
+      // options are gateway-probed (options_source "models") — the "Get models" action (#1386)
+      // refreshes them from the form's api_base/key.
+      { key: "model.name", label: "Primary model", type: "select", section: "Model", restart: false, description: "", options: ["protolabs/reasoning", "protolabs/fast"], options_source: "models", value: "protolabs/reasoning", default: "protolabs/reasoning", scope: "host", source: "host" },
+      { key: "model.api_base", label: "Gateway base URL", type: "string", section: "Model", restart: false, description: "", options: [], value: "https://gw.example/v1", default: "", scope: "host", source: "host" },
       // host-scoped but overridden in this agent (overridden-here badge + reset link).
       { key: "model.temperature", label: "Temperature", type: "number", section: "Model", restart: false, description: "", options: [], value: 0.2, default: 0.2, minimum: 0, maximum: 2, scope: "host", source: "agent" },
       { key: "model.api_key", label: "API key", type: "secret", section: "Model", restart: false, description: "Stored in secrets.yaml.", options: [], value: "", is_set: true, scope: "agent", source: "agent" },
@@ -205,7 +213,7 @@ export const SETTINGS_SCHEMA = [
   },
   {
     section: "Routing",
-    category: "Agent",
+    category: "Model",
     fields: [
       // App default (inherited-from-default badge).
       { key: "routing.aux_model", label: "Auxiliary (fast) model", type: "string", section: "Routing", restart: false, description: "Cheap alias for aux calls.", options: [], value: "protolabs/fast", default: "", scope: "host", source: "default" },
@@ -215,14 +223,14 @@ export const SETTINGS_SCHEMA = [
   },
   {
     section: "Compaction",
-    category: "System",
+    category: "Behavior",
     fields: [
       { key: "compaction.enabled", label: "Enable compaction", type: "bool", section: "Compaction", restart: false, description: "", options: [], value: true, default: true, scope: "host", source: "host" },
     ],
   },
   {
     section: "Runtime",
-    category: "System",
+    category: "Behavior",
     fields: [
       { key: "runtime.autostart_on_boot", label: "Autostart on boot", type: "bool", section: "Runtime", restart: true, description: "Install/remove the boot LaunchAgent.", options: [], value: false, default: false, scope: "agent", source: "agent" },
     ],
@@ -238,6 +246,11 @@ export const SETTINGS_SCHEMA = [
     ],
   },
 ];
+
+/** The model list a freshly-probed gateway returns from POST /api/config/models (#1386) — a
+ *  DIFFERENT set than model.name's saved options, so the e2e can prove "Get models" refreshes
+ *  the dropdown with the new provider's models. */
+export const GATEWAY_MODELS = ["protolabs/smart", "protolabs/micro", "protolabs/nano"];
 
 /** restart_required for a flat updates payload, per the schema. */
 export function settingsRestartRequired(updates) {
@@ -259,6 +272,55 @@ const MARKDOWN_ANSWER = [
   "```",
 ].join("\n");
 
+// A full-surface markdown smoke doc — exercises EVERY construct the chat renderer must
+// handle so we can eyeball the whole brand/style surface in one turn (and feed concrete
+// gaps to protoContent#297/#298). Kept in sync with scratch markdown-smoke.md.
+const MARKDOWN_SMOKE_ANSWER = [
+  "# H1 — Markdown smoke test",
+  "",
+  "## H2 heading",
+  "### H3 heading",
+  "",
+  "A paragraph with **bold**, *italic*, `inline code`, ~~strike~~, and a [link](https://example.com).",
+  "",
+  "> A blockquote.",
+  "> > Nested blockquote.",
+  "",
+  "- Unordered item",
+  "  - Nested item",
+  "- Item with `code`",
+  "",
+  "1. Ordered item",
+  "2. Second item",
+  "",
+  "- [ ] Open task",
+  "- [x] Done task",
+  "",
+  "Inline math $E = mc^2$ and a block:",
+  "",
+  "$$a^2 + b^2 = c^2$$",
+  "",
+  "```ts",
+  "export const add = (a: number, b: number): number => a + b;",
+  "```",
+  "",
+  "```mermaid",
+  "flowchart LR",
+  "  A[Start] --> B[End]",
+  "```",
+  "",
+  "| Column A | Column B | Numeric |",
+  "| -------- | -------- | ------: |",
+  "| alpha    | first    |    1024 |",
+  "| beta     | second   |    2048 |",
+  "",
+  "![alt text](https://example.com/image.png)",
+  "",
+  "---",
+  "",
+  "Final paragraph after a horizontal rule.",
+].join("\n");
+
 const DEFAULT_SEARCH_OUTPUT = [
   "8 result(s) for 'AI coding agents latest news':",
   "1. First Result — https://example.com/a",
@@ -274,6 +336,20 @@ function scenarioFor(prompt) {
   const t = (prompt || "").toUpperCase();
   if (t.includes("CALC"))
     return { name: "calculator", input: { expression: "19 * 23" }, output: "19 * 23 = 437", answer: "19 × 23 = 437." };
+  if (t.includes("COMPONENT"))
+    // show_component (#1323): the tool fires AND emits a component-v1 part. The tool card is
+    // suppressed (it's a render directive); the table renders inline below the answer.
+    return {
+      events: [
+        { id: "comp-1", name: "show_component", phase: "start", input: JSON.stringify({ component: "table" }) },
+        { id: "comp-1", name: "show_component", phase: "end", output: "Rendered a table component for the user." },
+      ],
+      component: {
+        component: "table",
+        props: { title: "Fleet", columns: ["Ship", "Status"], rows: [["Hauler", "active"], ["Scout", "idle"]] },
+      },
+      answer: "Here's the fleet breakdown.",
+    };
   if (t.includes("TIME"))
     return {
       name: "current_time",
@@ -310,6 +386,31 @@ function scenarioFor(prompt) {
         { id: "task-1", name: "task", phase: "end", output: "Subagent finished: found 1 result." },
       ],
     };
+  if (t.includes("NESTLATE"))
+    // Out-of-order delegation: the `task` card CLOSES before the subagent's child frames
+    // arrive (the real detached-delegation ordering). Only the explicit parentToolCallId
+    // lets the console still nest the child under the task — the timing heuristic can't.
+    return {
+      answer: "Delegated; the child frame arrived after the task closed.",
+      events: [
+        { id: "task-late", name: "task", phase: "start", input: JSON.stringify({ description: "Research", prompt: "Find it." }) },
+        { id: "task-late", name: "task", phase: "end", output: "Subagent finished." },
+        { id: "kid-late", name: "web_search", phase: "start", input: JSON.stringify({ query: "late" }), parentId: "task-late" },
+        { id: "kid-late", name: "web_search", phase: "end", output: "1 result(s) for 'late':\n1. Ex — https://example.com/x\n   snip.", parentId: "task-late" },
+      ],
+    };
+  if (t.includes("FANOUT"))
+    // Two INDEPENDENT top-level tool calls (no task wrapping them) → both settle, so the
+    // console folds them behind a single "2 tools" summary chip (clutter cleanup).
+    return {
+      answer: "Ran a search and a calculation.",
+      events: [
+        { id: "fan-1", name: "web_search", phase: "start", input: JSON.stringify({ query: "coding agents" }) },
+        { id: "fan-1", name: "web_search", phase: "end", output: "1 result(s) for 'coding agents':\n1. Example — https://example.com/x\n   A snippet." },
+        { id: "fan-2", name: "calculator", phase: "start", input: JSON.stringify({ expression: "2 + 2" }) },
+        { id: "fan-2", name: "calculator", phase: "end", output: "2 + 2 = 4" },
+      ],
+    };
   if (t.includes("NOEND"))
     // A tool whose `end` frame never arrives (e.g. a workflow card whose end
     // races with the terminal `done`). The turn still completes — the client
@@ -334,6 +435,9 @@ function scenarioFor(prompt) {
       streamChunks: ["Testing ", "catches bugs ", "before users do."],
       answer: "Testing catches bugs before users do.",
     };
+  if (t.includes("MARKDOWN_SMOKE"))
+    // Pure markdown render (no tool card — `events: []`) of the full-surface smoke doc.
+    return { events: [], answer: MARKDOWN_SMOKE_ANSWER };
   if (t.includes("MARKDOWN"))
     return { name: "web_search", input: { query: "md" }, output: DEFAULT_SEARCH_OUTPUT, answer: MARKDOWN_ANSWER };
   return { name: "web_search", input: { max_results: 8, query: "AI coding agents latest news" }, output: DEFAULT_SEARCH_OUTPUT, answer: "Done — found 8 results." };
@@ -361,6 +465,8 @@ export function buildFrames({ rpcId, contextId, taskId, prompt }) {
     phase: ev.phase === "start" ? "started" : "completed",
     args: ev.input,
     result: ev.output,
+    // A subagent's own tool frame carries its parent `task` id so the console nests it.
+    ...(ev.parentId ? { parentToolCallId: ev.parentId } : {}),
   });
   const statusFrame = (text, toolEvent) =>
     wrap({
@@ -410,6 +516,25 @@ export function buildFrames({ rpcId, contextId, taskId, prompt }) {
     const text = ev.phase === "start" ? `🔧 ${ev.name}: ${ev.input ?? ""}` : `✅ ${ev.name} → ${ev.output ?? ""}`;
     frames.push(statusFrame(text, ev));
   }
+  // Inline component (component-v1, #1323): a status frame carrying the {component,props}
+  // DataPart — decoded by componentFromParts → rendered by the console registry.
+  if (scenario.component) {
+    frames.push(
+      wrap({
+        kind: "status-update",
+        taskId,
+        contextId,
+        status: {
+          state: "working",
+          message: {
+            role: "agent",
+            parts: [{ kind: "data", data: scenario.component, metadata: { mimeType: COMPONENT_MIME } }],
+          },
+        },
+        final: false,
+      }),
+    );
+  }
   // Stream the answer as append:true deltas when the scenario asks for it,
   // then always send the authoritative append:false terminal artifact.
   for (const chunk of scenario.streamChunks || []) {
@@ -424,12 +549,44 @@ export function buildFrames({ rpcId, contextId, taskId, prompt }) {
       }),
     );
   }
+  // The terminal answer artifact also carries the cost-v1 DataPart (token usage + cost),
+  // exactly as a2a_impl's executor emits it — so the per-turn usage footer (#1372) renders.
   frames.push(
     wrap({
       kind: "artifact-update",
       taskId,
       contextId,
-      artifact: { artifactId: taskId, parts: [{ kind: "text", text: scenario.answer }] },
+      artifact: {
+        artifactId: taskId,
+        parts: [
+          { kind: "text", text: scenario.answer },
+          {
+            kind: "data",
+            data: {
+              usage: {
+                input_tokens: 12_340,
+                output_tokens: 1_200,
+                cache_read_input_tokens: 8_000,
+                cache_creation_input_tokens: 0,
+              },
+              costUsd: 0.0412,
+              durationMs: 2300,
+              success: true,
+            },
+            metadata: { mimeType: COST_MIME },
+          },
+          {
+            kind: "data",
+            data: {
+              contextTokens: 12_340,
+              compactionAtTokens: 120_000,
+              trigger: "tokens:120000",
+              enabled: true,
+            },
+            metadata: { mimeType: CONTEXT_MIME },
+          },
+        ],
+      },
       append: false,
       lastChunk: true,
     }),

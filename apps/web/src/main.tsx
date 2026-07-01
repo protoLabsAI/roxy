@@ -12,7 +12,9 @@ import { isLauncherWindow } from "./lib/desktop";
 // Tailwind + the shadcn→token bridge, then the legacy theme.css (which may reference --pl-*).
 import "@protolabsai/design/css/tokens";
 import "./app/tailwind.css";
-import "@protolabsai/ui/styles.css";
+import "@protolabsai/ui/styles.css"; // component styles, incl. the DS `.pl-markdown` renderer
+import "streamdown/styles.css"; // streaming per-token fade (opt-in; see DS <Markdown> docstring)
+import "katex/dist/katex.min.css"; // KaTeX glyph layout for math in the DS <Markdown>
 import "./app/theme-base.css"; // shared token bridge + resets — must load before the rest
 import "./app/theme.css";
 import { activateSlugAgent } from "./lib/api";
@@ -36,7 +38,10 @@ ReactDOM.createRoot(document.getElementById("root")!).render(
         the providers themselves is caught too. */}
     <ErrorBoundary fallback={({ error }) => <AppCrash error={error} />}>
       <QueryClientProvider client={queryClient}>
-        <ToastProvider>{launcher ? <Launcher /> : <App />}</ToastProvider>
+        {/* Toasts anchor TOP-right (app-level notifications; clear of the bottom utility
+            bar / composer) via the DS prop — no `.pl-toast-stack` CSS override needed
+            since @protolabsai/ui 0.49 (ToastProvider `position`). */}
+        <ToastProvider position="top-right">{launcher ? <Launcher /> : <App />}</ToastProvider>
       </QueryClientProvider>
     </ErrorBoundary>
   </React.StrictMode>,

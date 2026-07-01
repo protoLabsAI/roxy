@@ -24,7 +24,7 @@ import threading
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from infra.paths import scope_leaf
+from infra.paths import instance_paths
 from runtime.state import STATE
 from server import AGENT_NAME_ENV, _event_bus, agent_name
 from server.chat import chat
@@ -75,7 +75,7 @@ def _init_langgraph_agent(headless_setup: bool = False):
 
     from graph.config import LangGraphConfig
     from graph.config_io import (
-        CONFIG_YAML_PATH,
+        config_yaml_path,
         ensure_live_config,
         is_setup_complete,
         mark_setup_complete,
@@ -98,10 +98,10 @@ def _init_langgraph_agent(headless_setup: bool = False):
         log.warning("[data-version] %s", _dv_warn)
 
     # Seed the untracked live config from the .example template on first run.
-    # CONFIG_YAML_PATH honors PROTOAGENT_CONFIG_DIR (the desktop sidecar points
-    # it at per-user app-data), so load through it rather than a fixed path.
+    # config_yaml_path() resolves to <instance_root>/config/langgraph-config.yaml
+    # (env-driven via PROTOAGENT_HOME / PROTOAGENT_INSTANCE), so load through it.
     ensure_live_config()
-    STATE.graph_config = LangGraphConfig.from_yaml(CONFIG_YAML_PATH)
+    STATE.graph_config = LangGraphConfig.from_yaml(config_yaml_path())
     # Fork tool denylist (config ``tools.disabled``) — applied before any
     # get_all_tools() call so dropped tools never reach the graph.
     from tools.lg_tools import set_disabled_tools
@@ -110,16 +110,16 @@ def _init_langgraph_agent(headless_setup: bool = False):
     # Egress allowlist (ADR 0008): deny-by-default outbound hosts for fetch_url.
     from security import egress
 
-    egress.set_allowed_hosts(STATE.graph_config.egress_allowed_hosts)
+    egress.set_allowed_hosts(
+        STATE.graph_config.egress_allowed_hosts, also_allow_url=STATE.graph_config.api_base
+    )
     # Opt-in CIDR allowlist for outbound A2A destinations — callbacks + delegate_to a2a delegates (#572).
     from security import policy
 
     policy.set_callback_allowlist(STATE.graph_config.security_callback_allowlist)
-    # Multi-instance scoping (ADR 0004): seed PROTOAGENT_INSTANCE from config so
-    # every store (incl. the env-reading knowledge/scheduler/memory modules) nests
-    # under the same id. Opt-in — empty config.instance_id leaves paths unchanged.
-    # Set before any store is built or the memory middleware is imported.
-    _seed_instance_env(STATE.graph_config)
+    # Instance identity is env-only (ADR 0004 / InstancePaths): PROTOAGENT_HOME /
+    # PROTOAGENT_INSTANCE are resolved at boot by infra.paths — never seeded from
+    # config-file content — so a correctly-scoped config is read on the first try.
     # Conversation checkpointer: durable SQLite when a path is configured (chat
     # history survives restarts), else in-memory. Bound into the graph at
     # compile time below — a checkpointer in the invoke config is ignored.
@@ -151,6 +151,7 @@ def _init_langgraph_agent(headless_setup: bool = False):
                 _pre.surfaces,
                 _pre.meta,
             )
+            STATE.plugin_public_paths = _pre.public_paths
             _register_plugin_subagents(_pre.subagents)
             log.info(
                 "Setup wizard has not been completed — graph not compiled "
@@ -191,8 +192,10 @@ def _init_langgraph_agent(headless_setup: bool = False):
         _plugins.skill_dirs,
         _plugins.meta,
     )
+    STATE.plugin_tool_owner = _plugins.tool_plugins
     STATE.plugin_workflow_dirs = _plugins.workflow_dirs
     STATE.plugin_a2a_skills = _plugins.a2a_skills  # A2A card skills (#570)
+    STATE.plugin_chat_commands = _plugins.chat_commands  # user-only /<name> control commands
     STATE.thread_id_resolver = _plugins.thread_id_resolver  # thread_id seam (#571)
     # A plugin may provide the knowledge backend (ADR 0031) — swap it in now (the
     # graph compiles below with STATE.knowledge_store). Default built-in store stays
@@ -202,15 +205,18 @@ def _init_langgraph_agent(headless_setup: bool = False):
     # (re)load so a config change refreshes the available `plugin` verifiers.
     from graph.goals import hooks as _goal_hooks
     from graph.goals import verifiers as _goal_verifiers
+    from graph.watches import hooks as _watch_hooks
 
     _goal_verifiers.set_plugin_verifiers(_plugins.goal_verifiers)
     _goal_hooks.set_goal_hooks(_plugins.goal_hooks)
+    _watch_hooks.set_watch_hooks(_plugins.watch_hooks)  # ADR 0067
     # Surfaces / routes / subagents (ADR 0018). Routers + surfaces are captured
     # here and consumed once by _main (mount) + the startup hook (start) — they
     # don't hot-reload. Subagents register into SUBAGENT_REGISTRY before the graph
     # build below so the first compile (and every reload) can delegate to them.
     # (`global STATE.plugin_routers, STATE.plugin_surfaces` is declared at the top of the fn.)
     STATE.plugin_routers, STATE.plugin_surfaces = _plugins.routers, _plugins.surfaces
+    STATE.plugin_public_paths = _plugins.public_paths
     _register_plugin_subagents(_plugins.subagents)
     _apply_config_subagents(STATE.graph_config)  # YAML subagent overrides (tools/max_turns/model)
     STATE.plugin_middleware = _resolve_plugin_middleware(STATE.graph_config, _plugins.middleware)  # ADR 0032
@@ -278,6 +284,11 @@ def _init_langgraph_agent(headless_setup: bool = False):
         STATE.goal_controller = GoalController(STATE.graph_config, GoalStore())
     else:
         STATE.goal_controller = None
+    # Watch primitive (ADR 0067) — many concurrent, out-of-band watches. Machinery only; no
+    # watch runs until one is created, so it's always on (cheap when idle).
+    from graph.watches import WatchController, WatchStore
+
+    STATE.watch_controller = WatchController(STATE.graph_config, WatchStore())
     log.info(
         "LangGraph agent initialized (model: %s, knowledge_db: %s, scheduler: %s)",
         STATE.graph_config.model_name,
@@ -472,7 +483,8 @@ def _build_skills_index(config, extra_skill_dirs=None):
     try:
         from pathlib import Path
 
-        from graph.config_io import _BUNDLE_CONFIG_DIR, _live_config_dir
+        from infra.paths import instance_paths
+
         from graph.skills.index import SkillsIndex
         from graph.skills.loader import seed_skills_index
 
@@ -494,8 +506,9 @@ def _build_skills_index(config, extra_skill_dirs=None):
             db_path = _resolve_skills_db(config.skills_db_path, shared=(scope == "shared"), commons=commons)
             index = SkillsIndex(db_path=db_path)
 
-        live_root = Path(config.skills_dir).expanduser() if config.skills_dir else (_live_config_dir() / "skills")
-        roots = [_BUNDLE_CONFIG_DIR / "skills", live_root]  # bundle first, live overrides
+        _ip = instance_paths()
+        live_root = Path(config.skills_dir).expanduser() if config.skills_dir else (_ip.config_dir / "skills")
+        roots = [_ip.bundle_dir / "skills", live_root]  # bundle first, live overrides
         roots.extend(Path(d) for d in (extra_skill_dirs or []))  # plugin-bundled skills
         # Operator-authored skills (UI/console CRUD) live under the data home and
         # win last — an explicit edit always overrides a bundled/plugin example.
@@ -643,35 +656,15 @@ def _build_plugins(config, existing_tools=None):
         return PluginLoadResult()
 
 
-def _seed_instance_env(config) -> None:
-    """Seed PROTOAGENT_INSTANCE from config.instance_id (ADR 0004), unless the
-    env is already set (env wins). Opt-in: no id → no scoping → legacy paths."""
-    if os.environ.get("PROTOAGENT_INSTANCE", "").strip():
-        return
-    iid = (getattr(config, "instance_id", "") or "").strip()
-    if iid:
-        os.environ["PROTOAGENT_INSTANCE"] = iid
-        log.info("[instance] data scoped to instance id %r (ADR 0004)", iid)
-
-
 def _resolve_checkpoint_db(configured: str) -> str:
-    """Pick a writable checkpoint DB path; fall back to ~/.protoagent when the
-    configured dir (default /sandbox) isn't creatable (e.g. local dev)."""
-    import os
-    from pathlib import Path
+    """The durable checkpoint DB — ``instance_root/checkpoints.db`` (per-instance).
 
-    candidate = Path(configured).expanduser()
-    try:
-        candidate.parent.mkdir(parents=True, exist_ok=True)
-        if os.access(candidate.parent, os.W_OK):
-            scoped = scope_leaf(candidate)
-            scoped.parent.mkdir(parents=True, exist_ok=True)
-            return str(scoped)
-    except OSError:
-        pass
-    fallback = scope_leaf(Path.home() / ".protoagent" / "checkpoints.db")
-    fallback.parent.mkdir(parents=True, exist_ok=True)
-    return str(fallback)
+    ``configured`` (``config.checkpoint_db_path``) only gates persistence on/off in
+    ``_build_checkpointer``; the path itself is the per-instance store, always
+    writable, so there's no /sandbox→~/.protoagent fallback dance any more."""
+    path = instance_paths().store("checkpoints.db")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return str(path)
 
 
 def _build_checkpointer(config):
@@ -813,23 +806,22 @@ async def _checkpoint_prune_loop() -> None:
         await asyncio.sleep(max(1, interval_h or 1) * 3600)
 
 
-async def _monitor_goals_loop() -> None:
-    """Out-of-band cadence for monitor goals (ADR 0030 D2.1): periodically run each
-    active monitor goal's verifier — no agent turn, no model call — so a met
-    long-horizon objective finishes (firing its on_achieved hook) without waiting
-    for a session turn. Verifier-only; the `drive` loop is untouched."""
+async def _watch_loop() -> None:
+    """Out-of-band cadence for watches (ADR 0067): periodically run each active watch's
+    verifier — no agent turn — so a met watch reacts (run_in_session + hooks) without waiting
+    for a session turn. Many watches tick together; verifier-only."""
     await asyncio.sleep(15)  # let boot settle before the first tick
     while True:
-        ctrl = STATE.goal_controller
+        ctrl = STATE.watch_controller
         cfg = STATE.graph_config
-        interval = getattr(cfg, "goal_monitor_interval", 60) if cfg else 60
+        interval = getattr(cfg, "watch_interval", 30) if cfg else 30
         if ctrl is not None:
             try:
-                n = await ctrl.tick_monitor_goals()
+                n = await ctrl.tick_all()
                 if n:
-                    log.info("[goal-monitor] %d monitor goal(s) reached a terminal state", n)
+                    log.info("[watch] %d watch(es) reached a terminal state", n)
             except Exception:
-                log.exception("[goal-monitor] tick failed")
+                log.exception("[watch] tick failed")
         await asyncio.sleep(max(5, interval))
 
 
@@ -873,21 +865,16 @@ async def _retire_thread(thread_id: str, *, harvest: bool | None = None, cascade
 
 
 def _build_inbox_store(config):
-    """Durable inbound inbox (ADR 0003). Path resolves like the other stores
-    (/sandbox → ~/.protoagent fallback), namespaced by agent name."""
+    """Durable inbound inbox (ADR 0003), namespaced by agent name. ``inbox_db_path``
+    config (a dir) is used verbatim; else the per-instance ``instance_root/inbox`` store."""
     from inbox import InboxStore
 
     name = re.sub(r"[^a-zA-Z0-9._-]", "_", agent_name()) or "agent"
-    configured = scope_leaf(Path(getattr(config, "inbox_db_path", "") or "/sandbox/inbox") / f"{name}.db")
-    try:
-        configured.parent.mkdir(parents=True, exist_ok=True)
-        if not os.access(configured.parent, os.W_OK):
-            raise OSError
-        path = str(configured)
-    except OSError:
-        fallback = scope_leaf(Path.home() / ".protoagent" / "inbox" / f"{name}.db")
-        fallback.parent.mkdir(parents=True, exist_ok=True)
-        path = str(fallback)
+    configured = getattr(config, "inbox_db_path", "") or ""
+    base = Path(configured).expanduser() if configured else instance_paths().store("inbox")
+    db = base / f"{name}.db"
+    db.parent.mkdir(parents=True, exist_ok=True)
+    path = str(db)
     try:
         return InboxStore(path)
     except Exception:
@@ -898,8 +885,8 @@ def _build_inbox_store(config):
 def _build_background_manager(config):
     """Background subagent manager (ADR 0050). Fires detached jobs as self-POSTed A2A
     turns, so it derives the invoke URL + auth exactly like ``_build_scheduler`` (so a
-    wizard rename can't break self-invocation). The store path resolves like the other
-    stores (/sandbox → ~/.protoagent fallback), namespaced by agent name. Reconciles any
+    wizard rename can't break self-invocation). The store is the per-instance
+    ``instance_root/background`` store, namespaced by agent name. Reconciles any
     job left ``running`` by a prior crash on startup. Returns ``None`` when disabled or
     the store can't be built (the ``task`` tool then falls back to synchronous execution)."""
     if os.environ.get("BACKGROUND_DISABLED", "").lower() in ("1", "true", "yes"):
@@ -908,16 +895,9 @@ def _build_background_manager(config):
     from background import BackgroundManager, BackgroundStore
 
     name = re.sub(r"[^a-zA-Z0-9._-]", "_", agent_name()) or "agent"
-    configured = scope_leaf(Path("/sandbox/background") / f"{name}.db")
-    try:
-        configured.parent.mkdir(parents=True, exist_ok=True)
-        if not os.access(configured.parent, os.W_OK):
-            raise OSError
-        path = str(configured)
-    except OSError:
-        fallback = scope_leaf(Path.home() / ".protoagent" / "background" / f"{name}.db")
-        fallback.parent.mkdir(parents=True, exist_ok=True)
-        path = str(fallback)
+    db = instance_paths().store("background") / f"{name}.db"
+    db.parent.mkdir(parents=True, exist_ok=True)
+    path = str(db)
     try:
         store = BackgroundStore(path)
     except Exception:
@@ -947,6 +927,19 @@ def _build_background_manager(config):
         publish = _event_bus.publish
     except Exception:  # noqa: BLE001
         publish = None
+
+    def _on_work_terminal(job) -> None:
+        """Give a deterministic ``spawn_work`` job the SAME idle-wake the A2A terminal
+        hook gives a subagent-turn job (ADR 0050 Phase 2). Lazy import keeps the
+        manager off ``server`` and avoids a server.a2a ↔ agent_init cycle."""
+        try:
+            from server.a2a import _background_wake_enabled, _spawn_background_wake
+
+            if _background_wake_enabled():
+                _spawn_background_wake(job)
+        except Exception:  # noqa: BLE001 — the wake is best-effort
+            log.exception("[background] work-job terminal hook failed for %s", getattr(job, "id", "?"))
+
     try:
         return BackgroundManager(
             agent_name=name,
@@ -955,6 +948,7 @@ def _build_background_manager(config):
             api_key=api_key,
             bearer_token=bearer,
             event_publish=publish,
+            on_terminal=_on_work_terminal,
         )
     except Exception:
         log.exception("[background] manager init failed; background disabled")
@@ -962,21 +956,14 @@ def _build_background_manager(config):
 
 
 def _build_activity_log(config):
-    """Provenance feed store (ADR 0022). Path resolves like the inbox store
-    (/sandbox → ~/.protoagent fallback), namespaced by agent name."""
+    """Provenance feed store (ADR 0022) — the per-instance ``instance_root/activity``
+    store, namespaced by agent name."""
     from activity import ActivityLog
 
     name = re.sub(r"[^a-zA-Z0-9._-]", "_", agent_name()) or "agent"
-    configured = scope_leaf(Path("/sandbox/activity") / f"{name}.db")
-    try:
-        configured.parent.mkdir(parents=True, exist_ok=True)
-        if not os.access(configured.parent, os.W_OK):
-            raise OSError
-        path = str(configured)
-    except OSError:
-        fallback = scope_leaf(Path.home() / ".protoagent" / "activity" / f"{name}.db")
-        fallback.parent.mkdir(parents=True, exist_ok=True)
-        path = str(fallback)
+    db = instance_paths().store("activity") / f"{name}.db"
+    db.parent.mkdir(parents=True, exist_ok=True)
+    path = str(db)
     try:
         return ActivityLog(path)
     except Exception:
@@ -985,23 +972,21 @@ def _build_activity_log(config):
 
 
 def _build_telemetry_store(config):
-    """Local per-turn telemetry store (ADR 0006 Slice 2). Path resolves like the
-    other stores (/sandbox → ~/.protoagent fallback) and is instance-scoped
-    (ADR 0004). Off when ``telemetry.enabled`` is false; best-effort otherwise."""
+    """Local per-turn telemetry store (ADR 0006 Slice 2). ``telemetry.db_path`` config
+    is used verbatim when an operator overrides it; the legacy ``/sandbox`` default maps
+    to the per-instance ``instance_root/telemetry.db`` store. Off when ``telemetry.enabled``
+    is false; best-effort otherwise."""
     if not getattr(config, "telemetry_enabled", True):
         return None
     from observability.telemetry_store import TelemetryStore
 
-    configured = scope_leaf(Path(getattr(config, "telemetry_db_path", "") or "/sandbox/telemetry.db"))
-    try:
-        configured.parent.mkdir(parents=True, exist_ok=True)
-        if not os.access(configured.parent, os.W_OK):
-            raise OSError
-        path = str(configured)
-    except OSError:
-        fallback = scope_leaf(Path.home() / ".protoagent" / "telemetry.db")
-        fallback.parent.mkdir(parents=True, exist_ok=True)
-        path = str(fallback)
+    configured = getattr(config, "telemetry_db_path", "") or ""
+    if configured and not str(configured).startswith("/sandbox"):
+        db = Path(configured).expanduser()
+    else:
+        db = instance_paths().store("telemetry.db")
+    db.parent.mkdir(parents=True, exist_ok=True)
+    path = str(db)
     try:
         store = TelemetryStore(path)
         log.info("[telemetry] store ready at %s", path)
@@ -1022,32 +1007,22 @@ def _commons_dir(config):
 
 
 def _resolve_skills_db(configured: str, *, shared: bool = False, commons=None) -> str:
-    """Pick a writable skills DB path.
+    """Pick the skills DB path.
 
     When ``shared`` (ADR 0041, tiered stores), the skills library is the COMMONS:
-    resolved un-scoped so every agent on the host shares one DB. Otherwise it's
-    per-instance scoped (``scope_leaf``), falling back to ~/.protoagent when the
-    configured dir (default /sandbox) isn't creatable."""
-    import os
+    box-level + un-scoped so every agent on the host shares one DB. Otherwise it's
+    the per-instance ``instance_root/skills.db`` (``configured`` is no longer a
+    location knob — the instance root IS the scope)."""
     from pathlib import Path
 
     if shared:
-        path = Path(commons or (Path.home() / ".protoagent" / "commons")) / "skills.db"
+        path = Path(commons or instance_paths().commons_dir) / "skills.db"
         path.parent.mkdir(parents=True, exist_ok=True)
         return str(path)
 
-    candidate = Path(configured)
-    try:
-        candidate.parent.mkdir(parents=True, exist_ok=True)
-        if os.access(candidate.parent, os.W_OK):
-            scoped = scope_leaf(candidate)
-            scoped.parent.mkdir(parents=True, exist_ok=True)
-            return str(scoped)
-    except OSError:
-        pass
-    fallback = scope_leaf(Path.home() / ".protoagent" / "skills.db")
-    fallback.parent.mkdir(parents=True, exist_ok=True)
-    return str(fallback)
+    db = instance_paths().store("skills.db")
+    db.parent.mkdir(parents=True, exist_ok=True)
+    return str(db)
 
 
 def _run_on_server_loop(make_coro, what: str) -> None:
@@ -1237,12 +1212,12 @@ def _reload_langgraph_agent() -> tuple[bool, str]:
 
     from graph.agent import create_agent_graph
     from graph.config import LangGraphConfig
-    from graph.config_io import CONFIG_YAML_PATH, ensure_live_config, is_setup_complete
+    from graph.config_io import config_yaml_path, ensure_live_config, is_setup_complete
     from tools.lg_tools import get_all_tools
 
     ensure_live_config()
     try:
-        new_config = LangGraphConfig.from_yaml(CONFIG_YAML_PATH)
+        new_config = LangGraphConfig.from_yaml(config_yaml_path())
     except Exception as e:
         log.exception("[reload] config load failed")
         return False, f"config load failed: {e}"
@@ -1285,6 +1260,8 @@ def _reload_langgraph_agent() -> tuple[bool, str]:
     new_skills = None
     new_mcp_clients, new_mcp_tools, new_mcp_meta = [], [], []
     new_plugin_tools, new_plugin_skill_dirs, new_plugin_meta = [], [], []
+    new_plugin_tool_owner: dict = {}  # tool name -> owning plugin display name (Tools tab)
+    new_plugin_chat_commands: dict = {}  # user-only /<name> control commands
     if is_setup_complete():
         try:
             new_store = _build_knowledge_store(new_config)
@@ -1303,8 +1280,10 @@ def _reload_langgraph_agent() -> tuple[bool, str]:
                 new_config, plugin_servers=[s["factory"] for s in new_plugins.mcp_servers]
             )
             new_plugin_tools = new_plugins.tools
+            new_plugin_tool_owner = new_plugins.tool_plugins
             new_plugin_skill_dirs = new_plugins.skill_dirs
             new_plugin_meta = new_plugins.meta
+            new_plugin_chat_commands = new_plugins.chat_commands  # user-only /<name> control commands
             # Plugin knowledge backend (ADR 0031) — swap before the graph rebuild.
             new_store = _apply_plugin_knowledge_backend(new_config, new_store, new_plugins)
             _register_plugin_subagents(new_plugins.subagents)
@@ -1353,11 +1332,14 @@ def _reload_langgraph_agent() -> tuple[bool, str]:
         new_plugin_skill_dirs,
         new_plugin_meta,
     )
+    STATE.plugin_tool_owner = new_plugin_tool_owner
     try:
         from security import egress
         from security import policy
 
-        egress.set_allowed_hosts(new_config.egress_allowed_hosts)  # live-reload (ADR 0008)
+        egress.set_allowed_hosts(
+            new_config.egress_allowed_hosts, also_allow_url=new_config.api_base
+        )  # live-reload (ADR 0008)
         policy.set_callback_allowlist(new_config.security_callback_allowlist)  # live-reload (#572)
     except Exception:  # noqa: BLE001 — never block a reload on the egress update
         pass
@@ -1372,6 +1354,7 @@ def _reload_langgraph_agent() -> tuple[bool, str]:
     STATE.graph = new_graph
     STATE.plugin_middleware = new_middleware  # ADR 0032
     STATE.plugin_late_tool_factories = new_late_tool_factories  # late-tools seam
+    STATE.plugin_chat_commands = new_plugin_chat_commands  # user-only /<name> control commands
     # STATE.workflow_registry / workflow_run were (re)set by the workflows plugin above.
     STATE.inbox_store = new_inbox_store
     # Commit the scheduler swap. start/stop are async — fire-and-forget
@@ -1539,7 +1522,7 @@ def _prune_shadowing_agent_keys(host_only: dict) -> list[str]:
     import graph.config_io as _cio
     from graph.config_io import load_yaml_doc, save_yaml_doc
 
-    leaf = _cio.CONFIG_YAML_PATH  # resolved at call time (honors a repoint)
+    leaf = _cio.config_yaml_path()  # resolved at call time (honors a repoint)
     if not Path(leaf).exists():
         return []  # no agent leaf on disk → nothing can shadow; don't seed one
     doc = load_yaml_doc(leaf)
@@ -1634,7 +1617,7 @@ def _apply_settings_changes(
 
                 main_config, secret_updates = split_secret_updates(config)
                 save_secrets(secret_updates)
-                leaf = _cio.CONFIG_YAML_PATH  # resolved at call time (honors a repoint)
+                leaf = _cio.config_yaml_path()  # resolved at call time (honors a repoint)
                 doc = load_yaml_doc(leaf)
                 apply_updates_to_yaml(doc, main_config)
                 strip_secrets_from_doc(doc)
@@ -1680,7 +1663,7 @@ def _reset_settings_keys(keys: list[str]) -> tuple[bool, list[str]]:
     messages: list[str] = []
     if keys:
         try:
-            leaf = _cio.CONFIG_YAML_PATH  # resolved at call time (honors a repoint)
+            leaf = _cio.config_yaml_path()  # resolved at call time (honors a repoint)
             doc = load_yaml_doc(leaf)
             pop_keys_from_yaml(doc, keys)
             save_yaml_doc(doc, leaf)

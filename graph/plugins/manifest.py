@@ -66,6 +66,13 @@ class PluginManifest:
     # postMessage token handshake. See `_parse_views` (warns on non-same-origin)
     # and docs/guides/building-react-plugin-views.md.
     views: list[dict] = field(default_factory=list)
+    # Auth-exempt paths — prefixes under THIS plugin's own /plugins/<id>/ (or
+    # /api/plugins/<id>/) namespace that the default-deny auth middleware lets
+    # through WITHOUT a bearer. The escape hatch for an inbound webhook (no bearer
+    # — the plugin verifies its own signature) or a public view page that must load
+    # in a browser iframe under a token-gated deployment. Namespace-scoped by the
+    # parser so a plugin can never exempt a core route.
+    public_paths: list[str] = field(default_factory=list)
     # Event contract (ADR 0039) — the topics this plugin broadcasts / listens for.
     # Declarative for discoverability (surfaced in /api/runtime/status): a plugin
     # "ships" its events as its public API so others subscribe by topic without
@@ -123,6 +130,68 @@ def _parse_views(views, plugin_id: str) -> list[dict]:
     return kept
 
 
+# A plugin id namespaces its routes (``/plugins/<id>/``, ``/api/plugins/<id>/``)
+# and its config section, so it must be a safe slug AND must not shadow a core
+# ``/api/plugins/<verb>`` management route — otherwise its ``public_paths`` could
+# prefix-match and exempt that core route (e.g. install = RCE) from the auth gate.
+_VALID_PLUGIN_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
+_RESERVED_PLUGIN_IDS = frozenset({"install", "installed", "sync", "updates", "catalog", "enabled"})
+
+
+def _parse_public_paths(paths, plugin_id: str) -> list[str]:
+    """Keep auth-exempt paths that live under THIS plugin's namespace SUBTREE
+    (``/plugins/<id>/…`` or ``/api/plugins/<id>/…``); drop + warn on anything else.
+
+    Namespace-scoping is the security boundary: a plugin can exempt only its own
+    routes from the auth gate, never a core path like ``/api/config`` or the core
+    ``/api/plugins/<verb>`` routes. The trailing slash is load-bearing — without
+    it, id ``install`` would prefix-match the core ``/api/plugins/install`` route."""
+    if not isinstance(paths, (list, tuple)):
+        return []
+    roots = (f"/plugins/{plugin_id}/", f"/api/plugins/{plugin_id}/")
+    kept: list[str] = []
+    for p in paths:
+        s = str(p).strip()
+        if s.startswith(roots):
+            kept.append(s)
+        elif s:
+            log.warning(
+                "[plugins] %s: public_path %r is outside the plugin namespace "
+                "(/plugins/%s/… or /api/plugins/%s/…) — ignored",
+                plugin_id, s, plugin_id, plugin_id,
+            )
+    return kept
+
+
+def _view_public_paths(views: list[dict]) -> list[str]:
+    """The page path of every console view (and its palette morph), to auto-exempt
+    from the auth gate.
+
+    A view page is public *chrome*: the console iframes it with a plain navigation
+    that cannot carry the operator bearer, so a gated page 401-blanks under a
+    token-gated deployment. Its DATA stays gated under ``/api/plugins/<id>/*`` and
+    is fetched from inside the loaded page with the postMessage handshake token.
+
+    Deriving these from ``views`` means a plugin's view loads under a token gate
+    automatically — authors don't have to re-declare each view path in
+    ``public_paths`` (the bundled notes/docs plugins didn't, and 401-blanked).
+    Query/fragment are stripped so the prefix match covers e.g.
+    ``/plugins/docs/view?mode=search``. Same-origin scoping is enforced later by
+    ``_parse_public_paths``.
+    """
+    out: list[str] = []
+    for v in views:
+        candidates = [v.get("path")]
+        palette = v.get("palette")
+        if isinstance(palette, dict):
+            candidates.append(palette.get("path"))
+        for c in candidates:
+            p = str(c or "").split("?", 1)[0].split("#", 1)[0].strip()
+            if p:
+                out.append(p)
+    return out
+
+
 def load_manifest(plugin_dir: Path) -> PluginManifest | None:
     """Parse ``<plugin_dir>/protoagent.plugin.yaml`` → ``PluginManifest``.
 
@@ -147,6 +216,13 @@ def load_manifest(plugin_dir: Path) -> PluginManifest | None:
     if not pid or not name:
         log.warning("[plugins] %s: manifest missing required id/name — skipping", plugin_dir.name)
         return None
+    if not _VALID_PLUGIN_ID.match(pid) or pid.lower() in _RESERVED_PLUGIN_IDS:
+        log.warning(
+            "[plugins] %s: invalid or reserved plugin id %r — must match %s and must not shadow a "
+            "core /api/plugins/ route; skipping",
+            plugin_dir.name, pid, _VALID_PLUGIN_ID.pattern,
+        )
+        return None
 
     req = data.get("requires_env")
     requires_env = [str(x) for x in req] if isinstance(req, (list, tuple)) else []
@@ -156,6 +232,18 @@ def load_manifest(plugin_dir: Path) -> PluginManifest | None:
     secrets = data.get("secrets")
     settings = data.get("settings")
     views = _parse_views(data.get("views"), pid)
+    # public_paths = explicitly-declared exempt paths PLUS every view's own page
+    # path (view pages are public chrome — see _view_public_paths). Both run
+    # through the namespace validator; dict.fromkeys dedupes while preserving order
+    # (a view path a manifest also lists explicitly collapses to one).
+    public_paths = list(
+        dict.fromkeys(
+            [
+                *_parse_public_paths(data.get("public_paths"), pid),
+                *_parse_public_paths(_view_public_paths(views), pid),
+            ]
+        )
+    )
     emits = data.get("emits")
     subscribes = data.get("subscribes")
     requires_pip = data.get("requires_pip")
@@ -177,6 +265,7 @@ def load_manifest(plugin_dir: Path) -> PluginManifest | None:
         test=bool(data.get("test", False)),
         guide_url=str(data.get("guide_url", "") or "").strip(),
         views=views,
+        public_paths=public_paths,
         emits=[str(x) for x in emits] if isinstance(emits, (list, tuple)) else [],
         subscribes=[str(x) for x in subscribes] if isinstance(subscribes, (list, tuple)) else [],
         requires_pip=[str(x) for x in requires_pip] if isinstance(requires_pip, (list, tuple)) else [],

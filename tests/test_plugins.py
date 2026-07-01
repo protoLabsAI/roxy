@@ -57,6 +57,52 @@ def test_manifest_parse(tmp_path) -> None:
     assert load_manifest(tmp_path / "bad") is None  # missing id
 
 
+def test_public_paths_namespace_scoped(tmp_path) -> None:
+    # A plugin may declare auth-exempt paths only under its OWN namespace; anything
+    # else (a core path, another plugin's path) is dropped by the parser.
+    _make_plugin(
+        tmp_path, "wh", enabled=True,
+        manifest_extra=(
+            "public_paths:\n"
+            "  - /plugins/wh/webhook\n"
+            "  - /api/plugins/wh/data\n"
+            "  - /api/config\n"
+            "  - /plugins/other/x\n"
+        ),
+    )
+    m = load_manifest(tmp_path / "wh")
+    assert m.public_paths == ["/plugins/wh/webhook", "/api/plugins/wh/data"]
+
+
+def test_public_paths_reject_core_route_prefix(tmp_path) -> None:
+    # The historical bypass: a plugin id that prefix-matches a core /api/plugins/<verb>
+    # route (e.g. "install") could exempt that RCE route from the auth gate. Such an
+    # id is now refused at load, and the path boundary requires a trailing slash after
+    # the id so it can't prefix-match the bare core route either.
+    from graph.plugins.manifest import _parse_public_paths
+
+    _make_plugin(tmp_path, "install", enabled=True, manifest_extra="public_paths:\n  - /api/plugins/install\n")
+    assert load_manifest(tmp_path / "install") is None  # reserved id → skipped entirely
+
+    assert _parse_public_paths(["/api/plugins/install"], "install") == []  # no trailing slash → not a subtree
+    assert _parse_public_paths(["/api/plugins/demo/webhook"], "demo") == ["/api/plugins/demo/webhook"]
+
+
+def test_invalid_plugin_id_rejected(tmp_path) -> None:
+    from graph.plugins.manifest import _VALID_PLUGIN_ID
+
+    _make_plugin(tmp_path, "ok-id_1", enabled=True)
+    assert load_manifest(tmp_path / "ok-id_1") is not None  # ordinary slug is fine
+
+    assert not _VALID_PLUGIN_ID.match("../etc")  # path traversal
+    assert not _VALID_PLUGIN_ID.match("a/b")  # slash
+    for reserved in ("sync", "Updates", "catalog"):
+        d = tmp_path / f"x_{reserved}"
+        d.mkdir()
+        (d / "protoagent.plugin.yaml").write_text(f"id: {reserved}\nname: x\nversion: 0.1.0\n", encoding="utf-8")
+        assert load_manifest(d) is None, reserved
+
+
 def test_discover_live_overrides_bundle(tmp_path, monkeypatch) -> None:
     bundle = tmp_path / "bundle"
     live = tmp_path / "live"
@@ -335,6 +381,31 @@ def test_manifest_parses_views() -> None:
     assert m.views[0]["icon"] == "LayoutDashboard"
 
 
+def test_view_paths_are_auto_public(tmp_path) -> None:
+    # A view page is public chrome (the console iframes it; the nav can't carry a
+    # bearer), so its path — and its palette morph's path, query stripped — is
+    # auto-exempted from the auth gate WITHOUT the manifest re-declaring it in
+    # public_paths. (This is the bug that 401-blanked the bundled notes/docs views
+    # under a token gate.) Explicit public_paths still merge in, deduped.
+    _make_plugin(
+        tmp_path, "viewy", enabled=True,
+        manifest_extra=(
+            "views:\n"
+            '  - {id: main, label: Main, path: /plugins/viewy/view, palette: {path: "/plugins/viewy/quick?mode=search"}}\n'
+            "public_paths:\n"
+            "  - /plugins/viewy/view\n"          # also declared explicitly → not duplicated
+            "  - /api/plugins/viewy/webhook\n"   # a non-view exempt path → preserved
+        ),
+    )
+    m = load_manifest(tmp_path / "viewy")
+    assert m is not None
+    assert m.public_paths == [
+        "/plugins/viewy/view",          # from public_paths; the view path collapses onto it
+        "/api/plugins/viewy/webhook",
+        "/plugins/viewy/quick",         # palette path, query stripped, auto-added
+    ]
+
+
 def test_loader_meta_exposes_views_for_enabled_plugin(monkeypatch, tmp_path) -> None:
     root = tmp_path / "plugins"
     _make_plugin(
@@ -511,3 +582,28 @@ def test_reload_picks_up_edited_sibling_submodule(tmp_path, monkeypatch) -> None
     res2 = load_plugins(_cfg(plugins_enabled=["multi"]))
     say2 = next(t for t in res2.tools if getattr(t, "name", "") == "say")
     assert say2.invoke({}) == "v2"
+
+
+def test_registry_live_config_reads_state_then_falls_back(monkeypatch) -> None:
+    """live_config() re-reads the section from STATE.graph_config on each call (so a
+    mounted router reflects config edits without a restart), falling back to the
+    register-time snapshot when the host state/section isn't available."""
+    import types
+
+    from graph.plugins.registry import PluginRegistry
+
+    reg = PluginRegistry("github", Path("."), config={"repos": ["o/snap"]}, config_section="github")
+    import runtime.state as rs
+
+    # No graph_config → snapshot.
+    monkeypatch.setattr(rs.STATE, "graph_config", None, raising=False)
+    assert reg.live_config() == {"repos": ["o/snap"]}
+
+    # Live section present → live wins (the edited value, no restart).
+    cfg = types.SimpleNamespace(plugin_config={"github": {"repos": ["o/live"]}})
+    monkeypatch.setattr(rs.STATE, "graph_config", cfg, raising=False)
+    assert reg.live_config() == {"repos": ["o/live"]}
+
+    # Section missing from live config → snapshot.
+    cfg.plugin_config = {"other": {}}
+    assert reg.live_config() == {"repos": ["o/snap"]}
