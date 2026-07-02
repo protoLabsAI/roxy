@@ -18,7 +18,9 @@ on:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: protolabsai/protoagent
+  # Overridable (#1534): a fork that opts into RELEASE_ENABLED sets its own
+  # `IMAGE_NAME` repo variable to push to its GHCR instead of protoLabs'.
+  IMAGE_NAME: ${{ vars.IMAGE_NAME || 'protolabsai/protoagent' }}
 
 jobs:
   release:
@@ -145,13 +147,14 @@ jobs:
           NOTES: ${{ steps.notes.outputs.notes }}
         run: |
           printf '%s' "$NOTES" > "$RUNNER_TEMP/release-notes.md"
-          # --latest=false: do NOT promote to 'Latest' yet. The in-app updater fetches
+          # --latest=false: do NOT promote to 'Latest'. The in-app updater fetches
           # releases/latest/download/latest.json, so a release must not become 'Latest'
-          # until its latest.json exists — otherwise update checks 404 in the window
-          # before the desktop build's fan-in uploads it. The desktop fan-in flips this
-          # release to 'Latest' once latest.json is up (desktop-build.yml). Patch tags
-          # skip the desktop build entirely, so they stay non-Latest and 'Latest'
-          # correctly remains on the last .0 (the one carrying latest.json).
+          # until its latest.json exists — otherwise update checks 404. Desktop builds
+          # are now MANUAL (desktop-build.yml runs on workflow_dispatch, not on tags), so
+          # every tagged release stays non-Latest here; it's promoted to 'Latest' only
+          # when someone dispatches a desktop build for that tag and its fan-in uploads
+          # latest.json. 'Latest' therefore tracks the last DESKTOP release (the one the
+          # updater can actually use), not the newest tag.
           gh release create "${{ steps.version.outputs.tag }}" \
             --title "${{ steps.version.outputs.tag }}" \
             --notes-file "$RUNNER_TEMP/release-notes.md" \
@@ -164,11 +167,28 @@ jobs:
       # scripts/post-release-notes.mjs.
 
       - name: Generate + post release notes
+        id: relnotes
         continue-on-error: true
-        uses: protoLabsAI/release-tools@b7c3531dd67accb57ca09242f47d8c0eb1ace8eb # v1.1.0
+        uses: protoLabsAI/release-tools@d6bfc09ce7d17da3f196f3b54afde5830b8a6398 # v2.4.0 — first version with the out-file input (#1516/#1615)
         with:
           version: ${{ steps.version.outputs.tag }}
           previous-version: ${{ steps.version.outputs.prev_tag }}
+          # Persist the SAME themed notes it posts to Discord (one generation writes the file
+          # AND posts the embed), so the in-app updater can render the identical text — one
+          # changelog, one voice (#1516). Uploaded as a release asset below; the (later,
+          # manual) desktop build prefers it for latest.json.
+          out-file: release-notes.md
         env:
           GATEWAY_API_KEY: ${{ secrets.GATEWAY_API_KEY }}
           DISCORD_RELEASE_WEBHOOK: ${{ secrets.DISCORD_RELEASE_WEBHOOK }}
+
+      # Attach the LLM notes to the release so desktop-build.yml's latest.json fan-in can read
+      # them (it runs on a later manual dispatch, so the asset must live on the release, not a
+      # step output). Best-effort + guarded: a fork with no GATEWAY_API_KEY writes no file, the
+      # upload is skipped, and the updater falls back to the curated CHANGELOG.md section.
+      - name: Persist LLM release notes as an asset
+        if: hashFiles('release-notes.md') != ''
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "${{ steps.version.outputs.tag }}" release-notes.md --clobber

@@ -111,7 +111,7 @@ export const FLEET = {
 
 export const ARCHETYPES = [
   { id: "basic", label: "Basic", icon: "Sparkles", blurb: "A plain agent — add tools later.", bundle: null, soul: "# Identity\n\nI am a general-purpose agent." },
-  { id: "pm-stack", label: "Project Manager", icon: "LayoutGrid", blurb: "PM tools + board.", bundle: "https://github.com/protoLabsAI/pm-stack", soul: "# Identity\n\nI am a project-management agent." },
+  { id: "product-stack", label: "Product Manager", icon: "Compass", blurb: "Research, strategy, and specs — rendered inline.", bundle: "https://github.com/protoLabsAI/product-stack", soul: "# Identity\n\nI am a product-management agent." },
   { id: "custom", label: "Custom", icon: "PenLine", blurb: "Write your own — fill in a template.", bundle: null, soul: "# Identity\n\n_Describe your agent in one paragraph._" },
 ];
 
@@ -175,6 +175,40 @@ export const GOALS = {
   ],
 };
 
+// Watches (ADR 0067) — varied statuses so the Work overview card renders an active
+// count, a met-today pulse fragment, and tinted status badges. Times are epoch SECONDS.
+// Mirror the controller's write order: the met path sets `finished_at` and skips the
+// `last_checked` update, so a finished watch's last_checked is the PREVIOUS check.
+// "met today" derives from finished_at on the local day, so keep it near now.
+export const WATCHES = {
+  enabled: true,
+  watches: [
+    {
+      id: "watch-1",
+      condition: "CI is green on main",
+      status: "active",
+      verifier: { type: "llm" },
+      last_checked: Math.floor(Date.now() / 1000) - 120,
+    },
+    {
+      id: "watch-2",
+      condition: "The staging deploy finishes",
+      status: "met",
+      verifier: { type: "llm" },
+      last_checked: Math.floor(Date.now() / 1000) - 900,
+      finished_at: Math.floor(Date.now() / 1000) - 600,
+    },
+    {
+      id: "watch-3",
+      condition: "Inbox zero before Friday",
+      status: "expired",
+      verifier: { type: "llm" },
+      last_checked: Math.floor(Date.now() / 1000) - 7500,
+      finished_at: Math.floor(Date.now() / 1000) - 7200,
+    },
+  ],
+};
+
 export const NOTES_WORKSPACE = {
   version: 1,
   workspaceVersion: 1,
@@ -233,6 +267,25 @@ export const SETTINGS_SCHEMA = [
     category: "Behavior",
     fields: [
       { key: "runtime.autostart_on_boot", label: "Autostart on boot", type: "bool", section: "Runtime", restart: true, description: "Install/remove the boot LaunchAgent.", options: [], value: false, default: false, scope: "agent", source: "agent" },
+    ],
+  },
+  // The per-agent run_command controls + the operator tool denylist — edited via the
+  // Tools panel's QuickSetting chips (no generic Capabilities panel renders these).
+  {
+    section: "Filesystem",
+    category: "Capabilities",
+    fields: [
+      { key: "filesystem.enabled", label: "Filesystem tools", type: "bool", section: "Filesystem", restart: false, description: "", options: [], value: true, default: true, scope: "agent", source: "agent" },
+      { key: "filesystem.allow_run", label: "Allow run_command", type: "bool", section: "Filesystem", restart: false, description: "", options: [], value: true, default: true, scope: "agent", source: "agent", depends_on: { key: "filesystem.enabled" } },
+      { key: "filesystem.run_requires_approval", label: "Require approval per command", type: "bool", section: "Filesystem", restart: false, description: "", options: [], value: true, default: true, scope: "agent", source: "agent", depends_on: { key: "filesystem.allow_run" } },
+      { key: "filesystem.bypass_allowed", label: "Allow /bypass", type: "bool", section: "Filesystem", restart: false, description: "", options: [], value: true, default: true, scope: "agent", source: "agent", depends_on: { key: "filesystem.run_requires_approval" } },
+    ],
+  },
+  {
+    section: "Tools",
+    category: "Capabilities",
+    fields: [
+      { key: "tools.disabled", label: "Disabled tools", type: "string_list", section: "Tools", restart: false, description: "", options: [], value: [], default: [], scope: "agent", source: "agent" },
     ],
   },
   // A plugin-contributed group (ADR 0019/0059) — tagged with plugin_id so the
@@ -686,6 +739,81 @@ export const KNOWLEDGE_CHUNKS = [
     domain: "general", source: null, source_type: null, finding_type: null,
     created_at: "2026-06-02T09:00:00+00:00",
     tier: "private",   // private to this agent → eligible for Share (promote)
+  },
+  // A multi-chunk ingested source (#1575) → renders as one collapsible section
+  // ("… · 3 chunks"). ids 11/12 above stay flat (single/no source), so the
+  // list + promote/unshare specs are unaffected.
+  { id: 13, heading: "", content: "Switchbacks keep the grade walkable.", preview: "Switchbacks keep the grade walkable.",
+    domain: "media", source: "Hiking with Kevin — Christina Mariani", source_type: "youtube", finding_type: null,
+    created_at: "2026-06-04T10:00:00+00:00", tier: null },
+  { id: 14, heading: "", content: "Bring more water than you think.", preview: "Bring more water than you think.",
+    domain: "media", source: "Hiking with Kevin — Christina Mariani", source_type: "youtube", finding_type: null,
+    created_at: "2026-06-04T10:01:00+00:00", tier: null },
+  { id: 15, heading: "", content: "The summit view pays off the climb.", preview: "The summit view pays off the climb.",
+    domain: "media", source: "Hiking with Kevin — Christina Mariani", source_type: "youtube", finding_type: null,
+    created_at: "2026-06-04T10:02:00+00:00", tier: null },
+];
+
+// Memory inspector (ADR 0069 D7) — session-summary digest rows, hot-memory chunks,
+// and the per-turn injection record the Memory surface renders.
+export const MEMORY_SESSIONS = [
+  {
+    session_id: "chat-1750000000000-abc123",
+    timestamp: "2026-06-30T18:00:00+00:00",
+    surface: "chat",
+    topic: "plan the memory hardening rollout",
+    message_count: 12,
+    size_bytes: 2048,
+  },
+  {
+    session_id: "sched-hourly-report",
+    timestamp: "2026-06-30T17:00:00+00:00",
+    surface: "background",
+    topic: "compile the hourly ops report",
+    message_count: 4,
+    size_bytes: 512,
+  },
+];
+
+export const MEMORY_SESSION_RENDERED =
+  '<session id="chat-1750000000000-abc123" timestamp="2026-06-30T18:00:00+00:00">\n' +
+  "  <messages>\n" +
+  "    <user>plan the memory hardening rollout</user>\n" +
+  "    <assistant>Here is the phased plan…</assistant>\n" +
+  "  </messages>\n" +
+  "</session>";
+
+export const MEMORY_HOT = [
+  {
+    id: 31, heading: "Operator timezone", content: "The operator works in US/Pacific.",
+    preview: "The operator works in US/Pacific.",
+    domain: "hot", source: "chat-1750000000000-abc123", source_type: "extracted", finding_type: null,
+    created_at: "2026-06-29T10:00:00+00:00",
+  },
+  {
+    id: 32, heading: "", content: "Weekly report goes out Fridays at 9am.",
+    preview: "Weekly report goes out Fridays at 9am.",
+    domain: "hot", source: "console", source_type: "operator", finding_type: null,
+    created_at: "2026-06-28T09:00:00+00:00",
+  },
+];
+
+export const MEMORY_INJECTIONS = [
+  {
+    ts: "2026-06-30T18:05:00+00:00",
+    session_id: "chat-1750000000000-abc123",
+    digest_session_ids: ["sched-hourly-report"],
+    hot_chunk_ids: [31, 32],
+    rag_chunk_ids: [11],
+    approx_tokens: 420,
+  },
+  {
+    ts: "2026-06-30T17:01:00+00:00",
+    session_id: "sched-hourly-report",
+    digest_session_ids: [],
+    hot_chunk_ids: [31],
+    rag_chunk_ids: [],
+    approx_tokens: 120,
   },
 ];
 

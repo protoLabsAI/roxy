@@ -189,17 +189,32 @@ def _summary(m: PluginManifest, *, source: str, ref: str, sha: str) -> dict:
 
 
 def _clone(url: str, ref: str | None, dest: Path) -> str:
-    """Clone ``url`` at ``ref`` into ``dest``; return the resolved commit SHA."""
+    """Clone ``url`` at ``ref`` into ``dest``; return the resolved commit SHA.
+
+    A plain LOCAL path is rewritten to a ``file://`` URL first. Without it git
+    uses its "local transport" — a readdir+copy of the source's ``.git/objects``
+    — which silently ignores ``--depth`` and races anything concurrently writing
+    the source repo: ``git commit`` spawns a DETACHED ``git maintenance run
+    --auto``, and on CI that background maintenance renamed a ``tmp_rev_*`` pack
+    file mid-copy → ``fatal: failed to copy file … No such file or directory``
+    (#1600). ``file://`` forces the regular pack transport (upload-pack streams a
+    fresh pack; nothing enumerates the source's raw object files), which is
+    immune to that race — exactly what git's own warning recommends.
+    ``--no-hardlinks`` stays as the belt for any local-transport clone that
+    slips through (it avoids the older ``hardlink different from source`` race);
+    it's a no-op for the file:// and remote cases."""
+    if url.startswith("/"):
+        url = Path(url).resolve().as_uri()
     if ref and _SHA_RE.match(ref):
         # A specific commit: full clone (shallow can't reliably check out an
         # arbitrary SHA), then check it out.
-        _git("clone", "--no-recurse-submodules", url, str(dest), timeout=_CLONE_TIMEOUT_S)
+        _git("clone", "--no-hardlinks", "--no-recurse-submodules", url, str(dest), timeout=_CLONE_TIMEOUT_S)
         _git("checkout", ref, cwd=dest)
     elif ref:
         # A tag or branch: shallow clone of just that ref.
-        _git("clone", "--depth", "1", "--no-recurse-submodules", "--branch", ref, url, str(dest), timeout=_CLONE_TIMEOUT_S)
+        _git("clone", "--depth", "1", "--no-hardlinks", "--no-recurse-submodules", "--branch", ref, url, str(dest), timeout=_CLONE_TIMEOUT_S)
     else:
-        _git("clone", "--depth", "1", "--no-recurse-submodules", url, str(dest), timeout=_CLONE_TIMEOUT_S)
+        _git("clone", "--depth", "1", "--no-hardlinks", "--no-recurse-submodules", url, str(dest), timeout=_CLONE_TIMEOUT_S)
     return _git("rev-parse", "HEAD", cwd=dest)
 
 

@@ -1,4 +1,4 @@
-import { ArrowLeftRight, ChevronDown, ChevronUp, Eye, EyeOff, Pencil, Plus, Puzzle, SlidersHorizontal, X } from "lucide-react";
+import { ArrowLeftRight, ChevronDown, ChevronUp, Eye, EyeOff, Pencil, Plus, Puzzle, RefreshCw, SlidersHorizontal, Trash2, X } from "lucide-react";
 
 import { openView } from "../app/usePaletteRegistry";
 import { useUI } from "../state/uiStore";
@@ -10,6 +10,12 @@ import type { MenuEntry } from "./types";
 // rails (without disabling the plugin). Chat is movable across all three docks like any other
 // surface; plugin views carry their owning plugin's id/name in `ctx` (resolved by the App-side
 // trigger) so Configure can open that plugin's settings dialog.
+//
+// Plugin lifecycle (#1521 / #1522): the App-side trigger also resolves the plugin's installed
+// version, whether the freshness poll says it's behind (`pluginUpdatable`), and whether it lives
+// in the writable plugins dir (`pluginRemovable`). So the menu shows the version, an "Update
+// available" action when behind, and a destructive "Uninstall…" — both gated so an in-tree
+// built-in (which the server refuses to update/uninstall) never offers them.
 registerContextMenu({
   type: "rail-surface",
   items: (ctx: {
@@ -17,6 +23,10 @@ registerContextMenu({
     side: "left" | "right" | "bottom";
     pluginId?: string;
     pluginName?: string;
+    pluginVersion?: string;
+    pluginBuiltin?: boolean;
+    pluginRemovable?: boolean;
+    pluginUpdatable?: boolean;
   }): MenuEntry[] => {
     if (!ctx) return [];
     const ui = useUI.getState();
@@ -41,16 +51,33 @@ registerContextMenu({
     // is always present; Configure (plugin views only) opens the owning plugin's settings dialog;
     // Hide moves the surface to railOrder.hidden (restore from ⌘K or "Move to …"). Chat is never
     // hidden — it mounts unconditionally on its dock, so a hidden chat would render with no rail icon.
+    // Built-in / uninstall / update, all gated on the plugin's origin, cluster under Configure.
     const manage: MenuEntry[] = [];
     if (ctx.pluginId) {
       const pid = ctx.pluginId;
       const pname = ctx.pluginName ?? ctx.pluginId;
+      // Installed version — informational (a disabled, non-clickable header), so the menu
+      // answers "which version am I on?" without opening the manager.
+      if (ctx.pluginVersion) {
+        manage.push({ id: "plugin-version", label: `Version v${ctx.pluginVersion}`, disabled: true, run: () => {} });
+      }
       manage.push({
         id: "configure",
         label: "Configure…",
         icon: <SlidersHorizontal size={14} />,
         run: () => useUI.getState().openPluginConfig(pid, pname),
       });
+      // Update — only when the freshness poll says this plugin is behind its ref AND it's
+      // not an in-tree built-in (the server refuses to update those). Fires via the store;
+      // a root PluginRailManage runs the mutation + toast (up-to-date/pinned → no item).
+      if (ctx.pluginUpdatable && !ctx.pluginBuiltin) {
+        manage.push({
+          id: "update",
+          label: "Update available",
+          icon: <RefreshCw size={14} />,
+          run: () => useUI.getState().requestPluginUpdate(pid, pname),
+        });
+      }
     }
     // A rail-wide escape hatch on every icon: the all-plugins counterpart to the per-plugin
     // "Configure…" above — opens Settings ▸ Integrations.
@@ -66,6 +93,22 @@ registerContextMenu({
         label: "Hide",
         icon: <EyeOff size={14} />,
         run: () => useUI.getState().hideSurface(ctx.id),
+      });
+    }
+    // Uninstall — a destructive action set off by its own divider, offered only for a
+    // writable-dir plugin (git-installed / local copy) that isn't an in-tree built-in
+    // (the server refuses those, so they only get Disable in the manager). The store
+    // trigger opens a "This cannot be undone." confirm rendered by PluginRailManage.
+    if (ctx.pluginId && ctx.pluginRemovable && !ctx.pluginBuiltin) {
+      const pid = ctx.pluginId;
+      const pname = ctx.pluginName ?? ctx.pluginId;
+      manage.push({ id: "uninstall-div", divider: true });
+      manage.push({
+        id: "uninstall",
+        label: "Uninstall…",
+        icon: <Trash2 size={14} />,
+        danger: true,
+        run: () => useUI.getState().requestPluginUninstall(pid, pname),
       });
     }
     // Any surface — core, plugin, or chat — reorders within its dock and moves across, including
@@ -160,24 +203,41 @@ registerContextMenu({
   },
 });
 
-// Right-click a chat session tab → New chat / Rename / Close (ADR 0036). ChatSurface owns the
-// behavior and passes it in `ctx` as closures: Close reuses its confirm-dialog flow, Rename
-// triggers the DS TabBar's inline editor (a synthetic dblclick on the tab). Right-clicking empty
-// tab-bar space carries only `onNew`. (The DS TabBar exposes no per-tab context-menu hook — a
-// DS gap noted for contribute-back; ChatSurface delegates from the tab-bar wrapper meanwhile.)
+// Right-click a chat session tab → New chat / New incognito chat / Rename / Incognito toggle /
+// Close (ADR 0036). ChatSurface owns the behavior and passes it in `ctx` as closures: Close
+// reuses its confirm-dialog flow, Rename triggers the DS TabBar's inline editor (a synthetic
+// dblclick on the tab), the incognito entries flip the per-thread flag (ADR 0069 D3b — every
+// send while ON carries metadata.incognito). Right-clicking empty tab-bar space carries only
+// the `onNew*` closures. (The DS TabBar exposes no per-tab context-menu hook — a DS gap noted
+// for contribute-back; ChatSurface delegates from the tab-bar wrapper meanwhile.)
 registerContextMenu({
   type: "chat-tab",
   items: (ctx: {
     sessionId?: string;
+    incognito?: boolean;
     onNew?: () => void;
+    onNewIncognito?: () => void;
+    onToggleIncognito?: () => void;
     onRename?: () => void;
     onClose?: () => void;
   }): MenuEntry[] => {
     const out: MenuEntry[] = [
       { id: "new", label: "New chat", icon: <Plus size={14} />, run: () => ctx?.onNew?.() },
+      {
+        id: "new-incognito",
+        label: "New incognito chat",
+        icon: <EyeOff size={14} />,
+        run: () => ctx?.onNewIncognito?.(),
+      },
     ];
     if (ctx?.sessionId) {
       out.push({ id: "rename", label: "Rename", icon: <Pencil size={14} />, run: () => ctx.onRename?.() });
+      out.push({
+        id: "incognito",
+        label: ctx.incognito ? "Turn incognito off" : "Turn incognito on",
+        icon: ctx.incognito ? <Eye size={14} /> : <EyeOff size={14} />,
+        run: () => ctx.onToggleIncognito?.(),
+      });
       out.push({ id: "tab-div", divider: true });
       out.push({ id: "close", label: "Close chat", icon: <X size={14} />, danger: true, run: () => ctx.onClose?.() });
     }

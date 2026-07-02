@@ -24,12 +24,14 @@ log = logging.getLogger(__name__)
 _MAX_TRANSCRIPT_CHARS = 16000
 
 
-def render_transcript(messages: list) -> str:
+def render_transcript(messages: list, *, max_chars: int | None = _MAX_TRANSCRIPT_CHARS) -> str:
     """Render a User/Assistant transcript from checkpoint messages.
 
     Assistant turns are run through ``extract_output`` (drop scratch_pad/think);
-    tool and system messages are skipped. Returns the most-recent
-    ``_MAX_TRANSCRIPT_CHARS`` when long.
+    tool and system messages are skipped. Truncated to the most-recent
+    ``max_chars`` when long; pass ``max_chars=None`` for the full transcript (the
+    compaction path archives the *whole* conversation losslessly before it
+    rewrites the live context — a capped render would silently drop the head).
     """
     lines: list[str] = []
     for m in messages:
@@ -43,8 +45,8 @@ def render_transcript(messages: list) -> str:
             if clean:
                 lines.append(f"Assistant: {clean}")
     transcript = "\n".join(lines)
-    if len(transcript) > _MAX_TRANSCRIPT_CHARS:
-        transcript = "…\n" + transcript[-_MAX_TRANSCRIPT_CHARS:]
+    if max_chars is not None and len(transcript) > max_chars:
+        transcript = "…\n" + transcript[-max_chars:]
     return transcript
 
 
@@ -85,16 +87,35 @@ async def harvest_thread(
     Both carry ``namespace`` for later per-project scoping.
 
     Returns the summary chunk id, or None when there's nothing to harvest (no
-    store, no checkpoint, empty transcript, or a summarizer failure). Never
-    raises — harvesting is best-effort and must not block retirement.
+    store, no checkpoint, incognito thread — ADR 0069 D3b, empty transcript,
+    or a summarizer failure). Never raises — harvesting is best-effort and
+    must not block retirement.
     """
     if knowledge_store is None:
+        return None
+    # Background worker thread (ADR 0070 D3): its transcript is disposable — the
+    # report was already delivered to (and indexed under) the ORIGIN session at
+    # completion, so harvesting the worker would duplicate the report into the KB
+    # under the worker's identity. Mirrors the incognito skip below; string-matched
+    # so legacy retired threads are covered too.
+    if thread_id.startswith("background:") or ":background:" in thread_id:
+        log.info("[harvest] thread %s is a background worker — skipping harvest", thread_id)
         return None
     try:
         tup = await checkpointer.aget_tuple({"configurable": {"thread_id": thread_id}})
         if tup is None:
             return None
-        messages = (tup.checkpoint or {}).get("channel_values", {}).get("messages", [])
+        channel_values = (tup.checkpoint or {}).get("channel_values", {})
+        # Incognito thread (ADR 0069 D3b): "no memory trail" must hold at
+        # retirement too — without this gate the retire sweep (harvest_enabled
+        # defaults ON) would summarize the transcript into the knowledge store,
+        # where RAG re-injects it into later prompts. Same per-message
+        # semantics as _persist_session: the channel holds the last stamped
+        # value, so a thread is as incognito as its latest turn.
+        if channel_values.get("incognito"):
+            log.info("[harvest] thread %s is incognito — skipping harvest", thread_id)
+            return None
+        messages = channel_values.get("messages", [])
         transcript = render_transcript(messages)
         if not transcript.strip():
             return None
@@ -109,12 +130,18 @@ async def harvest_thread(
 
         from knowledge import add_document
 
+        # source=<thread_id> is the machine-readable provenance link (ADR 0069
+        # D5) — the heading carries it for humans, but recall/audit key on the
+        # row's source column. source_type="harvest" ranks the rows in the
+        # agent-derived trust tier (ADR 0069 D8).
         chunk_ids = await asyncio.to_thread(
             add_document,
             knowledge_store,
             summary,
             domain="conversation",
             heading=f"Conversation summary ({thread_id})",
+            source=thread_id,
+            source_type="harvest",
             namespace=namespace,
         )
         chunk_id = chunk_ids[0] if chunk_ids else None
@@ -129,7 +156,12 @@ async def harvest_thread(
         if getattr(config, "knowledge_facts", False):
             from graph.memory_facts import extract_and_store_facts
 
-            kwargs = {"knowledge_store": knowledge_store, "config": config, "namespace": namespace}
+            kwargs = {
+                "knowledge_store": knowledge_store,
+                "config": config,
+                "namespace": namespace,
+                "source": thread_id,
+            }
             if fact_extractor is not None:
                 kwargs["extractor"] = fact_extractor
             await extract_and_store_facts(transcript, **kwargs)

@@ -358,6 +358,7 @@ export type WatchState = {
   last_reason?: string;
   last_evidence?: string;
   last_checked?: number | null; // last out-of-band verifier check (epoch seconds)
+  finished_at?: number | null; // met/expired time (epoch seconds); the met path sets THIS, not last_checked
   created_at?: number;
 };
 
@@ -385,12 +386,15 @@ export type Subagent = {
 };
 
 // A live wired tool (Agent → Tools): its source (core/plugin/mcp) + the subsystem
-// category it's grouped under in the console.
+// category it's grouped under in the console. `enabled: false` = present in the
+// assembled catalog but dropped by the tools.disabled denylist (still listed so the
+// operator can toggle it back on).
 export type ToolInfo = {
   name: string;
   description: string;
   source: "core" | "plugin" | "mcp";
   category?: string;
+  enabled: boolean;
 };
 
 export type ToolCall = {
@@ -717,6 +721,33 @@ export type KnowledgeChunk = {
   tier?: "private" | "commons" | null;
 };
 
+// Memory inspector (ADR 0069 D7) — the delivery-layer audit surface.
+// One session-summary digest row (GET /api/memory/sessions) — the same
+// derivation the <prior_sessions> digest injects, so the list can't drift
+// from what the agent is actually told.
+export type MemorySessionDigest = {
+  session_id: string;
+  timestamp: string;
+  surface: string; // chat | background | a2a | …
+  topic: string;
+  message_count: number;
+  size_bytes?: number;
+  // Detail-only fields (GET /api/memory/sessions/{id}):
+  trace_id?: string | null;
+  rendered?: string; // the full render recall_session returns
+};
+
+// One per-model-call injection record (GET /api/memory/injections, ADR 0069 D6):
+// which memory items entered which turn — the poisoning-forensics trail.
+export type MemoryInjectionRow = {
+  ts: string;
+  session_id: string;
+  digest_session_ids: string[];
+  hot_chunk_ids: number[];
+  rag_chunk_ids: number[];
+  approx_tokens: number;
+};
+
 // Delegate registry (ADR 0025) — the agents & endpoints the agent can talk to.
 export type DelegateFieldSpec = {
   key: string;
@@ -769,10 +800,24 @@ export type FleetStatus = { agents: FleetAgent[] };
 export type DiscoveredAgent = { name: string; url: string; host: string; port: number };
 
 export type Archetype = {
-  id: string; // "basic", or a bundle id e.g. "pm-stack"
+  id: string; // "basic"/"custom", or a bundle id e.g. "product-stack"
   label: string;
   icon: string; // lucide-react icon name
   blurb: string;
   bundle: string | null; // null = Basic; else the bundle git URL
   soul: string; // base SOUL.md the wizard seeds when this archetype is picked ("" = none)
 };
+
+// Developer flags (ADR 0068) — the /api/flags payload the Developer panel renders.
+export type FlagTier = "off" | "dev" | "beta" | "on";
+export type FlagChannel = "prod" | "beta" | "dev";
+export type FlagInfo = {
+  id: string;
+  description: string;
+  tier: FlagTier;
+  owner: string;
+  remove_by: string;
+  enabled: boolean; // channel-resolved (before any device-local override)
+  source: "channel" | "env";
+};
+export type FlagsPayload = { channel: FlagChannel; flags: FlagInfo[] };

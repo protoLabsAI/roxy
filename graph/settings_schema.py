@@ -242,6 +242,44 @@ FIELDS: list[Field] = [
     ),
     # ── Knowledge / memory ───────────────────────────────────────────────────
     Field("knowledge.top_k", "knowledge_top_k", "Knowledge recall top-k", "number", "Knowledge", minimum=1),
+    # Scope filter for the auto-inject RAG search (ADR 0069 D3a).
+    Field(
+        "knowledge.inject_namespaces",
+        "knowledge_inject_namespaces",
+        "Auto-inject namespaces",
+        "string_list",
+        "Knowledge",
+        "Restrict per-turn auto-injected knowledge (RAG) to chunks in these namespaces — one "
+        "per line; an empty line matches un-namespaced chunks. Empty = no filter (everything "
+        "is eligible, today's behavior). Tool-driven recall (memory_recall) is not affected.",
+    ),
+    # Trust floor for the auto-inject RAG hits (ADR 0069 D8).
+    Field(
+        "knowledge.inject_min_trust",
+        "knowledge_inject_min_trust",
+        "Auto-inject trust floor",
+        "number",
+        "Knowledge",
+        "Minimum trust tier a knowledge chunk needs to be auto-injected into the prompt. "
+        "1 = everything (low-trust hits are only ranked below higher tiers); 2 = exclude "
+        "ingested/external content (web, YouTube, PDFs, media); 3 = operator-authored rows "
+        "only. Tool-driven recall (memory_recall) is never gated — excluded content stays "
+        "reachable on demand, tier visible.",
+        minimum=1,
+        maximum=3,
+    ),
+    # Hot-memory write confirm gate (ADR 0069 D8).
+    Field(
+        "knowledge.hot_write_confirm",
+        "knowledge_hot_write_confirm",
+        "Confirm agent hot-memory writes",
+        "bool",
+        "Knowledge",
+        "When on, the agent's memory_ingest tool refuses to write always-on hot memory "
+        "(domain \"hot\") and instructs the model to ask you instead — only operator "
+        "surfaces (the knowledge browser / memory inspector) can put facts in front of the "
+        "model every turn. Every hot write emits a memory.hot_written event either way.",
+    ),
     # Tier (ADR 0041 / bd-2wu) — mirrors `skills.scope`; the commons lives at `commons.path`.
     Field(
         "knowledge.scope",
@@ -498,6 +536,63 @@ FIELDS: list[Field] = [
         "secrets on every agent, so share only servers you trust box-wide.",
         options=["scoped", "layered"],
     ),
+    # ── Filesystem (ADR 0007 operator primitives) — the fenced project fs toolset,
+    # incl. the dual-use ``run_command``. Per-agent (leaf scope): an operator can
+    # fully remove run_command for one agent while siblings keep it. Hot-reloads:
+    # a save rebuilds the graph, so binding changes apply without a restart. ──────
+    Field(
+        "filesystem.enabled",
+        "filesystem_enabled",
+        "Filesystem tools",
+        "bool",
+        "Filesystem",
+        "The fenced multi-project filesystem toolset (list/read/search/write/edit + "
+        "run_command). Off = none of them are bound. With no explicit projects "
+        "configured, a default read-write `workspace` project is provided.",
+    ),
+    Field(
+        "filesystem.allow_run",
+        "filesystem_allow_run",
+        "Allow run_command",
+        "bool",
+        "Filesystem",
+        "Bind the run_command shell tool (runs arbitrary commands in a project dir as "
+        "the server user). Off = the tool is never built — the model can't see or call "
+        "it; the read/write file tools stay. The full kill switch for shell access.",
+        depends_on={"key": "filesystem.enabled"},
+    ),
+    Field(
+        "filesystem.run_requires_approval",
+        "filesystem_run_requires_approval",
+        "Require approval per command",
+        "bool",
+        "Filesystem",
+        "Pause every run_command invocation for operator approval (HITL) before it "
+        "executes. Turn off only inside a hardened container or for a trusted "
+        "autonomous deploy.",
+        depends_on={"key": "filesystem.allow_run"},
+    ),
+    Field(
+        "filesystem.bypass_allowed",
+        "filesystem_bypass_allowed",
+        "Allow /bypass",
+        "bool",
+        "Filesystem",
+        "Permit the per-tab /bypass chat toggle to skip the approval gate. Off = "
+        "approvals are enforced regardless of any caller-supplied bypass flag.",
+        depends_on={"key": "filesystem.run_requires_approval"},
+    ),
+    # ── Tools — the operator denylist over the assembled toolset ────────────────
+    Field(
+        "tools.disabled",
+        "tools_disabled",
+        "Disabled tools",
+        "string_list",
+        "Tools",
+        "Tool names removed from this agent's toolset at graph build — one per line. "
+        "Covers every contributor: core, plugin, MCP, filesystem (e.g. run_command), "
+        "and delegation tools. Applies on save (the graph rebuilds).",
+    ),
     # ── Middleware toggles ───────────────────────────────────────────────────
     Field("middleware.knowledge", "knowledge_middleware", "Knowledge middleware", "bool", "Middleware"),
     Field("middleware.memory", "memory_middleware", "Memory middleware", "bool", "Middleware"),
@@ -571,6 +666,17 @@ FIELDS: list[Field] = [
     # A plugin's Settings group is declared by its manifest (ADR 0019) and rendered
     # via the plugin-fields path in build_schema — same for bundled or external
     # plugins; the generic Test button + guide link come from the manifest (ADR 0059).
+    # ── Background jobs (ADR 0050/0070) ──────────────────────────────────────
+    Field(
+        "background.auto_resume",
+        "background_auto_resume",
+        "Push-resume on completion",
+        "bool",
+        "Background",
+        "When a background job finishes, immediately run a turn in the session that "
+        "spawned it so the agent reviews the report and briefs the operator (ADR 0070). "
+        "Off = the report waits for that session's next manual turn.",
+    ),
     # ── Runtime (restart) ────────────────────────────────────────────────────
     Field(
         "runtime.autostart_on_boot",
@@ -684,6 +790,17 @@ FIELDS: list[Field] = [
         minimum=0,
         scope="host",
     ),
+    Field(
+        "developer.channel",
+        "developer_channel",
+        "Developer channel",
+        "select",
+        "Developer",
+        "Which pre-release features this instance exposes (ADR 0068). `prod` = released "
+        "features only; `beta` = opt-in previews; `dev` = everything, incl. in-progress "
+        "work. The dev sandbox instance defaults to `dev`. Env fallback: PROTOAGENT_CHANNEL.",
+        options=["prod", "beta", "dev"],
+    ),
 ]
 
 # Knowledge domain sub-sections (console grouping). The Knowledge fields are declared with
@@ -694,6 +811,9 @@ FIELDS: list[Field] = [
 _KNOWLEDGE_SUBSECTION = {
     # Recall — what the agent retrieves into context, and how.
     "knowledge.top_k": "Recall",
+    "knowledge.inject_namespaces": "Recall",
+    "knowledge.inject_min_trust": "Recall",
+    "knowledge.hot_write_confirm": "Recall",
     "knowledge.scope": "Recall",
     "knowledge.embeddings": "Recall",
     "knowledge.embed_model": "Recall",
@@ -791,11 +911,14 @@ _SECTION_CATEGORY = {
     "Goal mode": "Behavior",
     "Compaction": "Behavior",
     "Middleware": "Behavior",
+    "Background": "Behavior",
     "Runtime": "Behavior",
     # Capabilities — the sharing/tier knobs for what the agent is wired to (the rich
     # Tools/MCP/Skills/Subagents/Delegates managers are bespoke console panels).
     "Skills": "Capabilities",
     "MCP": "Capabilities",
+    "Filesystem": "Capabilities",
+    "Tools": "Capabilities",
     # Knowledge — recall / RAG config, split into sub-sections (see _KNOWLEDGE_SUBSECTION).
     "Recall": "Knowledge",
     "Ingestion": "Knowledge",
@@ -807,6 +930,9 @@ _SECTION_CATEGORY = {
     "Network": "Box",
     "Discovery": "Box",
     "Keep-warm": "Box",
+    # Developer — pre-release feature gating (ADR 0068). The channel this instance runs on;
+    # the flags themselves live in a device-local Developer panel, not the schema.
+    "Developer": "Behavior",
     # Discord / Google / GitHub / other plugin sections → "Plugins" (the default), the
     # Integrations surface.
 }

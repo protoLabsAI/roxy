@@ -31,10 +31,15 @@ import {
   SLASH_COMMANDS,
   PLAYBOOKS,
   KNOWLEDGE_CHUNKS,
+  MEMORY_HOT,
+  MEMORY_INJECTIONS,
+  MEMORY_SESSIONS,
+  MEMORY_SESSION_RENDERED,
   SUBAGENTS,
   TELEMETRY_INSIGHTS,
   TELEMETRY_SUMMARY,
   TELEMETRY_TURNS,
+  WATCHES,
   WORKFLOW_RUN_RESULT,
   WORKFLOWS,
 } from "./fixtures.mjs";
@@ -95,6 +100,15 @@ let playbooks = clonePlaybooks();
 const cloneKnowledge = () => JSON.parse(JSON.stringify(KNOWLEDGE_CHUNKS));
 let knowledgeChunks = cloneKnowledge();
 
+// Memory inspector (ADR 0069 D7) — sessions + hot chunks are MUTATED by the delete
+// specs, so serve working copies each memory test resets via
+// POST /api/__test__/memory/reset.
+const cloneMemory = () => ({
+  sessions: JSON.parse(JSON.stringify(MEMORY_SESSIONS)),
+  hot: JSON.parse(JSON.stringify(MEMORY_HOT)),
+});
+let memory = cloneMemory();
+
 // Fleet state is the one slice of the mock backend the specs MUTATE (create /
 // stop / rename / add-remote). Isolate it PER SPEC so parallel files and serial-
 // group retries can't observe each other's writes: every `x-e2e-fleet` request
@@ -121,13 +135,18 @@ function handleApiGet(pathname, fleet = FLEET) {
     case "/api/subagents":
       return { subagents: SUBAGENTS };
     case "/api/tools":
+      // run_command ships toggled OFF (still listed — disabled tools stay in the
+      // catalog); `disabled` is the RAW denylist and carries a stale name with no
+      // live tool (ghost_tool) so specs can assert a row toggle preserves it.
       return {
         tools: [
-          { name: "web_search", description: "Search the web.", source: "core", category: "General" },
-          { name: "memory_recall", description: "Search long-term memory.", source: "core", category: "Memory" },
-          { name: "echo__ping", description: "Echo ping.", source: "mcp", category: "echo" },
+          { name: "web_search", description: "Search the web.", source: "core", category: "General", enabled: true },
+          { name: "memory_recall", description: "Search long-term memory.", source: "core", category: "Memory", enabled: true },
+          { name: "run_command", description: "Run a shell command.", source: "core", category: "Filesystem", enabled: false },
+          { name: "echo__ping", description: "Echo ping.", source: "mcp", category: "echo", enabled: true },
         ],
         count: 3,
+        disabled: ["run_command", "ghost_tool"],
       };
     case "/api/chat/commands":
       return { commands: SLASH_COMMANDS };
@@ -135,6 +154,8 @@ function handleApiGet(pathname, fleet = FLEET) {
       return SCHEDULER_JOBS;
     case "/api/goals":
       return GOALS;
+    case "/api/watches":
+      return WATCHES;
     case "/api/notes/workspace":
       return { workspace: NOTES_WORKSPACE };
     case "/api/tasks/status":
@@ -255,6 +276,18 @@ function handleApiGet(pathname, fleet = FLEET) {
           total: knowledgeChunks.length,
           commons: knowledgeChunks.filter((c) => c.tier === "commons").length,
         },
+      };
+    case "/api/flags":
+      // Developer flags (ADR 0068). channel "dev" so the Developer panel is visible in e2e.
+      return {
+        channel: "dev",
+        flags: [
+          { id: "chat.new_dashboard", description: "Preview of the redesigned dashboard.", tier: "beta", owner: "kj", remove_by: "v1.0", enabled: true, source: "channel" },
+          { id: "chat.experimental_widget", description: "An in-progress widget.", tier: "dev", owner: "kj", remove_by: "", enabled: true, source: "channel" },
+          // The REAL chat.compact flag (runtime/flags.py) — enabled so commands.spec sees
+          // /compact in the slash menu; the flag-off path is covered via ?flag:chat.compact=off.
+          { id: "chat.compact", description: "/compact — summarize + archive a chat thread.", tier: "dev", owner: "kj", remove_by: "2026-09-01", enabled: true, source: "channel" },
+        ],
       };
     default:
       return null;
@@ -401,6 +434,26 @@ const server = createServer(async (req, res) => {
     if (req.method === "GET") {
       // Mid-turn steering: turn-end reconcile reads the still-queued items.
       if (/^\/api\/chat\/sessions\/[^/]+\/steer$/.test(pathname)) return sendJson(res, { pending: [] });
+      // Memory inspector (ADR 0069 D7) — needs the query string (injections filter),
+      // so it's handled here rather than in the pathname-only handleApiGet switch.
+      if (pathname === "/api/memory/sessions") return sendJson(res, { sessions: memory.sessions });
+      {
+        const m = pathname.match(/^\/api\/memory\/sessions\/([^/]+)$/);
+        if (m) {
+          const sid = decodeURIComponent(m[1]);
+          const s = memory.sessions.find((x) => x.session_id === sid);
+          if (!s) return sendJson(res, { detail: "no session summary with that id" }, 404);
+          return sendJson(res, { session: { ...s, trace_id: null, rendered: MEMORY_SESSION_RENDERED } });
+        }
+      }
+      if (pathname === "/api/memory/hot") return sendJson(res, { enabled: true, chunks: memory.hot });
+      if (pathname === "/api/memory/injections") {
+        const sid = url.searchParams.get("session_id") || "";
+        const rows = sid
+          ? MEMORY_INJECTIONS.filter((r) => r.session_id === sid)
+          : MEMORY_INJECTIONS;
+        return sendJson(res, { injections: rows });
+      }
       const payload = handleApiGet(pathname, fleetFor(req));
       if (payload !== null) return sendJson(res, payload);
       return sendJson(res, { detail: "not mocked" }, 404);
@@ -464,6 +517,38 @@ const server = createServer(async (req, res) => {
       knowledgeChunks = cloneKnowledge();
       return sendJson(res, { ok: true });
     }
+    if (pathname === "/api/__test__/memory/reset" && req.method === "POST") {
+      memory = cloneMemory();
+      return sendJson(res, { ok: true });
+    }
+    // Memory inspector writes (ADR 0069 D7): delete a session summary / edit + delete
+    // a hot chunk — mutate the working copy so the panels visibly update.
+    {
+      const m = pathname.match(/^\/api\/memory\/sessions\/([^/]+)$/);
+      if (m && req.method === "DELETE") {
+        const sid = decodeURIComponent(m[1]);
+        const i = memory.sessions.findIndex((x) => x.session_id === sid);
+        if (i < 0) return sendJson(res, { detail: "no session summary with that id" }, 404);
+        memory.sessions.splice(i, 1);
+        return sendJson(res, { deleted: true, session_id: sid });
+      }
+      const h = pathname.match(/^\/api\/memory\/hot\/(\d+)$/);
+      if (h && req.method === "DELETE") {
+        const id = Number(h[1]);
+        const i = memory.hot.findIndex((x) => x.id === id);
+        if (i < 0) return sendJson(res, { detail: "no hot-memory chunk with that id" }, 404);
+        memory.hot.splice(i, 1);
+        return sendJson(res, { enabled: true, deleted: true });
+      }
+      if (h && req.method === "PUT") {
+        const id = Number(h[1]);
+        const c = memory.hot.find((x) => x.id === id);
+        if (!c) return sendJson(res, { detail: "no hot-memory chunk with that id" }, 404);
+        c.content = String(body.content || "");
+        c.preview = c.content;
+        return sendJson(res, { enabled: true, id: id + 100, replaced: true });
+      }
+    }
     if (req.method === "POST" && /^\/api\/knowledge\/\d+\/promote$/.test(pathname)) {
       const id = Number(pathname.split("/").at(-2));
       const c = knowledgeChunks.find((x) => x.id === id);
@@ -476,6 +561,14 @@ const server = createServer(async (req, res) => {
       if (i < 0) return sendJson(res, { enabled: true, forgotten: false, error: "no commons chunk with that id" });
       knowledgeChunks.splice(i, 1); // removed from the commons
       return sendJson(res, { enabled: true, forgotten: true });
+    }
+    if (req.method === "DELETE" && /^\/api\/knowledge\/chunks\/\d+$/.test(pathname)) {
+      // Actually drop the chunk so the list re-render reflects the delete (the
+      // quick-delete spec asserts it disappears). Reset via /api/__test__/knowledge/reset.
+      const id = Number(pathname.split("/").at(-1));
+      const i = knowledgeChunks.findIndex((x) => x.id === id);
+      if (i >= 0) knowledgeChunks.splice(i, 1);
+      return sendJson(res, { enabled: true, deleted: i >= 0 });
     }
     if (pathname === "/api/settings") {
       // ADR 0047: a layer-aware save — "agent" (per-agent leaf, default) or "host"

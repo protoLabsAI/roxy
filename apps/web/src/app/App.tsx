@@ -65,6 +65,7 @@ import { BackgroundWatch } from "./BackgroundWatch";
 import { ChatResumeWatch } from "./ChatResumeWatch";
 import { BackgroundJobs } from "./BackgroundJobs";
 import { ProtoLabsIcon } from "./ProtoLabsIcon";
+import { bootGatePhase } from "./bootGate";
 import { AuthGate } from "./AuthGate";
 import { authRequired, subscribeAuth } from "../lib/auth";
 import { TenantGuard } from "./TenantGuard";
@@ -77,8 +78,10 @@ import { InboxWidget } from "../inbox/InboxWidget";
 import { ChatSlot } from "./ChatSlot";
 import { chatStore, useAnyChatStreaming } from "../chat/chat-store";
 import { KnowledgeStore } from "../knowledge/KnowledgeStore";
+import { MemorySurface } from "../memory/MemorySurface";
 import { SettingsOverlay } from "../settings/SettingsOverlay";
 import { PluginSettingsDialog } from "../plugins/PluginSettingsDialog";
+import { PluginRailManage } from "../plugins/PluginRailManage";
 import { AppDrawer } from "./AppDrawer";
 import { HamburgerMenu } from "./HamburgerMenu";
 import { FleetSwitcher } from "./FleetSwitcher";
@@ -87,7 +90,17 @@ import {
   type RightPanel,
   type Surface,
 } from "../state/uiStore";
-import { api, apiUrl, authToken, is401 } from "../lib/api";
+import {
+  api,
+  apiUrl,
+  authToken,
+  is401,
+  isAgentNotRunning,
+  isAgentUnreachable,
+  currentSlug,
+  agentHref,
+  activateSlugAgent,
+} from "../lib/api";
 import { PluginView, consoleTheme } from "./PluginView";
 import { UtilityWidget } from "./UtilityWidget";
 import { AppShell, Header, UtilityBar } from "@protolabsai/ui/app-shell";
@@ -107,7 +120,7 @@ import { useToast } from "@protolabsai/ui/overlays";
 import { StatusPill } from "./StatusPill";
 import { WorkPanel } from "./WorkPanel";
 import { SetupWizard } from "../setup/SetupWizard";
-import { hostRuntimeStatusQuery, runtimeStatusQuery } from "../lib/queries";
+import { hostRuntimeStatusQuery, installedPluginsQuery, pluginUpdatesQuery, runtimeStatusQuery } from "../lib/queries";
 import { buildViews } from "../lib/viewRegistry";
 import { applyNavIntent, usePaletteRegistry } from "./usePaletteRegistry";
 import type { NavIntent } from "./usePaletteRegistry";
@@ -277,6 +290,14 @@ export function App() {
   });
   const runtime = runtimeQ.data ?? null;
 
+  // Installed inventory + freshness — feed the rail context-menu plugin actions
+  // (#1521 / #1522) so a plugin icon's menu can show its version and offer Update /
+  // Uninstall. Lightweight + cached (the freshness poll is TTL-cached server-side);
+  // both degrade gracefully (retry:false), so a missing/erroring API just hides the
+  // extra menu items rather than blocking the menu.
+  const installedPluginsQ = useQuery(installedPluginsQuery());
+  const pluginUpdatesQ = useQuery(pluginUpdatesQuery());
+
   // Tenant uid is the HUB's, never the focused agent's (which changes on every fleet
   // swap and would wrongly wipe the chat view). Host-pinned, stable, low-churn.
   const hostUidQ = useQuery({
@@ -368,6 +389,27 @@ export function App() {
   // copy/escape-hatch swap. STUCK_AFTER_MS=45s — past it, offer "Continue anyway"
   // so a graph that never compiles can't trap the operator on the loading screen.
   const bootFailed = !runtime && runtimeQ.isError;
+  // Focused fleet agent is DOWN (ADR 0042): a non-host slug whose boot probe keeps failing
+  // past a normal spawn window. Two shapes: a LOCAL peer 409s ("agent not running" — `activate`
+  // didn't bring it up), a REMOTE member 502s (its box is offline / URL wrong — it never 409s,
+  // it isn't a local process). Without this the operator waited out the full ~30 retries for a
+  // generic "isn't responding" gate whose "Continue anyway" just opens a broken app. Detect it
+  // early (≥6 retries ≈ ~6s at the 1s delay) and offer targeted recovery: return to the host
+  // console, or try starting/reaching it again. `failureReason`/`failureCount` are live during
+  // retries (TanStack Query v5), so recovery shows before the probe fully gives up.
+  const focusedSlug = currentSlug();
+  const agentDown =
+    focusedSlug !== "host" &&
+    !runtime &&
+    (isAgentNotRunning(runtimeQ.failureReason) || isAgentUnreachable(runtimeQ.failureReason)) &&
+    runtimeQ.failureCount >= 6;
+  // Focused REMOTE member's stored token is wrong/missing: its proxied boot probe 401s. That's
+  // the MEMBER's credential problem, not the hub's — api.ts already keeps it off the global
+  // AuthGate (which prompts for the HUB token), and the probe's 401 stops the retry loop
+  // immediately (is401), so we surface a targeted "update its token / return to host" recovery
+  // instead of the generic "isn't responding" gate. Host-window 401s stay with the AuthGate.
+  const memberAuthFailed = focusedSlug !== "host" && !runtime && is401(runtimeQ.failureReason);
+  const agentUnreachable = isAgentUnreachable(runtimeQ.failureReason); // 502 (remote) vs 409 (local peer)
   // Token-gated first run (#873): the boot probe itself 401s. The BootGate's
   // "Starting… / isn't responding" copy is wrong for that — and its overlay
   // (z-1900) would cover the AuthGate dialog (z-1000) — so the gate yields to
@@ -381,6 +423,8 @@ export function App() {
     const t = window.setTimeout(() => setBootStuck(true), 45_000);
     return () => window.clearTimeout(t);
   }, [bootReady]);
+  // Which recovery the boot gate shows (pure precedence — tested in bootGate.test.ts).
+  const gatePhase = bootGatePhase({ memberAuthFailed, agentDown, unreachable: agentUnreachable, bootFailed, bootStuck });
   const [error, setError] = useState("");
 
   // Clear the stale "Load failed" strip once the engine reports ready. The
@@ -489,21 +533,10 @@ export function App() {
   }
 
   // Right-click the EMPTY rail background (not an icon) → the "Hidden views" restore menu
-  // (ADR 0035/0036). The DS AppShell only fires onRailContextMenu on icons, so we catch the
-  // rail-container right-click here via event delegation (the DS classnames are the contract)
-  // and hand the resolved hidden-surface labels to the `rail-background` menu. An icon click
-  // is handled by its own `rail-surface` menu, so bail when the target is a rail button.
-  const onShellContextMenu = (e: ReactMouseEvent) => {
-    const t = e.target as HTMLElement;
-    if (t.closest(".pl-rail__btn")) return; // an icon — its own menu handles it
-    const railEl = t.closest(".pl-rail") as HTMLElement | null;
-    if (!railEl) return; // not the rail — leave the default menu
-    // Which rail was right-clicked → restore a hidden view to THIS dock (not its default).
-    const side: "left" | "right" | "bottom" = railEl.classList.contains("pl-rail--right")
-      ? "right"
-      : railEl.classList.contains("pl-rail--bottom")
-        ? "bottom"
-        : "left";
+  // (ADR 0035/0036). The DS AppShell's `onRailBackgroundContextMenu` (@protolabsai/ui@0.53.0)
+  // fires on empty rail space with the resolved side — no more DOM/classname delegation.
+  // Icon right-clicks go to `onRailContextMenu` (the `rail-surface` menu) instead.
+  const onRailBackgroundContextMenu = (side: "left" | "right" | "bottom", e: ReactMouseEvent) => {
     const hidden = (railOrder.hidden ?? []).map((id) => ({ id, label: metaFor(id)?.label ?? id }));
     openContextMenu("rail-background", e, { side, hidden });
   };
@@ -582,6 +615,10 @@ export function App() {
       // Settings ▸ Workspace ▸ Memory (ADR 0048 S-C).
       case "knowledge":
         return <KnowledgeStore />;
+      // Memory inspector (ADR 0069 D7) — the delivery-layer audit surface: session
+      // digests, hot memory, per-turn injection record.
+      case "memory":
+        return <MemorySurface />;
       // Settings is no longer a rail surface (2026-06 consolidation) — it's a utility-bar
       // pill opening the settings dialog (SettingsOverlay). Notes is the first-party `notes`
       // plugin (ADR 0034 S4) — rendered via the default
@@ -695,7 +732,7 @@ export function App() {
     {/* Command palette (⌘K, ADR 0057) — portals over the shell; the same component
         backs the desktop quick-command (step 4). */}
     <CommandPalette open={paletteOpen} onOpenChange={setPaletteOpen} registry={paletteRegistry} />
-    <div className={`app-shell${isTauriMac ? " is-tauri-mac" : ""}`} onContextMenu={onShellContextMenu}>
+    <div className={`app-shell${isTauriMac ? " is-tauri-mac" : ""}`}>
       {/* protoLabs.studio brand bumper — DS Splash (@protolabsai/ui/splash). Holds
           2.5s then hands off via the View Transitions API cross-fade (the
           protoAgent path); shows once per tab session (sessionStorage
@@ -742,23 +779,69 @@ export function App() {
           <BootGate
             logo={<ProtoLabsIcon variant="outline" size={56} decorative gradientStroke tone="accent" />}
             title={
-              bootFailed
-                ? `${bootName} isn’t responding`
-                : `Starting ${bootName}…`
+              gatePhase === "memberAuth"
+                ? `Can’t authenticate to “${focusedSlug}”`
+                : gatePhase === "unreachable"
+                  ? `Agent “${focusedSlug}” is unreachable`
+                  : gatePhase === "notRunning"
+                    ? `Agent “${focusedSlug}” isn’t running`
+                    : gatePhase === "failed"
+                      ? `${bootName} isn’t responding`
+                      : `Starting ${bootName}…`
             }
             detail={
-              bootFailed
-                ? "The engine didn’t come up in time. It may still be warming up — give it another moment, then retry."
-                : bootStuck
-                  ? "This is taking longer than usual. The engine may still be compiling, or it may need attention in Settings."
-                  : "Warming up the engine — first launch (and finishing setup) can take up to a minute. Later launches are quick."
+              gatePhase === "memberAuth"
+                ? "This remote member rejected the hub’s stored token (it’s wrong, missing, or was rotated). Return to the host console and update its token in Settings ▸ Agents."
+                : gatePhase === "unreachable"
+                  ? "This remote member didn’t answer. Return to the host console to keep working, or check its URL and token in Settings ▸ Agents."
+                  : gatePhase === "notRunning"
+                    ? "This fleet agent didn’t start. Return to the host console to keep working, or try starting it again."
+                    : gatePhase === "failed"
+                      ? "The engine didn’t come up in time. It may still be warming up — give it another moment, then retry."
+                      : gatePhase === "stuck"
+                        ? "This is taking longer than usual. The engine may still be compiling, or it may need attention in Settings."
+                        : "Warming up the engine — first launch (and finishing setup) can take up to a minute. Later launches are quick."
             }
             action={
-              bootFailed ? (
+              gatePhase === "memberAuth" ? (
+                <Button
+                  variant="primary"
+                  size="sm"
+                  onClick={() => {
+                    window.location.href = agentHref("host");
+                  }}
+                >
+                  Return to host
+                </Button>
+              ) : gatePhase === "unreachable" || gatePhase === "notRunning" ? (
+                <div style={{ display: "flex", gap: 8 }}>
+                  <Button
+                    variant="primary"
+                    size="sm"
+                    onClick={() => {
+                      window.location.href = agentHref("host");
+                    }}
+                  >
+                    Return to host
+                  </Button>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    onClick={() => {
+                      void (async () => {
+                        await activateSlugAgent();
+                        void runtimeQ.refetch();
+                      })();
+                    }}
+                  >
+                    {gatePhase === "unreachable" ? "Try again" : "Try to start it"}
+                  </Button>
+                </div>
+              ) : gatePhase === "failed" ? (
                 <Button variant="primary" size="sm" onClick={() => void runtimeQ.refetch()}>
                   Retry
                 </Button>
-              ) : bootStuck ? (
+              ) : gatePhase === "stuck" ? (
                 <Button variant="primary" size="sm" onClick={() => setBootOverride(true)}>
                   Continue anyway
                 </Button>
@@ -792,6 +875,8 @@ export function App() {
               setFleetStartNew(true);
               openGlobalSettings("fleet");
             }}
+            // "Fleet settings" → the fleet management dialog (no new-agent picker).
+            onManageFleet={() => openGlobalSettings("fleet")}
           />
         }
         org={runtime?.identity?.org || "protoLabs.studio"}
@@ -847,14 +932,31 @@ export function App() {
             else { setBottomPanel(id); setBottomCollapsed(false); }
           }
         }}
+        onRailBackgroundContextMenu={onRailBackgroundContextMenu}
         onRailContextMenu={(side, e, id) => {
           // A plugin view's rail id is `plugin:<pluginId>:<viewId>` — resolve the owning
           // plugin's id + display name so the menu can offer "Configure…" (ADR 0036/0059).
           const pluginId = id.startsWith("plugin:") ? id.split(":")[1] : undefined;
-          const pluginName = pluginId
-            ? (runtime?.plugins?.find((p) => p.id === pluginId)?.name ?? pluginId)
-            : undefined;
-          openContextMenu("rail-surface", e, { id, side, pluginId, pluginName });
+          const rec = pluginId ? runtime?.plugins?.find((p) => p.id === pluginId) : undefined;
+          const pluginName = pluginId ? (rec?.name ?? pluginId) : undefined;
+          // Version + lifecycle affordances (#1521 / #1522): removable = tracked in the
+          // writable plugins dir (git-installed / local copy; in-tree built-ins aren't in
+          // this list and are refused server-side); updatable = the freshness poll says
+          // this plugin is behind its ref. Both feed the Update / Uninstall menu gating.
+          const removable = pluginId ? (installedPluginsQ.data?.plugins ?? []).some((pl) => pl.id === pluginId) : false;
+          const updatable = pluginId
+            ? Boolean((pluginUpdatesQ.data?.plugins ?? []).find((u) => u.id === pluginId)?.behind)
+            : false;
+          openContextMenu("rail-surface", e, {
+            id,
+            side,
+            pluginId,
+            pluginName,
+            pluginVersion: rec?.version,
+            pluginBuiltin: rec?.builtin,
+            pluginRemovable: removable,
+            pluginUpdatable: updatable,
+          });
         }}
         onRailReorder={(next) => {
           // Chat can dock anywhere now — left, right, or the bottom dock. Its slot mounts
@@ -1114,6 +1216,9 @@ export function App() {
         onClose={closePluginConfig}
       />
     )}
+    {/* Rail context-menu plugin actions (#1521 / #1522) — fires an Update, or renders the
+        Uninstall confirm, for a plugin right-clicked on its rail icon. One root mount. */}
+    <PluginRailManage />
     </>
   );
 }

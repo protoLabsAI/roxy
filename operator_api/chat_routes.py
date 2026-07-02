@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import secrets
 import time
 
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -27,13 +28,35 @@ from runtime.state import STATE
 log = logging.getLogger("protoagent.server")
 from server import agent_name
 from server.agent_init import _retire_thread
-from server.chat import chat
+from server.chat import chat, compact_session, rewind_session
 
 
 class ChatRequest(BaseModel):
+    # Omitted/blank session_id → a unique per-call id is minted (ADR 0069 D4).
+    # The old literal "api-default" pooled every anonymous caller into ONE
+    # checkpointer thread and ONE session-memory file.
     message: str
-    session_id: str = "api-default"
+    session_id: str = ""
     model: str | None = None  # per-tab model override; None → configured default
+    # Incognito thread (ADR 0069 D3b): no session-memory persistence and no
+    # memory injection for this turn. Additive, default False — existing
+    # callers are unaffected.
+    incognito: bool = False
+    # This message answers a pending HITL form/question/approval (#1560): resume
+    # the parked interrupt instead of running a fresh turn. Set by the console's
+    # desktop /api/chat fallback — the streaming path carries the same flag as
+    # A2A message metadata (`hitl_resume`). Additive, default False.
+    hitl_resume: bool = False
+
+
+_B36 = "0123456789abcdefghijklmnopqrstuvwxyz"
+
+
+def _mint_session_id() -> str:
+    """Unique per-call session id — ``api-<epoch-ms>-<6 base36>``, mirroring the
+    console's ``chat-<ts>-<rand>`` shape (apps/web chat-store ``id()``)."""
+    rand = "".join(secrets.choice(_B36) for _ in range(6))
+    return f"api-{int(time.time() * 1000)}-{rand}"
 
 
 def register_chat_routes(app, ui: str) -> None:
@@ -46,9 +69,14 @@ def register_chat_routes(app, ui: str) -> None:
     # --- Chat API -----------------------------------------------------------
     @app.post("/api/chat")
     async def _api_chat(req: ChatRequest):
-        result = await chat(req.message, req.session_id, model=req.model)
+        # Echo the (possibly minted) session_id so callers can continue the
+        # session — additive key, existing consumers unaffected.
+        session_id = req.session_id.strip() or _mint_session_id()
+        result = await chat(
+            req.message, session_id, model=req.model, incognito=req.incognito, hitl_resume=req.hitl_resume
+        )
         parts = [m["content"] for m in result if m.get("role") == "assistant" and m.get("content")]
-        return {"response": "\n\n".join(parts), "messages": result}
+        return {"response": "\n\n".join(parts), "messages": result, "session_id": session_id}
 
     @app.delete("/api/chat/sessions/{session_id}")
     async def _api_delete_session(session_id: str, harvest: bool = False):
@@ -61,8 +89,10 @@ def register_chat_routes(app, ui: str) -> None:
         operator may be deleting it precisely to get rid of it. The TTL prune
         sweep keeps its own config-driven default (``checkpoint_harvest_enabled``).
 
-        Both ``a2a:{session_id}`` and ``chat:{session_id}`` threads are retired
-        with cascade so goal-mode ``:goal-iter-N`` sub-threads are not orphaned."""
+        Both ``a2a:{session_id}`` and the legacy ``chat:{session_id}`` threads are
+        retired (non-streaming turns keyed ``chat:`` before ADR 0069 unified the
+        prefix) with cascade so goal-mode ``:goal-iter-N`` sub-threads are not
+        orphaned."""
         chunk_id = await _retire_thread(f"a2a:{session_id}", harvest=harvest, cascade=True)
         await _retire_thread(f"chat:{session_id}", harvest=False, cascade=True)  # only harvest once
         # Ephemeral chat attachments are session-scoped (ADR 0021) — drop them so a
@@ -74,6 +104,53 @@ def register_chat_routes(app, ui: str) -> None:
             except Exception as exc:  # noqa: BLE001 — cleanup is best-effort
                 log.warning("[chat] attachment cleanup failed for %s: %s", session_id, exc)
         return {"deleted": True, "harvested": chunk_id is not None}
+
+    @app.post("/api/chat/sessions/{session_id}/compact")
+    async def _api_compact_session(session_id: str):
+        """Compact a chat session's live context (#1527): archive the raw history
+        into searchable memory, summarize it, and rewrite the LangGraph checkpoint
+        to ``[summary, recent tail]`` so the agent keeps context at lower token
+        cost. Runs SERVER-SIDE — the checkpoint is the agent's real context, so a
+        client-only compaction would do nothing.
+
+        Never-lossy: if there's no store or the archive write yields nothing, the
+        checkpoint is left untouched and ``refused`` is true (the console then
+        keeps the full thread rather than dropping anything).
+
+        Pre-release: behind the ``chat.compact`` developer flag (ADR 0068)."""
+        from fastapi import HTTPException
+
+        from runtime.flags import flag_enabled
+
+        if not flag_enabled("chat.compact"):
+            raise HTTPException(
+                status_code=403,
+                detail="/compact is pre-release — enable the chat.compact developer flag (ADR 0068)",
+            )
+        return await compact_session(session_id)
+
+    @app.post("/api/chat/sessions/{session_id}/rewind")
+    async def _api_rewind_session(session_id: str, body: dict | None = None):
+        """Rewind a chat session to a target message (#1535): discard everything
+        AFTER it and rewrite the LangGraph checkpoint IN PLACE. Runs SERVER-SIDE —
+        the checkpoint is the agent's real context, so a client-only truncate would
+        leave the agent's memory intact.
+
+        The body carries the target: ``message_id`` and/or ``content`` (the console
+        sends the visible bubble's text, since its client-side message ids never
+        appear in the checkpoint), or an explicit ``index``. Intentionally
+        DESTRUCTIVE (no archive) but never corrupting — the kept prefix is trimmed
+        to a safe tool-call boundary so no orphaned tool_call is left behind."""
+        body = body or {}
+        idx = body.get("index")
+        occ = body.get("occurrence")
+        return await rewind_session(
+            session_id,
+            message_id=body.get("message_id"),
+            index=int(idx) if idx is not None else None,
+            content=body.get("content"),
+            occurrence=int(occ) if occ is not None else None,
+        )
 
     @app.post("/api/chat/sessions/{session_id}/steer")
     async def _api_steer(session_id: str, body: dict | None = None):

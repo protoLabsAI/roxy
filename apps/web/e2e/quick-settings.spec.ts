@@ -1,4 +1,5 @@
 import { expect, test } from "@playwright/test";
+import type { Page } from "@playwright/test";
 
 // Contextual quick-settings + the topbar Settings overlay (ADR 0048): a gear icon
 // opens a dialog editing fields via the same /api/settings path, and the central
@@ -59,4 +60,91 @@ test("the chat composer model picker overrides the model per-tab (no global save
   await expect(trigger).toContainText("protolabs/fast");
   await page.waitForTimeout(300);
   expect(settingsWrite).toBe(false);
+});
+
+test("Tools panel: the Shell & filesystem chip disables run_command via /api/settings", async ({ page }) => {
+  // The per-agent run_command kill switch lives on the Tools capability panel as a
+  // QuickSetting chip (ADR 0048 §2.2) — same /api/settings write path as the central home.
+  await page.goto("/app/", { waitUntil: "load" });
+  await page.getByTestId("header-menu").click();
+  await page.getByTestId("app-drawer").getByRole("button", { name: "Settings", exact: true }).click();
+  await page
+    .locator(".settings-overlay .pl-sidenav")
+    .getByRole("tab", { name: "Tools", exact: true })
+    .click();
+
+  await page.getByRole("button", { name: "Shell & filesystem tools" }).click();
+  const dialog = page.getByRole("dialog", { name: "Shell & filesystem tools" });
+  await expect(dialog).toBeVisible();
+  // All four gates render, allow_run being the full kill switch.
+  await expect(dialog.getByText("Allow run_command")).toBeVisible();
+  await expect(dialog.getByText("Require approval per command")).toBeVisible();
+
+  const saved = page.waitForRequest(
+    (r) => r.url().endsWith("/api/settings") && ["POST", "PUT"].includes(r.method()),
+  );
+  await dialog.locator('[data-key="filesystem.allow_run"] .pl-switch').click();
+  await dialog.getByRole("button", { name: "Save" }).click();
+  const req = await saved;
+  const body = req.postDataJSON();
+  expect(body.updates["filesystem.allow_run"]).toBe(false);
+  expect(body.layer ?? "agent").toBe("agent"); // per-agent leaf, not box-wide
+  await expect(page.locator(".pl-toast").getByText("Saved")).toBeVisible();
+});
+
+// The old "Disabled tools" chip (a raw tools.disabled textarea) is gone — every row
+// in the list carries an on/off switch writing the same denylist. These specs pin the
+// row-toggle contract: the POST edits the RAW denylist (preserving entries it didn't
+// touch, incl. stale names with no live tool) and off rows stay listed.
+async function openToolsTab(page: Page) {
+  await page.goto("/app/", { waitUntil: "load" });
+  await page.getByTestId("header-menu").click();
+  await page.getByTestId("app-drawer").getByRole("button", { name: "Settings", exact: true }).click();
+  await page
+    .locator(".settings-overlay .pl-sidenav")
+    .getByRole("tab", { name: "Tools", exact: true })
+    .click();
+}
+
+test("Tools panel: the Disabled tools chip is gone (row switches replaced it)", async ({ page }) => {
+  await openToolsTab(page);
+  await expect(page.getByRole("button", { name: "Shell & filesystem tools" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Disabled tools" })).toHaveCount(0);
+});
+
+test("Tools panel: toggling a tool row off appends it to tools.disabled", async ({ page }) => {
+  await openToolsTab(page);
+
+  // web_search sits in General — the first group, expanded by default.
+  const row = page.locator(".tools-row", { has: page.getByText("web_search", { exact: true }) });
+  await expect(row).toBeVisible();
+
+  const saved = page.waitForRequest(
+    (r) => r.url().endsWith("/api/settings") && ["POST", "PUT"].includes(r.method()),
+  );
+  await row.locator(".pl-switch").click();
+  const req = await saved;
+  const body = req.postDataJSON();
+  // Appends the toggled name and PRESERVES the rest of the raw denylist — including
+  // ghost_tool, a stale entry with no live tool row to recompute it from.
+  expect(body.updates["tools.disabled"]).toEqual(["run_command", "ghost_tool", "web_search"]);
+  expect(body.layer ?? "agent").toBe("agent"); // per-agent leaf, not box-wide
+});
+
+test("Tools panel: an off tool stays listed and toggles back on", async ({ page }) => {
+  await openToolsTab(page);
+
+  // run_command ships disabled in the fixture — still listed (dimmed) under Filesystem.
+  await page.locator(".pl-accordion__trigger", { hasText: "Filesystem" }).click();
+  const row = page.locator(".tools-row", { has: page.getByText("run_command", { exact: true }) });
+  await expect(row).toBeVisible();
+  await expect(row).toHaveClass(/tools-row--off/);
+
+  const saved = page.waitForRequest(
+    (r) => r.url().endsWith("/api/settings") && ["POST", "PUT"].includes(r.method()),
+  );
+  await row.locator(".pl-switch").click();
+  const req = await saved;
+  // Re-enabling removes ONLY run_command; the stale ghost_tool entry survives.
+  expect(req.postDataJSON().updates["tools.disabled"]).toEqual(["ghost_tool"]);
 });

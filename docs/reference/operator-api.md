@@ -52,6 +52,7 @@ is a map — `operator_api/*.py` is the source of truth for exact request/respon
 | Method | Path | Purpose |
 |---|---|---|
 | GET | `/api/background` | Background subagent jobs |
+| GET | `/api/background/{job_id}` | One job's full row by id (full result text; ADR 0070) |
 | POST | `/api/background/{job_id}/cancel` · `/api/background/clear` | Cancel one / clear finished |
 | DELETE | `/api/background/{job_id}` | Remove a job row |
 | GET · POST | `/api/scheduler/jobs` | List / create scheduled jobs |
@@ -68,6 +69,20 @@ is a map — `operator_api/*.py` is the source of truth for exact request/respon
 | GET | `/api/playbooks` · `/api/playbooks/{id}` | List / fetch skills ("playbooks") |
 | POST · PUT · DELETE | `/api/playbooks[/{id}]` | Create / edit / delete a skill |
 | POST | `/api/playbooks/{id}/promote` | Promote a private skill into the commons |
+
+## Memory inspector
+
+The audit surface for the memory delivery layer
+([ADR 0069](../adr/0069-memory-delivery-layer.md) D7): the persisted session
+summaries behind the `<prior_sessions>` digest, and the hot-memory chunks
+injected every turn.
+
+| Method | Path | Purpose |
+|---|---|---|
+| GET | `/api/memory/sessions` | List session summaries (digest fields: id, timestamp, surface, topic, message count, size) |
+| GET · DELETE | `/api/memory/sessions/{session_id}` | Full rendered summary (what `recall_session` returns) / delete one |
+| GET | `/api/memory/hot` | List hot-memory chunks (`domain="hot"`) |
+| PUT · DELETE | `/api/memory/hot/{chunk_id}` | Edit (revision stays `hot`) / delete a hot chunk |
 
 ## Activity, inbox & events
 

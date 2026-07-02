@@ -1,6 +1,7 @@
 """Chat / goal / health / OpenAI-compat routes (ADR 0023 phase 3 extraction)."""
 
 import json
+import re
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -10,7 +11,7 @@ def _client(monkeypatch, *, graph=object(), goal=None, chat_reply=None):
     import operator_api.chat_routes as cr
     import runtime.state as rs
 
-    async def _fake_chat(message, session_id, *, model=None):
+    async def _fake_chat(message, session_id, *, model=None, incognito=False, hitl_resume=False):
         suffix = f"@{model}" if model else ""
         return chat_reply or [{"role": "assistant", "content": f"echo:{message}{suffix}"}]
 
@@ -30,10 +31,59 @@ def test_api_chat_joins_assistant_parts(monkeypatch):
     assert body["response"] == "echo:hi"
 
 
+def test_api_chat_mints_unique_session_id_when_omitted(monkeypatch):
+    # ADR 0069 D4: an omitted/blank session_id must NOT pool callers into a
+    # shared "api-default" thread + memory file — each call mints a unique id
+    # and the response echoes it so the caller can continue the session.
+    import operator_api.chat_routes as cr
+
+    seen: list[str] = []
+
+    async def _fake_chat(message, session_id, *, model=None, incognito=False, hitl_resume=False):
+        seen.append(session_id)
+        return [{"role": "assistant", "content": "ok"}]
+
+    c = _client(monkeypatch)
+    monkeypatch.setattr(cr, "chat", _fake_chat)
+
+    b1 = c.post("/api/chat", json={"message": "hi"}).json()
+    b2 = c.post("/api/chat", json={"message": "hi", "session_id": "  "}).json()
+    for body in (b1, b2):
+        assert re.fullmatch(r"api-\d{13,}-[a-z0-9]{6}", body["session_id"])
+    assert b1["session_id"] != b2["session_id"]
+    assert seen == [b1["session_id"], b2["session_id"]]  # minted id reached chat()
+
+
+def test_api_chat_echoes_explicit_session_id(monkeypatch):
+    c = _client(monkeypatch)
+    body = c.post("/api/chat", json={"message": "hi", "session_id": "tab-1"}).json()
+    assert body["session_id"] == "tab-1"
+    assert body["response"] == "echo:hi"
+
+
 def test_api_chat_threads_per_tab_model(monkeypatch):
     c = _client(monkeypatch)
     body = c.post("/api/chat", json={"message": "hi", "model": "protolabs/fast"}).json()
     assert body["response"] == "echo:hi@protolabs/fast"  # model reached chat()
+
+
+def test_api_chat_passes_incognito_flag(monkeypatch):
+    # ADR 0069 D3b: `incognito` rides the request body into chat() (default
+    # False — existing callers unaffected).
+    import operator_api.chat_routes as cr
+
+    seen: list[bool] = []
+
+    async def _fake_chat(message, session_id, *, model=None, incognito=False, hitl_resume=False):
+        seen.append(incognito)
+        return [{"role": "assistant", "content": "ok"}]
+
+    c = _client(monkeypatch)
+    monkeypatch.setattr(cr, "chat", _fake_chat)
+
+    c.post("/api/chat", json={"message": "hi"})
+    c.post("/api/chat", json={"message": "hi", "incognito": True})
+    assert seen == [False, True]
 
 
 def test_openai_completion_honors_model_override(monkeypatch):
@@ -77,6 +127,91 @@ def test_delete_session_harvest_is_opt_in(monkeypatch):
         ("a2a:s2", True, True),
         ("chat:s2", False, True),
     ]
+
+
+def test_compact_session_route(monkeypatch):
+    # The route is a thin pass-through to server.chat.compact_session — forwards the
+    # path session_id and returns the compaction result dict verbatim. /compact is
+    # behind the chat.compact developer flag (ADR 0068); force it ON via the env
+    # override so the pass-through is what's under test, not the gate.
+    import operator_api.chat_routes as cr
+
+    monkeypatch.setenv("PROTOAGENT_FLAG_CHAT_COMPACT", "1")
+    seen: list[str] = []
+
+    async def _fake_compact(session_id):
+        seen.append(session_id)
+        return {
+            "summary": "s",
+            "archived_chunks": 2,
+            "kept": 4,
+            "removed": 9,
+            "archived": True,
+            "refused": False,
+            "reason": "",
+            "message": "Compacted this conversation",
+        }
+
+    monkeypatch.setattr(cr, "compact_session", _fake_compact)
+    c = _client(monkeypatch)
+    body = c.post("/api/chat/sessions/s1/compact").json()
+    assert seen == ["s1"]
+    assert body["removed"] == 9 and body["kept"] == 4 and body["archived"] is True
+    assert body["message"] == "Compacted this conversation"
+
+
+def test_compact_session_route_refuses_when_flag_off(monkeypatch):
+    # /compact is pre-release (chat.compact developer flag, ADR 0068): on the prod
+    # channel the dev-tier flag resolves OFF, the route 403s, and compact_session is
+    # never reached — the checkpoint can't be touched through a disabled gate.
+    import operator_api.chat_routes as cr
+
+    monkeypatch.delenv("PROTOAGENT_FLAG_CHAT_COMPACT", raising=False)
+    monkeypatch.setenv("PROTOAGENT_CHANNEL", "prod")
+    called: list[str] = []
+
+    async def _fake_compact(session_id):
+        called.append(session_id)
+        return {}
+
+    monkeypatch.setattr(cr, "compact_session", _fake_compact)
+    c = _client(monkeypatch)
+    resp = c.post("/api/chat/sessions/s1/compact")
+    assert resp.status_code == 403
+    assert "chat.compact" in resp.json()["detail"]
+    assert called == []
+
+
+def test_rewind_session_route(monkeypatch):
+    # The route is a thin pass-through to server.chat.rewind_session — forwards the
+    # path session_id + body target (message_id / content / index) and returns the
+    # rewind result dict verbatim.
+    import operator_api.chat_routes as cr
+
+    seen: list[dict] = []
+
+    async def _fake_rewind(session_id, *, message_id=None, index=None, content=None, occurrence=None):
+        seen.append(
+            {
+                "session_id": session_id,
+                "message_id": message_id,
+                "index": index,
+                "content": content,
+                "occurrence": occurrence,
+            }
+        )
+        return {"found": True, "kept": 4, "removed": 2, "reason": "", "message": "Rewound"}
+
+    monkeypatch.setattr(cr, "rewind_session", _fake_rewind)
+    c = _client(monkeypatch)
+    body = c.post(
+        "/api/chat/sessions/s1/rewind", json={"message_id": "m9", "content": "the answer"}
+    ).json()
+    assert seen == [
+        {"session_id": "s1", "message_id": "m9", "index": None, "content": "the answer", "occurrence": None}
+    ]
+    assert body["removed"] == 2 and body["kept"] == 4 and body["found"] is True
+    assert body["message"] == "Rewound"
 
 
 def test_delete_session_cleans_ephemeral_attachments(monkeypatch):

@@ -47,7 +47,7 @@ def test_parse_facts_drops_blank_and_caps_length():
 def test_facts_stored_with_namespace_and_type(tmp_path):
     store = KnowledgeStore(tmp_path / "kb.db")
     counts = consolidate_and_store(store, ["operator deploys on Fridays"], namespace="proj-a")
-    assert counts == {"added": 1, "skipped": 0}
+    assert counts == {"added": 1, "skipped": 0, "superseded": 0}
     facts = store.list_chunks(domain="fact", limit=10)
     assert len(facts) == 1
     assert facts[0].finding_type == "fact"
@@ -59,7 +59,7 @@ def test_near_duplicate_facts_are_skipped(tmp_path):
     consolidate_and_store(store, ["The operator prefers metric units"], namespace="p")
     # Re-running with a near-identical fact must not append a second copy.
     counts = consolidate_and_store(store, ["The operator prefers metric units"], namespace="p")
-    assert counts == {"added": 0, "skipped": 1}
+    assert counts == {"added": 0, "skipped": 1, "superseded": 0}
     assert len(store.list_chunks(domain="fact", limit=10)) == 1
 
 
@@ -70,7 +70,7 @@ def test_distinct_facts_are_added(tmp_path):
         ["The gateway alias is protolabs/reasoning", "Releases are cut manually"],
         namespace="p",
     )
-    assert counts == {"added": 2, "skipped": 0}
+    assert counts == {"added": 2, "skipped": 0, "superseded": 0}
 
 
 def test_namespace_scopes_dedup(tmp_path):
@@ -78,9 +78,20 @@ def test_namespace_scopes_dedup(tmp_path):
     store = KnowledgeStore(tmp_path / "kb.db")
     consolidate_and_store(store, ["deploys on Fridays"], namespace="proj-a")
     counts = consolidate_and_store(store, ["deploys on Fridays"], namespace="proj-b")
-    assert counts == {"added": 1, "skipped": 0}
+    assert counts == {"added": 1, "skipped": 0, "superseded": 0}
     assert len(store.list_chunks(domain="fact", namespace="proj-a")) == 1
     assert len(store.list_chunks(domain="fact", namespace="proj-b")) == 1
+
+
+def test_facts_carry_source_session(tmp_path):
+    """ADR 0069 D5: a fact row links back to the session it was extracted from;
+    without a session id the legacy "harvest" literal is kept (never empty)."""
+    store = KnowledgeStore(tmp_path / "kb.db")
+    consolidate_and_store(store, ["deploys on Fridays"], namespace="p", source="a2a:chat-42")
+    consolidate_and_store(store, ["releases are manual"], namespace="p")
+    by_content = {c.content: c for c in store.list_chunks(domain="fact", limit=10)}
+    assert by_content["deploys on Fridays"].source == "a2a:chat-42"
+    assert by_content["releases are manual"].source == "harvest"
 
 
 def test_extract_and_store_facts_end_to_end(tmp_path):
@@ -96,6 +107,7 @@ def test_extract_and_store_facts_end_to_end(tmp_path):
             knowledge_store=store,
             config=object(),
             namespace="ns1",
+            source="a2a:chat-7",
             extractor=fake_extractor,
         )
     )
@@ -103,8 +115,10 @@ def test_extract_and_store_facts_end_to_end(tmp_path):
     facts = store.list_chunks(domain="fact", namespace="ns1", limit=10)
     # The store guardrail (ADR 0021 Phase 1) strips scratch_pad even here.
     assert all("scratch_pad" not in f.content.lower() for f in facts)
+    # Provenance threads through the extraction path (ADR 0069 D5).
+    assert all(f.source == "a2a:chat-7" for f in facts)
 
 
 def test_extract_noop_without_store():
     counts = asyncio.run(extract_and_store_facts("x", knowledge_store=None, config=object()))
-    assert counts == {"added": 0, "skipped": 0}
+    assert counts == {"added": 0, "skipped": 0, "superseded": 0}

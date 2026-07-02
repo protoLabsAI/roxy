@@ -660,6 +660,12 @@ def _main():
     # Knowledge store + Playbooks (ADR 0020). Extracted to
     # operator_api/knowledge_routes.py (ADR 0023 phase 3).
     register_knowledge_routes(fastapi_app)
+
+    # Memory inspector (ADR 0069 D7) — /api/memory/*: the session summaries
+    # behind the <prior_sessions> digest + always-injected hot memory.
+    from operator_api.memory_routes import register_memory_routes
+
+    register_memory_routes(fastapi_app)
     register_plugin_routes(fastapi_app)
 
     # Operator server controls — POST /api/restart (graceful self-restart). Gated by
@@ -674,6 +680,12 @@ def _main():
 
     register_fleet_routes(fastapi_app)
 
+    # Developer flags (ADR 0068) — /api/flags serves the resolved flag states the
+    # console Developer panel renders + toggles.
+    from operator_api.flags_routes import register_flags_routes
+
+    register_flags_routes(fastapi_app)
+
     # Per-agent theme (ADR 0042) — each agent saves its own look; the console repaints
     # to the focused agent's theme (proxied via /agents/<slug>/api/theme, slug routing).
     from operator_api.theme_routes import register_theme_routes
@@ -685,6 +697,12 @@ def _main():
     # Per-turn cost/latency + advise-only insights (ADR 0006). Extracted to
     # operator_api/telemetry_routes.py (ADR 0023 phase 3).
     register_telemetry_routes(fastapi_app)
+
+    # Memory-injection record (ADR 0069 D6) — which memory items entered which
+    # turn. Read-only forensics surface over observability/injection_log.py.
+    from operator_api.injection_routes import register_injection_routes
+
+    register_injection_routes(fastapi_app)
 
     # Live config / SOUL editing, model probe/test, setup wizard, and
     # schema-driven settings. Extracted to operator_api/config_routes.py

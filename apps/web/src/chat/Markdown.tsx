@@ -10,6 +10,11 @@ import { Markdown as DSMarkdown } from "@protolabsai/ui/markdown";
  *
  * `className="markdown"` rides the same element the DS scopes as `.pl-markdown`, so existing
  * `.markdown` selectors (e2e + message-layout) keep matching.
+ *
+ * Code-block line numbers default OFF in the DS `<Markdown>` as of `@protolabsai/ui@0.52.1`
+ * (protoContent#376) — the DS themes the gutter for Tailwind-purging consumers and no longer
+ * needs the console to force `lineNumbers={false}`. Pass an explicit `lineNumbers` prop to opt
+ * a numbered code well back in.
  */
 export function Markdown({ children }: { children: string }) {
   return <DSMarkdown className="markdown">{children}</DSMarkdown>;

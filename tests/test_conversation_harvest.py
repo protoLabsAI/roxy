@@ -28,8 +28,17 @@ class _FakeKnowledge:
     def __init__(self):
         self.chunks = []
 
-    def add_chunk(self, content, domain=None, heading=None, *, namespace=None, **kw):
-        self.chunks.append({"content": content, "domain": domain, "heading": heading, "namespace": namespace})
+    def add_chunk(self, content, domain=None, heading=None, *, source=None, source_type=None, namespace=None, **kw):
+        self.chunks.append(
+            {
+                "content": content,
+                "domain": domain,
+                "heading": heading,
+                "source": source,
+                "source_type": source_type,
+                "namespace": namespace,
+            }
+        )
         return f"chunk-{len(self.chunks)}"
 
 
@@ -70,6 +79,10 @@ def test_harvest_thread_summarizes_into_knowledge(tmp_path):
     assert cid == "chunk-1"
     assert kb.chunks[0]["domain"] == "conversation"
     assert "teal" in kb.chunks[0]["content"]
+    # Provenance (ADR 0069 D5): the row links back to the retired thread.
+    assert kb.chunks[0]["source"] == "a2a:chat-1"
+    # Trust tier (ADR 0069 D8): harvest rows rank agent-derived.
+    assert kb.chunks[0]["source_type"] == "harvest"
 
 
 def test_harvest_extracts_facts_when_enabled(tmp_path):
@@ -104,9 +117,13 @@ def test_harvest_extracts_facts_when_enabled(tmp_path):
     )
     assert cid is not None
     # Episodic summary (conversation) + semantic fact (fact), both namespaced.
-    assert len(store.list_chunks(domain="conversation", namespace="proj-x")) == 1
+    summaries = store.list_chunks(domain="conversation", namespace="proj-x")
+    assert len(summaries) == 1
     facts = store.list_chunks(domain="fact", namespace="proj-x")
     assert len(facts) == 1 and "teal" in facts[0].content
+    # Provenance (ADR 0069 D5): both rows carry the originating thread id.
+    assert summaries[0].source == "a2a:chat-1"
+    assert facts[0].source == "a2a:chat-1"
 
 
 def test_harvest_skips_facts_when_disabled(tmp_path):
@@ -156,6 +173,38 @@ def test_harvest_noop_on_unknown_thread(tmp_path):
 
     out = asyncio.run(
         harvest_thread("a2a:nope", checkpointer=saver, knowledge_store=kb, config=object(), summarizer=_boom)
+    )
+    assert out is None and kb.chunks == []
+
+
+def test_harvest_skips_incognito_thread(tmp_path):
+    """ADR 0069 D3b: incognito means NO memory trail — the retire sweep
+    (harvest_enabled defaults ON) must not summarize the thread into the
+    knowledge store, where RAG would re-inject it into later prompts."""
+    from graph.state import ProtoAgentState
+
+    db = str(tmp_path / "c.db")
+    g = StateGraph(ProtoAgentState)
+    g.add_node("n", lambda s: {"messages": [AIMessage(content="noted")]})
+    g.add_edge(START, "n")
+    g.add_edge("n", END)
+
+    async def main():
+        app = g.compile(checkpointer=build_sqlite_checkpointer(db))
+        await app.ainvoke(
+            {"messages": [HumanMessage(content="my secret color is teal")], "incognito": True},
+            {"configurable": {"thread_id": "a2a:incog"}},
+        )
+
+    asyncio.run(main())
+    saver = build_sqlite_checkpointer(db)
+    kb = _FakeKnowledge()
+
+    async def _boom(transcript, config):
+        raise AssertionError("incognito thread must not be summarized")
+
+    out = asyncio.run(
+        harvest_thread("a2a:incog", checkpointer=saver, knowledge_store=kb, config=object(), summarizer=_boom)
     )
     assert out is None and kb.chunks == []
 

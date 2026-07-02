@@ -218,6 +218,7 @@ def create(
     bundle: str | None = None,
     port: int | None = None,
     shared_skills: bool = False,
+    soul: str | None = None,
 ) -> dict:
     """Scaffold a workspace: its config dir, ``workspace.yaml``, and (with ``bundle``)
     an installed plugin bundle. Does not start it.
@@ -228,6 +229,10 @@ def create(
         secrets popped over (the gateway), so it boots ready-to-chat WITHOUT inheriting its
         plugins/skills. This is the fleet's default "new agent" (a blank agent, model carried).
       * neither — the plain blank template.
+
+    ``soul`` (the picked archetype's base SOUL.md, ADR 0042) is written into the workspace's
+    ``config/SOUL.md`` — the member's live persona — so an agent created from an archetype
+    arrives with its persona, not just its tools. Blank leaves the agent on the default SOUL.
     """
     name = _safe(name)
     if name.lower() in _RESERVED_NAMES:
@@ -264,6 +269,12 @@ def create(
             _overlay_model(cfg, ws, inherit_model)  # gateway only — not plugins/skills
         if shared_skills:
             _stamp_identity(cfg, name, True, instance_id=wid)
+
+    # The archetype persona (ADR 0042) — the member reads its SOUL at <ws>/config/SOUL.md
+    # (instance_root=<ws>), so scaffold it there. Only when non-empty: a blank archetype
+    # (or none) leaves the agent on the default SOUL rather than writing an empty persona.
+    if soul and soul.strip():
+        (cfg_dir / "SOUL.md").write_text(soul, encoding="utf-8")
 
     import yaml
 
@@ -416,6 +427,16 @@ def _stamp_identity(cfg: Path, name: str, shared_skills: bool, *, instance_id: s
     save_yaml_doc(doc, cfg)
 
 
+def _server_argv() -> list[str]:
+    """Argv prefix that re-invokes THIS server binary. A source checkout launches
+    ``python -m server``; in the frozen desktop sidecar ``sys.executable`` *is* the
+    server entrypoint, and passing ``-m server`` to it dies at argparse with
+    "unrecognized arguments" — the fleet's created-agents never booted there."""
+    if getattr(sys, "frozen", False):  # PyInstaller sidecar — entrypoint is already `-m server`
+        return [sys.executable]
+    return [sys.executable, "-m", "server"]
+
+
 def _install_bundle_into(ws: Path, bundle: str) -> list[str]:
     """Install a bundle (or plugin) into the workspace via a scoped subprocess —
     ``PROTOAGENT_HOME=<ws>`` makes the workspace the installer's instance root, so
@@ -425,7 +446,7 @@ def _install_bundle_into(ws: Path, bundle: str) -> list[str]:
         "PROTOAGENT_HOME": str(ws),
     }
     proc = subprocess.run(
-        [sys.executable, "-m", "server", "plugin", "install", bundle],
+        [*_server_argv(), "plugin", "install", bundle],
         env=env,
         capture_output=True,
         text=True,
@@ -460,7 +481,7 @@ def run_exec(ident: str, passthrough: list[str]) -> tuple[dict, list[str]]:
         "PROTOAGENT_HOME": str(ws),
         "PROTOAGENT_INSTANCE": str(rec.get("id", ident)),
     }
-    argv = [sys.executable, "-m", "server", "--port", str(rec.get("port", PORT_BASE + 1)), *passthrough]
+    argv = [*_server_argv(), "--port", str(rec.get("port", PORT_BASE + 1)), *passthrough]
     return env, argv
 
 

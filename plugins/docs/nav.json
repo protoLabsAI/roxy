@@ -171,6 +171,10 @@
           "title": "Command palette (⌘K)"
         },
         {
+          "path": "guides/developer-flags.md",
+          "title": "Developer flags (gate pre-release features)"
+        },
+        {
           "path": "guides/phone-access.md",
           "title": "Access from your phone (LAN / Tailscale)"
         },
@@ -619,6 +623,14 @@
         {
           "path": "adr/0068-developer-flags-and-panel.md",
           "title": "0068 — Developer flags & the Developer panel (gating pre-release functionality)"
+        },
+        {
+          "path": "adr/0069-memory-delivery-layer.md",
+          "title": "ADR 0069 — Memory delivery layer: attributed digest, provenance, trust tiers"
+        },
+        {
+          "path": "adr/0070-background-results-push-resume.md",
+          "title": "ADR 0070 — Background results: push-resume, indexed reports, disposable workers"
         },
         {
           "path": "adr/index.md",

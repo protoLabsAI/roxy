@@ -6,7 +6,7 @@ import { useState } from "react";
 
 import { Badge, Button, Empty } from "@protolabsai/ui/primitives";
 import { Alert, StatusDot } from "@protolabsai/ui/data";
-import { EditableText, Switch } from "@protolabsai/ui/forms";
+import { EditableText, Input, SecretInput, Switch } from "@protolabsai/ui/forms";
 import { ConfirmDialog, useToast } from "@protolabsai/ui/overlays";
 import { PanelHeader } from "@protolabsai/ui/navigation";
 
@@ -15,6 +15,13 @@ import { api, currentSlug } from "../lib/api";
 import { errMsg } from "../lib/format";
 import { fleetQuery, queryKeys } from "../lib/queries";
 import type { DiscoveredAgent, FleetAgent } from "../lib/types";
+
+/** The manual add-remote form is submittable only with a name and an http(s) URL. Exported
+ * (pure) so the enable rule is unit-tested without rendering the panel. The server does the
+ * authoritative validation (charset, SSRF egress, dedupe); this is just the button gate. */
+export function canAddRemote(name: string, url: string): boolean {
+  return name.trim().length > 0 && /^https?:\/\/.+/.test(url.trim());
+}
 
 // Fleet manager (ADR 0042) — Settings → Agents. Lists the workspace agents with live
 // status (the query polls every 3s, so a crashed agent flips to stopped on its own) and
@@ -128,17 +135,79 @@ export function FleetManagerPanel({ onNew }: { onNew?: () => void }) {
   // same enable-and-retry path as fleet-row adds.
   const addRemote = (d: DiscoveredAgent) => addDelegate.mutate({ name: d.name, url: `${d.url}/a2a` });
 
+  // A registered member's up-front feedback: the server probes it at register time and
+  // returns `reachable`, so a peer that's offline (or behind a wrong/missing token — the
+  // probe hits its unauthenticated agent-card) is added with an honest "not reachable yet"
+  // warning instead of silently appearing as a dead row.
+  const addedToast = (name: string, reachable?: boolean) =>
+    reachable === false
+      ? toast({
+          tone: "warning",
+          title: `Added ${name}`,
+          message: "Registered, but it isn't reachable yet — it'll connect when it comes online.",
+        })
+      : toast({ tone: "success", title: `Added ${name}`, message: `${name} joined the fleet.` });
+
   // …or join the fleet outright (ADR 0042 §I): the remote becomes a SWITCHABLE member —
-  // a slug window, console + A2A reverse-proxied through this hub. Discovered names can
-  // collide with existing agents (every template fork is "protoagent") — suffix on 400.
+  // a slug window, console + A2A reverse-proxied through this hub.
   const addMember = useMutation({
     mutationFn: (d: DiscoveredAgent) => api.addRemoteAgent({ name: d.name, url: d.url }),
+    onSuccess: (res, d) => addedToast(d.name, res.reachable),
     onError: (e) => toast({ tone: "error", title: "Couldn't add to fleet", message: errMsg(e) }),
     onSettled: () => {
       qc.invalidateQueries({ queryKey: queryKeys.fleet });
       void scan(); // the new member drops out of the discover list
     },
   });
+
+  // The add-a-remote-by-URL form doubles as the EDIT form (`editingId` set). Manual add is the
+  // ONLY way to register a token-gated remote (discovery can't carry a credential) or a peer
+  // discovery didn't surface (a different subnet, mDNS off); edit is how you fix a rotated/
+  // wrong token or a changed URL in place (the id/slug — and open windows — survive).
+  const [showAdd, setShowAdd] = useState(false);
+  const [editingId, setEditingId] = useState<string | null>(null); // null = add mode
+  const [addName, setAddName] = useState("");
+  const [addUrl, setAddUrl] = useState("");
+  const [addToken, setAddToken] = useState("");
+  const resetForm = () => {
+    setShowAdd(false);
+    setEditingId(null);
+    setAddName("");
+    setAddUrl("");
+    setAddToken("");
+  };
+  const openAdd = () => {
+    resetForm();
+    setShowAdd(true);
+  };
+  const openEdit = (a: FleetAgent) => {
+    setEditingId(a.id);
+    setAddName(a.name);
+    setAddUrl(a.url ?? "");
+    setAddToken(""); // blank = keep the stored token (write a new one only to rotate it)
+    setShowAdd(true);
+  };
+  const submitRemote = useMutation({
+    mutationFn: () => {
+      const name = addName.trim();
+      const url = addUrl.trim();
+      const token = addToken.trim();
+      // On edit, a blank token means "keep" (omit it); on add, pass it through.
+      return editingId
+        ? api.updateRemoteAgent(editingId, { name, url, ...(token ? { token } : {}) })
+        : api.addRemoteAgent({ name, url, token });
+    },
+    onSuccess: (res) => {
+      const name = addName.trim();
+      if (editingId) toast({ tone: "success", title: `Updated ${name}`, message: res.reachable === false ? "Saved — still not reachable." : "Saved." });
+      else addedToast(name, res.reachable);
+      resetForm();
+    },
+    onError: (e) =>
+      toast({ tone: "error", title: editingId ? "Couldn't update member" : "Couldn't add to fleet", message: errMsg(e) }),
+    onSettled: () => qc.invalidateQueries({ queryKey: queryKeys.fleet }),
+  });
+  const canAdd = canAddRemote(addName, addUrl);
   const removeMember = useMutation({
     mutationFn: (a: FleetAgent) => api.removeRemoteAgent(a.id),
     onError: (e) => toast({ tone: "error", title: "Couldn't remove member", message: errMsg(e) }),
@@ -212,9 +281,20 @@ export function FleetManagerPanel({ onNew }: { onNew?: () => void }) {
               const isActive = (a.host ? "host" : a.id) === slug; // slug = stable id, not name
               return (
                 <li key={a.id} className={`fleet-row${isActive ? " active" : ""}`}>
-                  <span role="img" title={a.running ? "running" : "stopped"} aria-label={a.running ? "running" : "stopped"}>
-                    <StatusDot status={a.running ? "success" : "neutral"} pulse={a.running} />
-                  </span>
+                  {/* A remote's `running` IS its reachability probe (it has no local process),
+                      so an offline remote is "unreachable", not "stopped" — and its dot reads
+                      warning, not neutral, since it's a fault to act on rather than an idle agent. */}
+                  {(() => {
+                    const label = a.running ? "running" : a.remote ? "unreachable" : "stopped";
+                    return (
+                      <span role="img" title={label} aria-label={label}>
+                        <StatusDot
+                          status={a.running ? "success" : a.remote ? "warning" : "neutral"}
+                          pulse={a.running}
+                        />
+                      </span>
+                    );
+                  })()}
                   <div className="fleet-row-main">
                     <span className="fleet-name">
                       {renaming === a.id ? (
@@ -273,14 +353,22 @@ export function FleetManagerPanel({ onNew }: { onNew?: () => void }) {
                         </Button>
                       )
                     ) : null}
-                    {/* A remote member can't be started/stopped/renamed from here — only
-                        unregistered (the remote agent itself is untouched). */}
+                    {/* A remote member can't be started/stopped from here, but its URL/token/
+                        name ARE editable in place (the id/slug survives) — or unregister it
+                        (the remote agent itself is untouched). */}
                     {a.remote ? (
-                      <Button icon variant="ghost" title="Remove from this fleet (the remote agent is untouched)"
-                        disabled={removeMember.isPending}
-                        onClick={() => removeMember.mutate(a)}>
-                        <Trash2 size={14} />
-                      </Button>
+                      <>
+                        <Button icon variant="ghost" title="Edit this member's URL, token or name"
+                          disabled={submitRemote.isPending}
+                          onClick={() => openEdit(a)}>
+                          <Pencil size={14} />
+                        </Button>
+                        <Button icon variant="ghost" title="Remove from this fleet (the remote agent is untouched)"
+                          disabled={removeMember.isPending}
+                          onClick={() => removeMember.mutate(a)}>
+                          <Trash2 size={14} />
+                        </Button>
+                      </>
                     ) : null}
                     {/* The host serves this console — it can't stop or remove itself; its
                         display name is edited in Settings → Identity instead. */}
@@ -318,9 +406,66 @@ export function FleetManagerPanel({ onNew }: { onNew?: () => void }) {
         {/* Network discovery — scan the box + LAN for OTHER protoAgents and add one as a remote
             delegate of the focused agent (ADR 0042 §I). */}
         <div className="fleet-discover">
-          <Button variant="ghost" onClick={scan} disabled={scanning}>
-            <Radar size={14} /> {scanning ? "Scanning…" : "Discover agents on the network"}
-          </Button>
+          <div className="fleet-discover-actions">
+            <Button variant="ghost" onClick={scan} disabled={scanning}>
+              <Radar size={14} /> {scanning ? "Scanning…" : "Discover agents on the network"}
+            </Button>
+            {/* Manual add — the only path for a token-gated remote (discovery carries no
+                credential) or one on a subnet the scan can't reach. */}
+            <Button variant="ghost" onClick={() => (showAdd ? resetForm() : openAdd())} aria-expanded={showAdd}>
+              <Link2 size={14} /> Add a remote by URL
+            </Button>
+          </div>
+          {showAdd ? (
+            <form
+              className="fleet-add-remote"
+              onSubmit={(e) => {
+                e.preventDefault();
+                if (canAdd && !submitRemote.isPending) submitRemote.mutate();
+              }}
+            >
+              {editingId ? <span className="fleet-add-remote-title">Edit remote member</span> : null}
+              <label className="field">
+                <span>Name</span>
+                <Input
+                  value={addName}
+                  onChange={(e) => setAddName(e.target.value)}
+                  placeholder="e.g. ava (letters, digits, - and _)"
+                  autoFocus
+                />
+              </label>
+              <label className="field">
+                <span>URL</span>
+                <Input
+                  value={addUrl}
+                  onChange={(e) => setAddUrl(e.target.value)}
+                  placeholder="http://100.x.y.z:7870"
+                />
+              </label>
+              <label className="field">
+                <span>Token{editingId ? "" : " (optional)"}</span>
+                <SecretInput
+                  value={addToken}
+                  onChange={(e) => setAddToken(e.target.value)}
+                  placeholder={editingId ? "•••••••• — leave blank to keep the current token" : "the remote's operator token, if it's gated"}
+                />
+              </label>
+              <div className="fleet-add-remote-actions">
+                <Button type="button" variant="ghost" onClick={resetForm}>
+                  Cancel
+                </Button>
+                <Button type="submit" variant="primary" disabled={!canAdd || submitRemote.isPending}>
+                  {submitRemote.isPending
+                    ? editingId
+                      ? "Saving…"
+                      : "Adding…"
+                    : editingId
+                      ? "Save changes"
+                      : "Add to fleet"}
+                </Button>
+              </div>
+            </form>
+          ) : null}
           {discovered ? (
             discovered.length === 0 ? (
               <Empty>No other protoAgents found on the network.</Empty>

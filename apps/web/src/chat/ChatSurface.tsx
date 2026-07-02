@@ -3,8 +3,8 @@ import { Badge, Button, Empty } from "@protolabsai/ui/primitives";
 import { Switch } from "@protolabsai/ui/forms";
 import { Conversation, Message, PromptInput } from "@protolabsai/ui/ai";
 import { TabBar } from "@protolabsai/ui/navigation";
-import { Check, TerminalSquare } from "lucide-react";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { Check, EyeOff, TerminalSquare } from "lucide-react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { MouseEvent as ReactMouseEvent } from "react";
 import { useQuery } from "@tanstack/react-query";
 
@@ -23,12 +23,14 @@ import {
   effectiveReasoningEffort,
 } from "./chat-store";
 import "./coreSlashCommands"; // registers /new, /clear, /effort via the slash-command seam (ADR 0061)
-import { findSlashCommand, registeredSlashCommands } from "../ext/slashRegistry";
+import { findSlashCommand, registeredSlashCommands, slashTokenAt } from "../ext/slashRegistry";
+import { useFlagPredicate } from "../flags/flags";
 import { registeredComposerActions } from "../ext/composerRegistry";
 import { ChatMessageView } from "./ChatMessageView";
 import { ComposerModelSelect } from "./ComposerModelSelect";
 import { filesFromTransfer, isLargePaste, pastedTextFile } from "./paste";
 import { inputHistory, pushInputHistory } from "./inputHistory";
+import { finalizeStoppedMessages, resolveStopTarget } from "./stopTurn";
 import { addComponent, addToolRef, appendReasoning, appendText } from "./parts";
 
 function messageId() {
@@ -155,24 +157,32 @@ export function ChatSurface({
     closeSession(session.id, false); // false = no knowledge harvest
   }
 
-  // Right-click a chat tab → context menu (ADR 0036). The DS TabBar exposes no per-tab
-  // context-menu hook, so we delegate from the tab-bar wrapper and map the clicked tab to its
-  // session by sibling index (DOM order tracks the `items` = sessions order). Close reuses the
-  // confirm dialog; Rename fires the TabBar's inline editor via a synthetic dblclick on the tab.
-  function onTabBarContextMenu(e: ReactMouseEvent) {
+  // Right-click a chat tab → context menu (ADR 0036). The DS TabBar's `onTabContextMenu`
+  // (@protolabsai/ui@0.53.0) hands us the session id directly — no sibling-index DOM sniffing.
+  // Rename opens the TabBar's inline editor via a synthetic dblclick on the tab element (the DS
+  // exposes no start-rename API); we grab that element off the event, not to recover WHICH tab
+  // (the hook gives us the id) but only to fire the editor.
+  function onTabContextMenu(id: string, e: ReactMouseEvent) {
     const tabEl = (e.target as HTMLElement).closest(".pl-tabbar__tab") as HTMLElement | null;
-    if (!tabEl) {
-      openContextMenu("chat-tab", e, { onNew: () => chatStore.createSession() });
-      return;
-    }
-    const tabs = Array.from((e.currentTarget as HTMLElement).querySelectorAll(".pl-tabbar__tab"));
-    const session = chat.sessions[tabs.indexOf(tabEl)];
-    if (!session) return;
+    const target = chat.sessions.find((s) => s.id === id);
     openContextMenu("chat-tab", e, {
-      sessionId: session.id,
+      sessionId: id,
+      incognito: !!target?.incognito,
       onNew: () => chatStore.createSession(),
-      onRename: () => tabEl.dispatchEvent(new MouseEvent("dblclick", { bubbles: true })),
-      onClose: () => setPendingClose(session.id),
+      onNewIncognito: () => chatStore.createSession({ incognito: true }),
+      onToggleIncognito: () => chatStore.setSessionIncognito(id, !target?.incognito),
+      onRename: () => tabEl?.dispatchEvent(new MouseEvent("dblclick", { bubbles: true })),
+      onClose: () => setPendingClose(id),
+    });
+  }
+
+  // Right-click EMPTY tab-bar space (not a tab) → just the "New chat" affordance. onTabContextMenu
+  // owns per-tab; this catches the background only, and bails on tab hits so the two never both fire.
+  function onTabBarBackgroundContextMenu(e: ReactMouseEvent) {
+    if ((e.target as HTMLElement).closest(".pl-tabbar__tab")) return; // a tab — onTabContextMenu owns it
+    openContextMenu("chat-tab", e, {
+      onNew: () => chatStore.createSession(),
+      onNewIncognito: () => chatStore.createSession({ incognito: true }),
     });
   }
 
@@ -185,7 +195,7 @@ export function ChatSurface({
           the collapsed <option> can't host markup, matching the old behavior. */}
       <div
         className={`chat-tabbar-wrap${shiftDel ? " chat-tabbar-wrap--del" : ""}`}
-        onContextMenu={onTabBarContextMenu}
+        onContextMenu={onTabBarBackgroundContextMenu}
         onClickCapture={onTabBarClickCapture}
       >
         <TabBar
@@ -197,7 +207,16 @@ export function ChatSurface({
             return {
               id: session.id,
               label: session.title,
-              icon: <span className={`session-dot ${status}`} title={status} />,
+              // Incognito rides the icon slot next to the status dot — the tab-level
+              // "this thread leaves no memory" indicator (ADR 0069 D3b).
+              icon: session.incognito ? (
+                <span className="session-tab-icons">
+                  <span className={`session-dot ${status}`} title={status} />
+                  <EyeOff size={12} className="session-incognito-icon" aria-label="incognito" />
+                </span>
+              ) : (
+                <span className={`session-dot ${status}`} title={status} />
+              ),
             };
           })}
           onSelect={(id) => chatStore.switchSession(id)}
@@ -205,6 +224,7 @@ export function ChatSurface({
           onRename={(id, label) => chatStore.renameSession(id, label)}
           onReorder={(next) => chatStore.reorderSessions(next.map((t) => t.id))}
           onAdd={() => chatStore.createSession()}
+          onTabContextMenu={onTabContextMenu}
           addLabel="New chat"
         />
       </div>
@@ -274,10 +294,20 @@ function ChatSessionSlot({
   // a spinner/"working…" strip above the composer — the inline indicators cover it now.
   const [, setStatusMessage] = useState("");
   const [taskId, setTaskId] = useState("");
-  const [hitl, setHitl] = useState<HitlPayload | null>(null);
+  const [hitl, setHitlState] = useState<HitlPayload | null>(null);
+  // Ref mirror for async closures (reconcileSteer runs after an await — the render
+  // closure's `hitl` is stale by then). Always set both via updateHitl.
+  const hitlRef = useRef<HitlPayload | null>(null);
+  const updateHitl = (payload: HitlPayload | null) => {
+    hitlRef.current = payload;
+    setHitlState(payload);
+  };
   const abortRef = useRef<AbortController | null>(null);
   // Transient "copied ✓" feedback on a message's copy action.
   const [copiedId, setCopiedId] = useState<string | null>(null);
+  // The message a "Rewind to here" is pending confirmation on (null = dialog closed).
+  // Rewind is destructive (discards everything below), so it goes through a confirm.
+  const [pendingRewind, setPendingRewind] = useState<ChatMessage | null>(null);
   // Mid-turn steering: user messages queued WHILE a turn streams (optimistic),
   // reconciled at turn-end. The ref mirrors the state so the post-stream reconcile
   // (a stale render closure) reads the live queue.
@@ -382,20 +412,52 @@ function ChatSessionSlot({
   }
 
   // Slash-command autocomplete. Commands the server handles (e.g. /goal) are
-  // fetched once; the dropdown is active while typing "/name" (before a space).
+  // fetched once; the dropdown is active while typing a "/name" token (before a space).
   const [commands, setCommands] = useState<SlashCommand[]>([]);
   const [slashIndex, setSlashIndex] = useState(0);
   const [slashDismissed, setSlashDismissed] = useState(false);
+  // The "/name" token the caret currently sits in ({query, start}), or null. Recomputed
+  // from the LIVE textarea caret (not just the draft) so the popover triggers MID-INPUT —
+  // typing "/" at any cursor position opens it, not only when "/" is char 0 (#1530).
+  const [slashCtx, setSlashCtx] = useState<{ query: string; start: number; end: number } | null>(null);
+  // Keeps the keyboard-selected item scrolled into view during ↑/↓ nav (#1528).
+  const activeSlashRef = useRef<HTMLButtonElement | null>(null);
 
   useEffect(() => {
     api.chatCommands().then((r) => setCommands(r.commands)).catch(() => {});
   }, []);
 
-  const slashQuery = useMemo(() => {
-    if (slashDismissed || !draft.startsWith("/")) return null;
-    const after = draft.slice(1);
-    return after.includes(" ") ? null : after; // closes once a space is typed
-  }, [draft, slashDismissed]);
+  // Re-parse the slash token from the textarea's current value + caret. Called on input,
+  // on caret moves (native keyup/click/select/focus listeners below), and after any
+  // programmatic caret change — so the popover state tracks the caret wherever it is.
+  const refreshSlash = useCallback(() => {
+    const ta = textareaRef.current;
+    if (!ta) return;
+    setSlashCtx(slashTokenAt(ta.value, ta.selectionStart ?? ta.value.length));
+  }, []);
+
+  // Caret moves that don't fire onChange (arrow keys, clicks, selection, focus) still need
+  // to re-evaluate the popover so "/" mid-input opens/closes as the caret enters/leaves a token.
+  useEffect(() => {
+    const ta = textareaRef.current;
+    if (!ta) return;
+    ta.addEventListener("keyup", refreshSlash);
+    ta.addEventListener("click", refreshSlash);
+    ta.addEventListener("select", refreshSlash);
+    ta.addEventListener("focus", refreshSlash);
+    return () => {
+      ta.removeEventListener("keyup", refreshSlash);
+      ta.removeEventListener("click", refreshSlash);
+      ta.removeEventListener("select", refreshSlash);
+      ta.removeEventListener("focus", refreshSlash);
+    };
+  }, [refreshSlash]);
+
+  const slashQuery = slashDismissed ? null : slashCtx?.query ?? null;
+
+  // Developer-flag gate (ADR 0068): a registered command tagged with `flag:` is listed
+  // and dispatched only while its flag resolves ON — flag-off, it's as if unregistered.
+  const flagOn = useFlagPredicate();
 
   const slashMatches = useMemo(() => {
     if (slashQuery === null) return [];
@@ -404,16 +466,24 @@ function ChatSessionSlot({
     // comes from the slash-command registry — core (/new, /clear, /effort) AND any fork-
     // registered commands — so neither is hardcoded here.
     const all: SlashCommand[] = [
-      ...registeredSlashCommands().map((c) => ({ name: c.name, description: c.description, usage: c.usage })),
+      ...registeredSlashCommands()
+        .filter((c) => !c.flag || flagOn(c.flag))
+        .map((c) => ({ name: c.name, description: c.description, usage: c.usage })),
       ...commands,
     ];
     return all.filter(
       (c) => !q || c.name.toLowerCase().includes(q) || c.description.toLowerCase().includes(q),
     );
-  }, [slashQuery, commands]);
+  }, [slashQuery, commands, flagOn]);
 
   const slashActive = slashMatches.length > 0;
   const slashSel = slashActive ? Math.min(slashIndex, slashMatches.length - 1) : 0;
+
+  // Auto-scroll the keyboard-selected item into view during ↑/↓ nav so it never hides
+  // below the popover's scroll edge (standard listbox behavior, #1528).
+  useEffect(() => {
+    if (slashActive) activeSlashRef.current?.scrollIntoView({ block: "nearest" });
+  }, [slashSel, slashActive]);
 
   // Post a local SYSTEM NOTE to the thread (e.g. a /effort confirmation, a status line, a
   // warning) — never sent to the agent, just shown so the operator sees a local action took
@@ -440,6 +510,7 @@ function ChatSessionSlot({
     const [verb, ...rest] = raw.split(/\s+/);
     const cmd = findSlashCommand(verb);
     if (!cmd) return false;
+    if (cmd.flag && !flagOn(cmd.flag)) return false; // flag-off ⇒ as if unregistered
     return cmd.run({
       rest: rest.join(" ").trim(),
       sessionId: session?.id ?? null,
@@ -450,17 +521,38 @@ function ChatSessionSlot({
   }
 
   function completeCommand(cmd: SlashCommand) {
-    // A client command runs on pick; a server skill fills the draft to edit + send.
+    // Replace ONLY the "/name" token the caret is in — surrounding text is preserved so a
+    // command can be completed at the start, middle, or end of the draft (#1530). Fall back
+    // to the whole draft if the token is somehow unknown (defensive).
+    const token = slashCtx;
+    const start = token ? token.start : 0;
+    const end = token ? token.end : draft.length;
+    // Place the caret + re-sync the popover after React commits the new value.
+    const settleCaret = (pos: number) => {
+      requestAnimationFrame(() => {
+        const ta = textareaRef.current;
+        if (!ta) return;
+        ta.focus();
+        ta.selectionStart = ta.selectionEnd = pos;
+        refreshSlash();
+      });
+    };
+    // A client command runs on pick — drop just its token from the draft (keeping any
+    // surrounding text); a server skill inserts "/name " to edit + send.
     if (runClientSlash(cmd.name)) {
-      setDraft("");
+      setDraft(draft.slice(0, start) + draft.slice(end));
       setSlashIndex(0);
       setSlashDismissed(true);
+      setSlashCtx(null);
+      settleCaret(start);
       return;
     }
-    setDraft(`/${cmd.name} `);
+    const insert = `/${cmd.name} `;
+    setDraft(draft.slice(0, start) + insert + draft.slice(end));
     setSlashIndex(0);
     setSlashDismissed(true); // a space follows, so it would close anyway
-    textareaRef.current?.focus();
+    setSlashCtx(null);
+    settleCaret(start + insert.length);
   }
 
   // Runs BEFORE the DS PromptInput's Enter-to-submit (via its onKeyDown seam):
@@ -508,7 +600,10 @@ function ChatSessionSlot({
           // caret to end so the next keystroke edits the recalled text (readline behaviour)
           requestAnimationFrame(() => {
             const t = textareaRef.current;
-            if (t) t.selectionStart = t.selectionEnd = val.length;
+            if (t) {
+              t.selectionStart = t.selectionEnd = val.length;
+              refreshSlash(); // keep the slash popover in sync with the moved caret
+            }
           });
         };
         if (event.key === "ArrowUp" && onFirstLine) {
@@ -546,6 +641,7 @@ function ChatSessionSlot({
         setDraft(`${draft.slice(0, start)}\n${draft.slice(end)}`);
         requestAnimationFrame(() => {
           ta.selectionStart = ta.selectionEnd = start + 1;
+          refreshSlash(); // keep the slash popover in sync with the moved caret
         });
       }
     }
@@ -631,6 +727,15 @@ function ChatSessionSlot({
 
   async function send() {
     if (!session || !canSend) return;
+    // A HITL form/question/approval is open (#1560): a fresh send would race the
+    // pending form — the server holds unmarked messages anyway — so queue it as a
+    // steer instead. It folds into the agent's context right AFTER the form
+    // response (submit or dismiss), with the same queued-bubble + ✕ affordances
+    // as mid-turn steering. Attachments stay in the tray for the next real send.
+    if (hitl) {
+      void queueSteer();
+      return;
+    }
     const text = draft.trim();
     pushInputHistory(text); // record for ↑/↓ recall, then reset nav to the newest
     histIndexRef.current = null;
@@ -755,6 +860,14 @@ function ChatSessionSlot({
     const consumed = queued.filter((q) => !remainingIds.has(q.id));
     const unconsumed = queued.filter((q) => remainingIds.has(q.id));
     if (consumed.length) settleConsumed(consumed);
+    // The turn parked on a HITL form (#1560): steers the agent hasn't folded yet stay
+    // QUEUED — the server keeps holding them and folds them in right after the form
+    // response. Re-sending them as a fresh turn here would deliver them BEFORE the
+    // form answer (and abandon the pending interrupt).
+    if (unconsumed.length && hitlRef.current) {
+      setSteerQueue(unconsumed);
+      return;
+    }
     setSteerQueue([]);
     if (unconsumed.length) {
       void runTurn(unconsumed.map((u) => u.text).join("\n\n"));
@@ -826,6 +939,48 @@ function ChatSessionSlot({
     chatStore.renameSession(created.id, `${baseTitle} (fork)`);
   }
 
+  // Rewind the conversation to a message IN PLACE (vs fork's new tab): discard
+  // everything below it. Destructive + irreversible, so it's gated behind a confirm
+  // (pendingRewind opens the dialog); confirmRewind does the work. The server rewrite
+  // is the point — the LangGraph checkpoint is the agent's real context, so a
+  // client-only trim would leave the agent still "remembering" the discarded turns.
+  function rewindAtMessage(message: ChatMessage) {
+    if (!session || status === "streaming") return;
+    setPendingRewind(message);
+  }
+
+  async function confirmRewind(message: ChatMessage) {
+    if (!session) return;
+    const i = session.messages.findIndex((m) => m.id === message.id);
+    if (i < 0) return;
+    // WHICH occurrence of this exact text the clicked bubble is — client message ids never
+    // appear in the checkpoint, so the server resolves by content; identical replies can
+    // repeat, and this makes it pick the SAME one we clicked (not a later duplicate).
+    const want = (message.content || "").trim();
+    const occurrence = session.messages.slice(0, i).filter((m) => (m.content || "").trim() === want).length;
+    let found: boolean;
+    try {
+      // Roll the agent's live context back on the server FIRST (the checkpoint is
+      // the real memory); the client truncate below just mirrors the result.
+      found = (await api.rewindChatSession(session.id, message.id ?? "", message.content, occurrence)).found;
+    } catch (e) {
+      onError(`Couldn't rewind: ${errMsg(e)}`);
+      return;
+    }
+    // The server couldn't locate the message in the live checkpoint — leave the
+    // client thread intact rather than diverge (the agent would still "remember"
+    // turns the UI had dropped).
+    if (!found) {
+      onError("Couldn't rewind — that message is no longer in the agent's live context.");
+      return;
+    }
+    // Keep the prefix through the selected message; drop everything after it.
+    const snap = chatStore.getSnapshot().sessions.find((s) => s.id === session.id);
+    const base = snap?.messages ?? session.messages;
+    const at = base.findIndex((m) => m.id === message.id);
+    chatStore.updateMessages(session.id, base.slice(0, (at < 0 ? i : at) + 1));
+  }
+
   // Resume a paused (input-required) turn: submitting the HITL form/question
   // sends the response as a follow-up on the same session — the server feeds it
   // to the agent via Command(resume=…). A form response is serialized to JSON.
@@ -835,14 +990,17 @@ function ChatSessionSlot({
     // the tool card itself (running → done on approve, error on deny), so the bubble is
     // just noise. A form/question answer IS meaningful content, so those stay visible.
     const silent = hitl?.kind === "approval";
-    setHitl(null);
+    updateHitl(null);
     // For an approval resume, CONTINUE the original assistant message (the one that paused) so the
     // pre- and post-approval tool cards live in ONE bubble / one WorkBlock — otherwise they split
     // across two message bubbles with a gap between them. Forms/questions keep the new-bubble path
     // (their answer is meaningful conversation).
+    // `hitlResume` marks this as THE answer to the pending interrupt (#1560): the server
+    // resumes the parked graph with it, while any other message sent meanwhile is held
+    // and folds in right after.
     void runTurn(
       typeof response === "string" ? response : JSON.stringify(response),
-      silent ? { hidden: true, resumeMessageId: lastAssistantId } : {},
+      silent ? { hidden: true, resumeMessageId: lastAssistantId, hitlResume: true } : { hitlResume: true },
     );
   }
 
@@ -854,11 +1012,11 @@ function ChatSessionSlot({
   // the paused assistant message (matching the approval-resume path) rather than minting a
   // new bubble.
   async function dismissHitl() {
-    setHitl(null);
+    updateHitl(null);
     void runTurn(
       "[dismissed] The operator dismissed this request without providing input. Continue " +
         "without it — proceed using your best judgment, or stop and explain what you need.",
-      { hidden: true, resumeMessageId: lastAssistantId },
+      { hidden: true, resumeMessageId: lastAssistantId, hitlResume: true },
     );
   }
 
@@ -869,6 +1027,8 @@ function ChatSessionSlot({
       sendAs?: string;
       images?: { b64: string; mime: string; name: string }[];
       resumeMessageId?: string;
+      // This message answers the pending HITL interrupt (#1560) — see resumeHitl.
+      hitlResume?: boolean;
     } = {},
   ) {
     if (!session || !content) return;
@@ -955,7 +1115,7 @@ function ChatSessionSlot({
           }
         },
         onInputRequired: (payload) => {
-          setHitl(payload);
+          updateHitl(payload);
           // Alert natively if the window is hidden/unfocused (menu-bar-only
           // desktop, or a backgrounded tab) so the form isn't missed.
           notifyIfHidden(
@@ -1131,6 +1291,12 @@ function ChatSessionSlot({
         // Read live (not the render-closure session) so an "Approve & don't ask again" that
         // flips bypass on right before this resume turn is carried by it.
         bypassPermissions: chatStore.getSnapshot().sessions.find((s) => s.id === session.id)?.bypassPermissions,
+        // Incognito (ADR 0069 D3b) — per-MESSAGE server-side, so read live and stamp
+        // EVERY send while the tab's toggle is on (a mixed thread would leak earlier
+        // incognito content into a later non-incognito turn's summary).
+        incognito: chatStore.getSnapshot().sessions.find((s) => s.id === session.id)?.incognito,
+        // Marks this message as the answer to the pending HITL interrupt (#1560).
+        hitlResume: opts.hitlResume,
       });
       chatStore.setSessionStatus(session.id, "idle");
       setStatusMessage("idle");
@@ -1162,18 +1328,33 @@ function ChatSessionSlot({
   }
 
   async function stop() {
-    if (taskId) {
-      try {
-        await api.cancelTask(taskId);
-      } catch {
-        // The local abort below still releases the UI even if the task already finished.
-      }
-    }
+    // Release any locally-owned stream first — the server cancel is an RPC and
+    // must never gate the UI stopping (#1617: Stop appeared dead while a long
+    // reasoning chain streamed).
     abortRef.current?.abort();
+    // The task to cancel: this slot's live turn, or — when the slot re-attached
+    // to a turn it didn't start (reload / remount / the desktop relay, all of
+    // which leave taskId state empty and abortRef null) — the streaming
+    // message's durable taskId. Resolve BEFORE settling bubbles below, which
+    // erases the `streaming` marker the fallback keys off. On desktop the relay
+    // ignores the abort signal entirely, so this server-side cancel is the only
+    // thing that actually halts the turn there.
+    const before = chatStore.getSnapshot().sessions.find((s) => s.id === sessionId);
+    const cancelId = resolveStopTarget(before?.messages || [], taskId);
+    // Settle the thread immediately: no bubble may stay `streaming` after Stop.
+    // The send-loop only finalizes turns it owns; a re-attached turn has none.
+    if (before) chatStore.updateMessages(sessionId, finalizeStoppedMessages(before.messages));
     chatStore.setSessionStatus(sessionId, "idle");
     setStatusMessage("stopped");
     // Drop any optimistic queued-steer bubbles; the user chose to stop.
     setSteerQueue([]);
+    if (cancelId) {
+      try {
+        await api.cancelTask(cancelId);
+      } catch {
+        // Best-effort — the UI is already released; the task may have finished.
+      }
+    }
   }
 
   if (!session) return null;
@@ -1193,6 +1374,7 @@ function ChatSessionSlot({
                 copiedId,
                 onCopy: copyMessage,
                 onFork: forkAtMessage,
+                onRewind: rewindAtMessage,
                 onRegenerate: regenerate,
                 lastAssistantId,
                 regenDisabled: status === "streaming",
@@ -1261,6 +1443,7 @@ function ChatSessionSlot({
             setDraft(v);
             setSlashDismissed(false); // re-open the menu when the input changes
             histIndexRef.current = null; // typing detaches from history nav (readline)
+            refreshSlash(); // re-parse the "/name" token at the (post-input) caret (#1530)
           }}
           // Idle → send. While a turn streams (`busy`), the field stays live: Enter
           // queues a steer into the running turn (onQueue) without stopping it, and
@@ -1322,6 +1505,18 @@ function ChatSessionSlot({
                 </Button>
               ))}
               <ComposerModelSelect />
+              {session?.incognito ? (
+                <button
+                  type="button"
+                  className="composer-incognito-toggle"
+                  title="Incognito is ON for this tab — turns leave no memory (no session summary, no harvest) and inject none. Click to turn it off."
+                  onClick={() => chatStore.setSessionIncognito(session.id, false)}
+                >
+                  <Badge status="neutral">
+                    <EyeOff size={12} /> incognito
+                  </Badge>
+                </button>
+              ) : null}
               {session?.bypassPermissions ? (
                 <button
                   type="button"
@@ -1351,6 +1546,7 @@ function ChatSessionSlot({
                 <button
                   type="button"
                   key={cmd.name}
+                  ref={index === slashSel ? activeSlashRef : undefined}
                   role="option"
                   aria-selected={index === slashSel}
                   className={`slash-item${index === slashSel ? " active" : ""}`}
@@ -1381,6 +1577,22 @@ function ChatSessionSlot({
           }}
         />
       </div>
+
+      <ConfirmDialog
+        open={pendingRewind !== null}
+        title="Rewind to here?"
+        confirmLabel="Rewind"
+        destructive
+        onConfirm={() => {
+          if (pendingRewind) void confirmRewind(pendingRewind);
+          setPendingRewind(null);
+        }}
+        onClose={() => setPendingRewind(null)}
+      >
+        <p style={{ margin: 0 }}>
+          This will discard everything below this message — cannot be undone.
+        </p>
+      </ConfirmDialog>
     </div>
   );
 }

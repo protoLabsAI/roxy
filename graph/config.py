@@ -424,6 +424,28 @@ class LangGraphConfig:
     # How many recalled chunks are injected per turn. Bumped 5 → 10 (RAG bake-off:
     # more candidates in-context lifted answer quality at sub-million-chunk scale).
     knowledge_top_k: int = 10
+    # Namespace scope for the AUTO-INJECT RAG search (ADR 0069 D3a). Empty (the
+    # default) = unfiltered — today's behavior, so box-commons sharing keeps
+    # working. When set, only chunks whose `namespace` matches a listed value
+    # are auto-injected; include "" to also match un-namespaced chunks. Gates
+    # only what enters the prompt unasked — memory_recall stays unscoped.
+    knowledge_inject_namespaces: list[str] = field(default_factory=list)
+    # Trust floor for the AUTO-INJECT RAG hits (ADR 0069 D8). Rows rank into
+    # deterministic trust tiers by source_type (knowledge/trust.py): 3 =
+    # operator-authored, 2 = agent-derived (extracted facts, harvest,
+    # memory_ingest), 1 = ingested/external (web, YouTube, PDF, media) and
+    # unknown. 1 (default) excludes nothing — low tiers are only down-weighted
+    # (ranked below higher tiers); 2 drops external/ingested content from
+    # auto-injection; 3 auto-injects operator-authored rows only. memory_recall
+    # is never gated — excluded content stays reachable on demand.
+    knowledge_inject_min_trust: int = 1
+    # Hot-memory write confirm gate (ADR 0069 D8). When True, the agent's own
+    # write path (memory_ingest) refuses domain="hot" writes with an error
+    # telling it to ask the operator — only operator surfaces (console
+    # knowledge/memory routes) put facts in front of the model every turn.
+    # Default False: single-operator boxes keep the frictionless flow; every
+    # hot write emits a `memory.hot_written` bus event either way.
+    knowledge_hot_write_confirm: bool = False
     # Hybrid-retrieval tuning (HybridKnowledgeStore knobs, ADR 0021) — surfaced so
     # they're tunable without editing the store / via the retrieval eval:
     #   vector_k  — FTS5 + vector candidates fused per query (the RRF pool).
@@ -490,6 +512,11 @@ class LangGraphConfig:
     # Background subagent threads (a2a:background:*) get a tighter cap — we only
     # resume-from-latest, never time-travel, so retaining more than 1 is waste.
     checkpoint_background_keep: int = 1
+    # Push-resume (ADR 0070 D1): when a background job finishes, self-submit a nudge
+    # turn into the session that spawned it, so its <task-notification> drains
+    # immediately and the agent briefs the operator — instead of the report waiting
+    # for that session's next manual turn. False restores pull-only delivery.
+    background_auto_resume: bool = True
     checkpoint_max_age_days: int = 30
     checkpoint_prune_interval_hours: int = 6
     # When a session is retired (aged out or deleted), summarize it into the
@@ -570,6 +597,11 @@ class LangGraphConfig:
     # LangGraph loop (default). "acp:<agent>" (e.g. "acp:codex", "acp:claude") = an
     # external coding agent drives the turn over ACP, mounting the operator MCP bus.
     agent_runtime: str = "native"
+    # Developer channel (ADR 0068) — which pre-release feature tier this instance exposes:
+    # "prod" (released only) | "beta" (opt-in previews) | "dev" (everything, incl. in-progress).
+    # The dev sandbox instance defaults to "dev"; env fallback PROTOAGENT_CHANNEL. Read by
+    # ``runtime.flags`` to resolve developer flags.
+    developer_channel: str = "prod"
     # ACP launch overrides (ADR 0033) — per-agent ``{command, args}`` from the YAML
     # ``acp.agents`` block, e.g. ``acp: {agents: {claude: {command: claude-agent-acp}}}``.
     # ``runtime.acp_runtime.adapter_for`` reads this to override the built-in default
@@ -892,6 +924,7 @@ class LangGraphConfig:
             checkpoint_background_keep=data.get("checkpoint", {}).get(
                 "background_keep", cls.checkpoint_background_keep
             ),
+            background_auto_resume=data.get("background", {}).get("auto_resume", cls.background_auto_resume),
             checkpoint_max_age_days=data.get("checkpoint", {}).get("max_age_days", cls.checkpoint_max_age_days),
             checkpoint_prune_interval_hours=data.get("checkpoint", {}).get(
                 "prune_interval_hours", cls.checkpoint_prune_interval_hours
@@ -907,6 +940,9 @@ class LangGraphConfig:
             image_describe_model=knowledge.get("image_describe_model", cls.image_describe_model),
             knowledge_embeddings=knowledge.get("embeddings", cls.knowledge_embeddings),
             knowledge_top_k=knowledge.get("top_k", cls.knowledge_top_k),
+            knowledge_inject_namespaces=list(knowledge.get("inject_namespaces", []) or []),
+            knowledge_inject_min_trust=knowledge.get("inject_min_trust", cls.knowledge_inject_min_trust),
+            knowledge_hot_write_confirm=knowledge.get("hot_write_confirm", cls.knowledge_hot_write_confirm),
             knowledge_vector_k=knowledge.get("vector_k", cls.knowledge_vector_k),
             knowledge_rrf_k=knowledge.get("rrf_k", cls.knowledge_rrf_k),
             knowledge_min_score=knowledge.get("min_score", cls.knowledge_min_score),
@@ -938,6 +974,7 @@ class LangGraphConfig:
             operator_mcp_enabled=operator_mcp.get("enabled", cls.operator_mcp_enabled),
             operator_mcp_tools=list(operator_mcp.get("tools", []) or []),
             agent_runtime=str(data.get("agent_runtime", cls.agent_runtime) or "native"),
+            developer_channel=str((data.get("developer", {}) or {}).get("channel", cls.developer_channel) or "prod"),
             acp_agents=dict(acp.get("agents", {}) or {}),
             plugins_enabled=list(plugins.get("enabled", []) or []),
             plugins_disabled=list(plugins.get("disabled", []) or []),

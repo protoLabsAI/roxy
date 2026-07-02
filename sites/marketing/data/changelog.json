@@ -1,5 +1,95 @@
 [
   {
+    "version": "v0.81.0",
+    "date": "2026-07-02",
+    "changes": [
+      "seccomp-profile.json moved to deploy/.",
+      "The in-app update notes now match the Discord release announcement"
+    ]
+  },
+  {
+    "version": "v0.80.0",
+    "date": "2026-07-02",
+    "changes": [
+      "Remote fleet members are fully manageable from the console",
+      "A down or mis-tokened fleet agent gives you a way out instead of a boot hang.",
+      "Background results are pushed, indexed, and worker-disposable",
+      "The Work surface is card-first — no tabs",
+      "The background report card is a real card",
+      "/compact is now behind the chat.compact developer flag",
+      "tools.disabled now actually removes any tool — including run_command — and the filesystem knobs are per-agent Settings toggles.",
+      "Fleet: the hub no longer lends a remote member's token over an unauthenticated WebSocket, and live events now work through a token-gated hub."
+    ]
+  },
+  {
+    "version": "v0.79.0",
+    "date": "2026-07-01",
+    "changes": [
+      "Memory-regression evals",
+      "Memory inspector console surface",
+      "Incognito thread toggle in the console",
+      "Trust-tiered injection",
+      "Hot-memory write visibility",
+      "Supersede-don't-delete staleness",
+      "Namespace-scoped auto-injection",
+      "Incognito threads",
+      "Per-turn memory-injection record",
+      "Memory-inspector REST surface",
+      "recall_session(session_id) starter tool",
+      "Knowledge Base view — collapsible source grouping + Shift+click quick-delete.",
+      "One-command install",
+      "Agent archetypes are a data-driven registry",
+      "CI workflows are fork-friendly",
+      "Fleet \"New agent\" now applies the archetype's persona",
+      "Cross-session memory injection is now an attributed digest inside an untrusted-reference envelope",
+      "Memory rows carry provenance.",
+      "The docs build now gates every PR.",
+      "Settings string_list fields can now carry an empty-string entry",
+      "Chat code blocks: no empty header gap, a distinct lighter well, and no panel-stretch.",
+      "Chat session-identity hygiene",
+      "Artifact plugin (0.15.0) — pointer lock now works in games/canvas/3D artifacts.",
+      "Artifact plugin (0.15.0) — SVG / Mermaid now render crisply instead of pixelating on zoom.",
+      "Artifact plugin (0.15.0) — the selected artifact + version now survive a tab switch.",
+      "A stale untracked plugin copy no longer shadows a newer bundled one.",
+      "Plugin install git clone --no-hardlinks",
+      "Console dev server no longer defaults to the prod backend.",
+      "Removed the broken built-in \"Project Manager\" archetype.",
+      "Instance collision warning no longer false-alarms on a shared box root",
+      "Setup wizard: the archetype bundle-install result is no longer swallowed.",
+      "Setup wizard: picking a persona-less archetype no longer blanks the editor."
+    ]
+  },
+  {
+    "version": "v0.78.0",
+    "date": "2026-07-01",
+    "changes": [
+      "Developer panel — view & toggle developer flags",
+      "Developer flags — backend foundation",
+      "Chat composer: terminal-style input history",
+      "Artifact panel: pan & zoom for diagrams",
+      "registerKeybinding on the fork extension seam",
+      "Watch primitive — supervise many external conditions at once",
+      "sdk.run_in_session(session_id, prompt)",
+      "Two-credential auth: auth.federation_token",
+      "Console set-goal form",
+      "Chat: slash commands trigger mid-input + render as command bubbles",
+      "Agent switcher: always available, with a Fleet-settings shortcut",
+      "Chat: Cmd/Ctrl+O toggles the latest tool-call block",
+      "Chat: /compact — summarize + archive a long thread",
+      "Knowledge panel: Upload / Add now open in a dialog",
+      "Goal mode is now drive-only; the monitor disposition is retired",
+      "Goal continuation protocol → tools",
+      "The A2A-streaming and non-streaming goal drive loops are unified (#1497), fixing a fresh-context thread-id drift.",
+      "Settings sub-panels share one container",
+      "wait tool output is conversational",
+      "Desktop app builds are on-demand",
+      "RCE-via-chat closed",
+      "Watch evaluation is serialized per watch id",
+      "New ADR 0066 (federation token + operator channel) and ADR 0067 (watch primitive); ADR 0030 marked superseded",
+      "PROTO.md § Run it"
+    ]
+  },
+  {
     "version": "v0.77.0",
     "date": "2026-07-01",
     "changes": [
