@@ -15,6 +15,7 @@ import type {
   DiscoveredAgent,
   FleetAgent,
   FleetStatus,
+  FlagsPayload,
   GoalState,
   HitlPayload,
   InboxItem,
@@ -24,6 +25,8 @@ import type {
   PluginInstallSummary,
   PluginUpdate,
   KnowledgeChunk,
+  MemoryInjectionRow,
+  MemorySessionDigest,
   RuntimeStatus,
   ScheduledJob,
   SetupStatus,
@@ -312,10 +315,36 @@ export function isColdStart(error: unknown): boolean {
   return true; // no HTTP response at all ⇒ not reachable yet (desktop sidecar booting)
 }
 
+/** The fleet proxy's "agent isn't running/registered" signal (ADR 0042): a 409 from a
+ *  slug-routed call. Distinct from `isColdStart` (which also rides 502/no-response) — this
+ *  is specifically "the focused fleet agent is down", used to offer a return-to-host recovery
+ *  once it persists past a normal spawn window instead of the generic "isn't responding" gate. */
+export function isAgentNotRunning(error: unknown): boolean {
+  return error instanceof ApiError && error.status === 409;
+}
+
 /** True for a 401 from request() — retrying can't help until the operator supplies
  *  a token (#873); the AuthGate owns recovery. */
 export function is401(error: unknown): boolean {
   return error instanceof ApiError && error.status === 401;
+}
+
+/** The fleet proxy's "can't reach the member" signal (ADR 0042 §I): a 502 from a
+ *  slug-routed call. A REMOTE member never 409s (it isn't a local process the hub can find
+ *  "not running") — it 502s when its box is offline or its URL is wrong. Distinct from
+ *  `isAgentNotRunning` (409) so the boot gate can offer the same return-to-host recovery for a
+ *  dead remote that it does for a down local peer. */
+export function isAgentUnreachable(error: unknown): boolean {
+  return error instanceof ApiError && error.status === 502;
+}
+
+/** A request is MEMBER-scoped when it's slug-routed to the focused agent (not the hub). A 401
+ *  from one is that member's credential problem — a wrong/missing stored token for a REMOTE —
+ *  NOT the hub's, so it must not trip the global AuthGate (which prompts for, and would
+ *  overwrite, the HUB token). `host:true` and the host window are always hub-scoped. Exported
+ *  for unit testing (it gates whether a 401 reaches `notifyAuthRequired`). */
+export function isMemberScoped(path: string, host?: boolean): boolean {
+  return !host && currentSlug() !== "host" && isAgentPath(path);
 }
 
 async function request<T>(path: string, options: RequestOptions = {}): Promise<T> {
@@ -346,7 +375,9 @@ async function request<T>(path: string, options: RequestOptions = {}): Promise<T
     }
     // Wrong/expired/missing bearer on a token-gated deployment — surface the
     // token prompt (#873) instead of leaving per-panel 401 cards as the only signal.
-    if (response.status === 401) notifyAuthRequired();
+    // But a MEMBER-scoped 401 is the focused remote's bad token, not the hub's — don't
+    // hijack the hub AuthGate; the boot gate / fleet panel own that recovery.
+    if (response.status === 401 && !isMemberScoped(path, host)) notifyAuthRequired();
     throw new ApiError(response.status, detail || "request failed");
   }
 
@@ -374,7 +405,7 @@ async function requestForm<T>(path: string, form: FormData, opts: { host?: boole
     } catch {
       detail = raw || detail;
     }
-    if (response.status === 401) notifyAuthRequired();
+    if (response.status === 401 && !isMemberScoped(path, opts.host)) notifyAuthRequired();
     throw new ApiError(response.status, detail || "request failed");
   }
   return (await response.json()) as T;
@@ -631,10 +662,16 @@ export const api = {
   // Short-lived HMAC token for the SSE EventSource, which can't send an
   // Authorization header. Bearer-gated; in open mode the server returns "" and
   // accepts a tokenless /api/events. events.ts fetches this before each
-  // (re)connect. Same slug routing as /api/events so the token is signed by
-  // whichever server actually terminates the stream (host or a proxied member).
+  // (re)connect.
+  //
+  // Signed by the HUB (host:true), NOT slug-routed. The proxied `/api/events`
+  // is validated at the HUB's auth middleware FIRST (before it forwards to the
+  // member), so the token must carry the hub's signature or the stream 401s at
+  // the hub for every non-host member on a bearer-gated hub. The hub then
+  // forwards with the member's own credential attached, so the member accepts it
+  // downstream (its SSE branch falls through to the bearer check).
   sseToken() {
-    return request<{ token: string }>("/api/sse-token");
+    return request<{ token: string }>("/api/sse-token", { host: true });
   },
 
   // Gracefully restart the server process (POST /api/restart) — the server drains and
@@ -657,6 +694,13 @@ export const api = {
   // `background.{started,completed}` bus events.
   background() {
     return request<{ enabled: boolean; jobs: BackgroundJobDTO[] }>("/api/background");
+  },
+
+  // One background job's full row by id (ADR 0070 D4). This is the ONLY place the
+  // FULL result text is fetchable — the `background.completed` bus event and the
+  // drained <task-notification> both carry truncated previews.
+  backgroundJob(jobId: string) {
+    return request<BackgroundJobDTO>(`/api/background/${encodeURIComponent(jobId)}`);
   },
 
   // Stop a running background job (ADR 0051) — cancels its detached A2A turn.
@@ -760,6 +804,45 @@ export const api = {
       source_type: string;
       chars: number;
     }>("/api/knowledge/ingest", form);
+  },
+
+  // --- Memory inspector (ADR 0069 D7) — the delivery-layer audit surface -----
+  // Session summaries: the files behind the <prior_sessions> digest.
+  memorySessions() {
+    return request<{ sessions: MemorySessionDigest[] }>("/api/memory/sessions");
+  },
+  memorySession(sessionId: string) {
+    return request<{ session: MemorySessionDigest }>(
+      `/api/memory/sessions/${encodeURIComponent(sessionId)}`,
+    );
+  },
+  deleteMemorySession(sessionId: string) {
+    return request<{ deleted: boolean; session_id: string }>(
+      `/api/memory/sessions/${encodeURIComponent(sessionId)}`,
+      { method: "DELETE" },
+    );
+  },
+  // Hot memory: the domain="hot" chunks injected every turn.
+  memoryHot() {
+    return request<{ enabled: boolean; chunks: KnowledgeChunk[] }>("/api/memory/hot");
+  },
+  updateMemoryHot(chunkId: number, body: { content: string; heading?: string }) {
+    return request<{ enabled: boolean; id: number | null; replaced: boolean }>(
+      `/api/memory/hot/${chunkId}`,
+      { method: "PUT", body },
+    );
+  },
+  deleteMemoryHot(chunkId: number) {
+    return request<{ enabled: boolean; deleted: boolean }>(`/api/memory/hot/${chunkId}`, {
+      method: "DELETE",
+    });
+  },
+  // Injection record (ADR 0069 D6): which memory entered which turn.
+  memoryInjections(sessionId = "", limit = 50) {
+    const q = new URLSearchParams();
+    if (sessionId) q.set("session_id", sessionId);
+    q.set("limit", String(limit));
+    return request<{ injections: MemoryInjectionRow[] }>(`/api/memory/injections?${q}`);
   },
 
   // Chat attachment — extract + TIER a dropped file (FormData: `file` + `session_id`).
@@ -910,7 +993,9 @@ export const api = {
   },
 
   tools() {
-    return request<{ tools: ToolInfo[]; count: number }>("/api/tools");
+    // `count` = wired (enabled) tools; `disabled` = the RAW tools.disabled denylist —
+    // the base a row toggle edits, so stale names (no live tool) survive a save.
+    return request<{ tools: ToolInfo[]; count: number; disabled: string[] }>("/api/tools");
   },
 
   runSubagent(body: {
@@ -1070,13 +1155,23 @@ export const api = {
   fleet() {
     return request<FleetStatus>("/api/fleet");
   },
+  flags() {
+    return request<FlagsPayload>("/api/flags");
+  },
   discoverAgents() {
     return request<{ discovered: DiscoveredAgent[] }>("/api/fleet/discover");
   },
   archetypes() {
     return request<{ archetypes: Archetype[] }>("/api/archetypes");
   },
-  createAgent(body: { name: string; bundle?: string | null; port?: number; start?: boolean; shared_skills?: boolean }) {
+  createAgent(body: {
+    name: string;
+    bundle?: string | null;
+    soul?: string;
+    port?: number;
+    start?: boolean;
+    shared_skills?: boolean;
+  }) {
     return request<{ ok: boolean; agent: FleetAgent; installed: string[] }>("/api/fleet", {
       method: "POST",
       body,
@@ -1094,11 +1189,23 @@ export const api = {
   },
   addRemoteAgent(body: { name: string; url: string; token?: string }) {
     // Register a remote protoAgent as a SWITCHABLE fleet member (ADR 0042 §I) —
-    // it gets a slug window; the hub reverse-proxies its console + A2A.
-    return request<{ ok: boolean; agent: FleetAgent }>("/api/fleet/remotes", {
+    // it gets a slug window; the hub reverse-proxies its console + A2A. The server
+    // probes it at register time and returns `reachable`/`version` so the caller can
+    // warn up front (registration is NOT rejected for an unreachable peer — deferred
+    // registration is intentional; a peer can come online later).
+    return request<{ ok: boolean; agent: FleetAgent; reachable?: boolean; version?: string }>("/api/fleet/remotes", {
       method: "POST",
       body,
     });
+  },
+  updateRemoteAgent(ident: string, body: { name?: string; url?: string; token?: string }) {
+    // Edit a remote member in place (ADR 0042 §I) — omitted fields keep their value;
+    // token:"" clears the stored bearer. The id/slug is unchanged, so open windows survive.
+    // The server re-probes and returns fresh {reachable, version}.
+    return request<{ ok: boolean; agent: FleetAgent; reachable?: boolean; version?: string }>(
+      `/api/fleet/remotes/${encodeURIComponent(ident)}`,
+      { method: "PATCH", body },
+    );
   },
   removeRemoteAgent(ident: string) {
     return request<{ ok: boolean; id: string; name: string }>(`/api/fleet/remotes/${encodeURIComponent(ident)}`, {
@@ -1158,6 +1265,45 @@ export const api = {
     );
   },
 
+  // Compact a chat session server-side (#1527): archive the raw history into
+  // searchable memory, summarize it, and rewrite the LangGraph checkpoint to
+  // [summary, recent tail] so the agent keeps context at lower token cost. The
+  // checkpoint is the agent's REAL context, so this must be server-side — a
+  // client-only trim would leave the agent's context untouched. `refused` (never
+  // lossy: nothing could be archived) means the server left the thread intact.
+  compactChatSession(sessionId: string) {
+    return request<{
+      summary: string;
+      archived_chunks: number;
+      kept: number;
+      removed: number;
+      archived: boolean;
+      refused: boolean;
+      reason: string;
+      message: string;
+    }>(`/api/chat/sessions/${encodeURIComponent(sessionId)}/compact`, { method: "POST", body: {} });
+  },
+
+  // Rewind a chat session server-side (#1535): discard every message AFTER the
+  // target and rewrite the LangGraph checkpoint in place, rolling the agent's live
+  // context back to that point. The checkpoint is the agent's REAL context, so this
+  // must be server-side — a client-only truncate would leave the agent's memory
+  // intact. Intentionally DESTRUCTIVE (no archive) but never corrupting. `content`
+  // is the visible bubble's text: the console's client-side message ids never appear
+  // in the checkpoint, so the server locates the message by its rendered content.
+  rewindChatSession(sessionId: string, messageId: string, content?: string, occurrence?: number) {
+    return request<{
+      found: boolean;
+      kept: number;
+      removed: number;
+      reason: string;
+      message: string;
+    }>(`/api/chat/sessions/${encodeURIComponent(sessionId)}/rewind`, {
+      method: "POST",
+      body: { message_id: messageId, content, occurrence },
+    });
+  },
+
   async streamChat(
     message: string,
     sessionId: string,
@@ -1186,6 +1332,15 @@ export const api = {
       model?: string;
       reasoningEffort?: string;
       bypassPermissions?: boolean;
+      // Incognito thread (ADR 0069 D3b): the flag is PER MESSAGE server-side, so the
+      // console stamps it on EVERY send while the thread's toggle is on — a mixed
+      // thread would leak earlier incognito content into a later turn's summary.
+      incognito?: boolean;
+      // This message ANSWERS a pending HITL form/question/approval (#1560): the server
+      // resumes the parked interrupt with it (Command(resume=…)) instead of running a
+      // fresh turn. Unmarked messages sent while a form is pending are held server-side
+      // until the form resolves.
+      hitlResume?: boolean;
     } = {},
   ) {
     // One A2A SendStreamingMessage body + one frame dispatcher, shared by the desktop
@@ -1205,13 +1360,16 @@ export const api = {
           messageId: rpcId,
           contextId: sessionId,
           // Per-turn overrides ride the A2A message metadata (server/chat.py reads them):
-          // the tab's chosen model + the /effort reasoning level.
-          ...((opts.model || opts.reasoningEffort || opts.bypassPermissions)
+          // the tab's chosen model + the /effort reasoning level + incognito (ADR 0069 D3b —
+          // per-message server-side, stamped on every send while the thread toggle is on).
+          ...((opts.model || opts.reasoningEffort || opts.bypassPermissions || opts.incognito || opts.hitlResume)
             ? {
                 metadata: {
                   ...(opts.model ? { model: opts.model } : {}),
                   ...(opts.reasoningEffort ? { reasoning_effort: opts.reasoningEffort } : {}),
                   ...(opts.bypassPermissions ? { bypass_permissions: true } : {}),
+                  ...(opts.incognito ? { incognito: true } : {}),
+                  ...(opts.hitlResume ? { hitl_resume: true } : {}),
                 },
               }
             : {}),
@@ -1298,7 +1456,17 @@ export const api = {
           method: "POST",
           headers: applyAuth(new Headers({ "Content-Type": "application/json" })),
           signal: handlers.signal,
-          body: JSON.stringify({ message, session_id: sessionId, ...(opts.model ? { model: opts.model } : {}) }),
+          body: JSON.stringify({
+            message,
+            session_id: sessionId,
+            ...(opts.model ? { model: opts.model } : {}),
+            // The non-streaming fallback must carry incognito too — dropping it here
+            // would silently persist a thread the operator marked private.
+            ...(opts.incognito ? { incognito: true } : {}),
+            // …and hitl_resume (#1560) — dropping it would make the server HOLD the
+            // operator's own form answer behind the form it answers (deadlock).
+            ...(opts.hitlResume ? { hitl_resume: true } : {}),
+          }),
         });
         if (!res.ok) {
           let detail = `${res.status} ${res.statusText}`;
@@ -1334,7 +1502,9 @@ export const api = {
     });
 
     if (!response.ok) {
-      if (response.status === 401) notifyAuthRequired(); // token-gated chat turn (#873)
+      // token-gated chat turn (#873) — but a member-scoped 401 is the focused remote's bad
+      // token, not the hub's, so don't hijack the hub AuthGate (the boot gate owns that).
+      if (response.status === 401 && !isMemberScoped("/a2a")) notifyAuthRequired();
       throw new Error(`${response.status} ${response.statusText}`);
     }
 
@@ -1630,3 +1800,24 @@ export const api = {
     return request<DelegateProbe>("/api/delegates/test", { method: "POST", body: entry });
   },
 };
+
+/** Full report body for the chat report card → document viewer (ADR 0070 D4).
+ *
+ *  Fetches the job by id (`GET /api/background/{id}` — the only route that carries the
+ *  untruncated result). Falls back to the legacy list-and-filter ONLY on a 404: a
+ *  pre-ADR-0070 server has no by-id route (its router answers 404), and on a current
+ *  server a 404 means the job row was deleted — which the list fallback resolves to the
+ *  same "no longer available" placeholder. Any other failure (401/500/network) is real
+ *  and propagates so the viewer shows its error state instead of a misleading placeholder. */
+export async function loadBackgroundReport(jobId: string): Promise<string> {
+  const gone =
+    "_The full report is no longer available — it may have been cleared from the Background agents panel._";
+  try {
+    return (await api.backgroundJob(jobId)).result || gone;
+  } catch (err) {
+    if (!(err instanceof ApiError) || err.status !== 404) throw err;
+    // Old server (no by-id route) or deleted row — the list answers both.
+    const listed = await api.background().catch(() => null);
+    return listed?.jobs.find((j) => j.id === jobId)?.result || gone;
+  }
+}

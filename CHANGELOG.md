@@ -11,7 +11,430 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.81.0] - 2026-07-02
+
+### Changed
+- **`seccomp-profile.json` moved to `deploy/`.** The Docker hardening profile now
+  lives with the other deployment assets instead of at the repo root;
+  `docker-compose.yml` and `.dockerignore` reference the new path. No behavior
+  change — Docker reads the profile from the host at compose time.
+- **The in-app update notes now match the Discord release announcement** ([#1516]).
+  The desktop updater's "what's new" card renders the same LLM-themed release notes
+  that are posted to Discord — one changelog, one voice — instead of the raw
+  `CHANGELOG.md` section. The release pipeline persists the generated notes as a
+  `release-notes.md` release asset (the *same* generation that posts the Discord
+  embed), and the desktop build's `latest.json` fan-in prefers it, falling back to
+  the curated `CHANGELOG.md` section when the notes step didn't run (e.g. a fork
+  with no gateway key). Takes effect from the next release.
+
+[#1516]: https://github.com/protoLabsAI/protoAgent/issues/1516
+
+## [0.80.0] - 2026-07-02
+
 ### Added
+- **Remote fleet members are fully manageable from the console** (ADR 0042 §I).
+  You can now **add a remote by URL** (name + URL + optional token) — the only way
+  to register a token-gated remote, since network discovery can't carry a
+  credential — and **edit a member in place** (its URL, token, or name; the id and
+  slug survive, so open windows don't break), which is how you fix a rotated or
+  wrong token. Adds surface the server's register-time reachability (an offline
+  peer is added with an honest "not reachable yet" toast, not a silent dead row),
+  and an offline remote now reads **"unreachable"** with a warning dot rather than
+  a neutral "stopped" (a remote's `running` *is* its reachability probe). New
+  `PATCH /api/fleet/remotes/{ident}` + `supervisor.update_remote` back it, re-running
+  the same SSRF-egress / collision checks as add and re-probing on save.
+- **A down or mis-tokened fleet agent gives you a way out instead of a boot hang.**
+  A focused member that can't be reached now shows a targeted boot-gate recovery:
+  a **remote whose box is offline** (a 502, which a remote returns instead of the
+  local peer's 409) offers *Return to host* / *Try again*, and a **remote whose
+  stored token is wrong** (a 401) shows *"can't authenticate — update its token in
+  Settings ▸ Agents"* with *Return to host*. Critically, a proxied member's 401 no
+  longer trips the **hub's** global token prompt (which asked for, and would
+  overwrite, the hub's own token) — a member-scoped 401 is recognized as that
+  member's credential problem.
+- **Background results are pushed, indexed, and worker-disposable**
+  ([ADR 0070](docs/adr/0070-background-results-push-resume.md), backend). When a
+  background job (ADR 0050) reaches a terminal state: **(D1)** the server
+  **push-resumes the origin session** — a terse self-A2A nudge turn (the
+  spawner's self-POST mechanics, factored into a shared
+  `BackgroundManager._send_a2a_message`) whose drain attaches the pending
+  `<task-notification>`, so the agent reviews the report and briefs the operator
+  immediately instead of the report waiting for the session's next manual turn.
+  New config `background.auto_resume` (default on; Settings ▸ Background).
+  Guarded: never for canceled jobs, `background:*` origins (no resume chains),
+  or incognito-spawned jobs; never-raises — a delivery failure falls back to the
+  ADR 0050 Activity idle-wake and the report still drains exactly-once on the
+  next manual turn. When the resume fires, the Activity wake is skipped (one
+  briefing turn, in the right place — never both). A mid-turn origin session is
+  safe: A2A turns serialize per thread. **(D2)** a substantial completed report
+  (> 800 chars) is **indexed into the knowledge store** keyed to the origin
+  session (`source_type: background_report`, trust tier 2 — agent-derived;
+  chunked by `add_document`; never for incognito-spawned or chained
+  background-origin jobs — a worker identity is never memory), and the drain
+  notification shrinks (cap 6 000 →
+  3 000 chars) with a pointer to `memory_recall` + the console report card.
+  **(D3)** worker transcripts are **disposable**: `background:*` sessions skip
+  session-summary persistence, the `<prior_sessions>` digest filters worker
+  files (legacy ones included), and retirement harvest skips worker threads —
+  the jobs DB is the system of record. The `task`/`task_batch` tools propagate
+  the turn's **incognito** flag onto the job row (new `origin_incognito`
+  column, migrated in place). New `GET /api/background/{job_id}` returns one
+  job's full row (strict `bg-<12 hex>` id validation) for the console report
+  card.
+
+### Changed
+- **The Work surface is card-first — no tabs** (console). The right-rail Work
+  hub drops its Overview/Goals/Watches/Tasks/Schedule tab strip: the landing is
+  always the **Overview**, now four live cards (Goals · **Watches**, previously
+  missing from the roll-up · Tasks · Schedule) in a responsive grid. Each card
+  IS the navigation — whole-card click-through (keyboard-accessible,
+  selection-guarded, raised-card hover like the chat report card) into the
+  unchanged panel under a slim **"← Overview"** back bar (Escape backs out too,
+  when no dialog is open). Cards carry an icon + count Badge header, a muted
+  one-line **pulse** ("2 driving · iteration 3/6", "1 watching · 1 met today",
+  "0 ready · 1 in progress", "next in 25m"), a StatusDot micro-list, and a
+  corner **"+" quick-add** that opens the same creator the panel uses — the
+  Goals inline `<details>` form became a shared `GoalCreateDialog` (one form,
+  two hosts: the panel's new "New goal" header action and the overview
+  quick-add; identical `/api/goals` payload), and `TaskCreateDialog` /
+  `ScheduleModal` are reused directly. Watches has **no** quick-add (watches
+  are agent-created; its empty state says so). Liveness: one surface-level SSE
+  subscription set (`goal.*`, `watch.*`, `task.changed`, `scheduler.fired`)
+  keeps every card fresh whichever view is open, plus a gentle 60s
+  schedule poll while the overview is mounted (the scheduler bus has no push
+  for agent-side add/cancel).
+- **The background report card is a real card**
+  ([ADR 0070](docs/adr/0070-background-results-push-resume.md) D4, console).
+  A finished background job's report no longer renders as the DS system-message
+  pill (near-black inset fill, 100px radius, a quiet ghost "Read full report"
+  link): it's now a raised card — `--pl-color-bg-raised` surface, 1px border,
+  real corners, drop shadow — with a header row (report title + "Background
+  report"), an excerpt **clamped to ~7 lines with a bottom fade-out mask** (a
+  teaser, not the content — the fade applies only when the text actually
+  overflows, so a short report's final line stays fully readable), and a clear
+  **"Open report"** CTA into the document
+  viewer; the whole card is click-to-open (selection-guarded). The viewer now
+  fetches the full report **by id** via the new `GET /api/background/{id}`
+  (`api.backgroundJob`), replacing the list-and-filter hack — kept only as a
+  fallback when the by-id route 404s (pre-0070 servers / deleted rows). Card
+  styling uses stacked specificity (`.pl-message--system.chat-report …`) so the
+  DS default can't win by stylesheet load order.
+- **`/compact` is now behind the `chat.compact` developer flag** (ADR 0068,
+  first real flag in the registry). The command shipped in #1558 but is still
+  pre-release: on the prod channel it no longer appears in the slash menu and
+  `POST /api/chat/sessions/{id}/compact` refuses with 403; the dev channel (and
+  `PROTOAGENT_FLAG_CHAT_COMPACT=1`, `?flag:chat.compact=on`, or the Settings ▸
+  Developer toggle) keeps it on. The client slash-command seam (ADR 0061) gains
+  an optional `flag:` tag — the host lists and dispatches a tagged command only
+  while its flag resolves ON, so forks can flag-gate their own commands the
+  same way.
+
+### Security
+- **`tools.disabled` now actually removes any tool — including `run_command` — and
+  the filesystem knobs are per-agent Settings toggles.** The operator denylist used
+  to be applied only inside `get_all_tools()`, while the filesystem tools (incl. the
+  dual-use `run_command`), plugin/MCP extras, delegation and late-seam tools were
+  appended after it — so `tools.disabled: [run_command]` silently did nothing. The
+  filter now runs over the **fully assembled** toolset in `create_agent_graph` (and
+  the out-of-graph manual-subagent runner), before the deferred `search_tools`
+  index is built, and the graph build syncs the denylist from its own config (eval
+  sweeps / scripts no longer inherit a stale process global). New **Settings ▸
+  Capabilities ▸ Filesystem** exposes `filesystem.enabled` / `allow_run` (the
+  per-agent `run_command` kill switch — the tool is never built when off) /
+  `run_requires_approval` / `bypass_allowed`, and **Settings ▸ Capabilities ▸
+  Tools** exposes the `tools.disabled` list; all hot-reload on save. `filesystem.
+  projects` now round-trips through `config_to_dict` like the other registries.
+
+- **Fleet: the hub no longer lends a remote member's token over an unauthenticated
+  WebSocket, and live events now work through a token-gated hub.** Two proxy-auth
+  gaps in remote fleet members (ADR 0042 §I), both only reachable on a non-loopback
+  (tailnet/LAN) hub — a loopback desktop hub was never exposed:
+  - The hub's default-deny auth is an HTTP middleware (Starlette `BaseHTTPMiddleware`
+    skips non-HTTP scopes), so the `/agents/<slug>/*` **WebSocket** proxy route ran
+    with no hub auth. For a *remote* member the hub would attach that member's stored
+    bearer and proxy any caller into its authenticated sockets (e.g. a terminal
+    plugin's PTY). WebSocket proxying to a **remote** member is now refused (close
+    1008); host/local-peer sockets — which carry no hub-stored credential — are
+    unaffected. Live plugin views into a remote member should use `delegate_to` / a
+    direct connection.
+  - The SSE token for `/api/events` was fetched slug-routed (signed by the *member*),
+    but the proxied stream is validated at the **hub's** middleware first — so on a
+    bearer-gated hub, live events 401'd for every non-host member. The console now
+    fetches a **hub-signed** SSE token; the hub validates it, then forwards with the
+    member's own credential so the member accepts it downstream.
+
+## [0.79.0] - 2026-07-01
+
+### Added
+- **Memory-regression evals** (`memory-regression` category,
+  [ADR 0069](docs/adr/0069-memory-delivery-layer.md) D10) — three ADR 0012
+  harness probes for the memory delivery layer: a **knowledge-update** case
+  (seed a fact, seed its supersede, assert the newer value wins and the stale
+  one is not restated), an **abstention** case (ask about an adjacent-but-absent
+  fact, rubric-judge that it declines rather than fabricates), and an OWASP
+  ASI06 **poisoning replay** (ingest a doc with an embedded instruction payload,
+  then a later benign turn — assert both that the payload token never appears in
+  the reply *and*, store-side, that the "save a memory that …" payload never
+  persisted). Adds two reusable, unit-tested assertions: `forbidden_patterns`
+  (substrings that must be absent from the reply) and
+  `verify_kb.max_chunks_containing` (`{contains, max, domain?}` — bound a
+  marker's chunk count). They run under the same live-gateway +
+  `PROTOAGENT_INSTANCE` scoping as the existing `memory_ingest` cases; see
+  [the evals guide](docs/guides/evals.md).
+- **Memory inspector console surface** — a new core "Memory" rail view
+  ([ADR 0069](docs/adr/0069-memory-delivery-layer.md) D7, console half) over the
+  `/api/memory/*` REST surface: **Sessions** (the summaries behind the
+  `<prior_sessions>` digest — row click opens the full `recall_session` render in
+  the document viewer; per-row delete with confirm + toast), **Hot memory** (the
+  always-on `domain="hot"` chunks — edit/delete per row), and **Injections** (the
+  per-turn D6 record: which digest sessions / hot chunks / RAG chunks entered
+  which model call, filterable by session — the poisoning-forensics readout; a
+  session row jumps straight to its filtered injections).
+- **Incognito thread toggle in the console** (ADR 0069 D3b, console half) — a
+  per-chat-tab incognito mode that stamps `incognito` into the A2A message
+  metadata on **every** send while ON (the backend flag is per-message; a mixed
+  thread would leak earlier incognito content into a later turn's summary — the
+  desktop non-streaming `/api/chat` fallback carries it too). Toggle via the
+  `/incognito` slash command or the chat-tab context menu ("Turn incognito
+  on/off"); start a thread private via "New incognito chat"; while ON the tab
+  shows an eye-off glyph and the composer a clickable "incognito" chip (click to
+  turn off). Persisted with the session.
+- **Trust-tiered injection** ([ADR 0069](docs/adr/0069-memory-delivery-layer.md)
+  D8). Every knowledge chunk now ranks into a deterministic trust tier by its
+  `source_type` (`knowledge/trust.py`): 3 = operator-authored (console
+  routes), 2 = agent-derived (extracted facts, harvest summaries,
+  `memory_ingest`, compaction archives — the agent write paths now stamp
+  themselves), 1 = ingested/external (web, YouTube, PDF, media) **and
+  unknown/unstamped**. The per-turn auto-injected RAG recall down-weights low
+  tiers (stable post-score sort — a low-trust hit never outranks a
+  higher-trust one, in-tier relevance preserved), and a new
+  `knowledge.inject_min_trust` key (default `1` = nothing excluded) can
+  exclude tiers from auto-injection entirely (`2` drops ingested/external
+  content, `3` = operator rows only). The tier is visible everywhere: injected
+  lines and `memory_recall`/`memory_list` citations carry a
+  `trust: operator|agent|external` label, and tool-driven recall is never
+  gated — excluded content stays reachable on demand. See
+  [the knowledge guide](docs/guides/knowledge.md#trust-tiers-adr-0069-d8).
+- **Hot-memory write visibility** (ADR 0069 D8). Every write that creates a
+  `domain="hot"` chunk (injected in front of the model *every* turn) now
+  emits a `memory.hot_written` event on the plugin event bus (ADR 0039) with
+  `{chunk_id, source, source_type, preview}` — agent tool, operator route, or
+  plugin SDK alike — so the console notification path and any bus subscriber
+  can surface it. An optional confirm gate, `knowledge.hot_write_confirm`
+  (default `false`), makes the agent's own `memory_ingest` refuse hot writes
+  with instructions to ask the operator; operator console surfaces are
+  unaffected.
+- **Supersede-don't-delete staleness** ([ADR 0069](docs/adr/0069-memory-delivery-layer.md)
+  D9). The `chunks` table gains a nullable `invalidated_at` column (additive
+  migration, namespace precedent): when the session-end fact pass extracts a
+  fact that *revises* a stored one (same subject, changed details — a
+  deterministic token-overlap band, never an LLM freshness judgment), the old
+  row is stamped `invalidated_at` and the new row inserted — history kept for
+  audit, nothing updated in place or deleted. Default retrieval excludes
+  invalidated rows everywhere (plain/hybrid/layered `search` — both hybrid
+  rankings — `list_chunks`, hot-memory injection, `memory_recall`), with an
+  `include_invalidated=True` escape hatch for audit tooling. Auto-injected RAG
+  lines now end with the chunk's stored date (`(stored 2026-07-01)`) as a
+  deterministic in-context recency signal. Operator deletes (`forget_memory`,
+  the inspector's DELETE routes) stay **hard** deletes — explicit intent beats
+  history-keeping. See [the knowledge guide](docs/guides/knowledge.md#staleness-supersede-dont-delete).
+- **Namespace-scoped auto-injection** (`knowledge.inject_namespaces`,
+  [ADR 0069](docs/adr/0069-memory-delivery-layer.md) D3a). When set, the per-turn
+  auto-injected RAG recall only considers chunks in the listed namespaces (`""`
+  matches un-namespaced chunks); default unset = unfiltered, so box-commons
+  sharing keeps working. Filters both the keyword and vector rankings on hybrid
+  stores; tool-driven `memory_recall` is deliberately unscoped. See
+  [the knowledge guide](docs/guides/knowledge.md#memory-delivery-controls-adr-0069).
+- **Incognito threads** (ADR 0069 D3b) — a per-message `incognito` flag
+  (`POST /api/chat` body field, or A2A message metadata on the streaming path)
+  that skips session-summary persistence, memory injection (prior-session
+  digest, hot memory, RAG) for that turn, and the retire-time conversation
+  harvest (the transcript never enters the knowledge store); the skill index
+  still injects. Carried through graph state (`ProtoAgentState.incognito`),
+  stamped explicitly each turn. Backend only — the console thread toggle rides
+  a later lane.
+- **Per-turn memory-injection record** (ADR 0069 D6) — every model call that had
+  memory auto-injected appends an id-attributed row (digest session ids, hot-memory
+  chunk ids, RAG chunk ids, approx tokens) to an instance-scoped SQLite log
+  (`observability/injection_log.py`, `<instance_root>/memory-injections.db`),
+  readable via `GET /api/memory/injections?session_id=&limit=` (newest-first).
+  Makes "why did it say that?" answerable and gives memory-poisoning forensics a
+  paper trail: store row → source session → the turns it entered.
+- **Memory-inspector REST surface** (`/api/memory/*`) — the audit surface for the
+  memory delivery layer ([ADR 0069](docs/adr/0069-memory-delivery-layer.md) D7,
+  API half; console UI follows). List/get/delete the persisted **session
+  summaries** behind the `<prior_sessions>` digest (list rows reuse the digest
+  derivation, get returns the same render `recall_session` expands, ids share its
+  path-traversal-safe guard) and list/edit/delete **hot memory** — the
+  `domain="hot"` chunks injected every turn (edits are pinned to `hot`, deletes
+  only resolve hot ids). Bearer-gated like every operator route; documented in
+  [Operator REST API](docs/reference/operator-api.md).
+- **`recall_session(session_id)` starter tool** — expands one entry from the
+  prior-sessions digest into that session's full persisted summary (reasoning-
+  stripped, capped), with a path-traversal-safe id guard. The on-demand
+  counterpart to the new digest below.
+  ([ADR 0069](docs/adr/0069-memory-delivery-layer.md))
+- **Knowledge Base view — collapsible source grouping + Shift+click quick-delete.** Chunks
+  from the same ingested source (a YouTube transcript, a multi-page doc) now collapse under
+  one section header showing the source title, type, and chunk count — with a Collapse/Expand-all
+  toolbar toggle. Only sources with ≥2 loaded chunks group; single/sourceless chunks stay flat
+  (no regression). Open state persists per source; an active search force-expands so matches stay
+  visible. And **Shift+click** a chunk's delete button now removes it immediately (no confirm),
+  matching the chat-tab quick-delete — the plain click still confirms. (#1575, #1582)
+- **One-command install** — `curl -fsSL .../scripts/install.sh | sh` takes a fresh
+  machine from zero to a running, configured protoAgent. It checks prerequisites
+  (Docker + curl), pulls `ghcr.io/protolabsai/protoagent:latest`, runs it
+  (loopback-published, named volume, `restart:unless-stopped`, `PROTOAGENT_UI=console`),
+  then drives a **CLI config wizard over the same `/api/config/*` endpoints as the
+  browser setup wizard** (gateway URL, silent API-key entry, live model probe +
+  validation, agent name). Idempotent (re-run updates the image, keeps data, offers
+  to re-run the wizard), works over a plain SSH session (no-TTY → start + finish in
+  the browser), and POSIX-sh (`| sh`). On non-amd64 hosts (Apple Silicon) it targets
+  the amd64 image under emulation with a clear notice. Versioned at
+  [`scripts/install.sh`](scripts/install.sh); see
+  [Deploy with Docker → one-command install](docs/guides/deploy-docker.md#one-command-install).
+- **Agent archetypes are a data-driven registry** (ADR 0042). The new-agent picker + setup
+  wizard now read their built-in starter types from `config/archetype-catalog.json`
+  (served by `GET /api/archetypes`) instead of a hardcoded list — so archetypes can be added
+  or removed **without a code change**, and a fork/instance overrides the set by dropping its
+  own `archetype-catalog.json` in the live config dir (same override rule as
+  `plugin-catalog.json`/`mcp-catalog.json`). Ships **Basic** + **Custom**; installed bundles
+  that declare an `archetype:` block still self-register on top, now **deduped** by id + bundle
+  URL so a card can't appear twice.
+
+### Changed
+- **CI workflows are fork-friendly** (#1534). Org-specific / expensive workflows no longer
+  auto-run or fail on forks: `docker-publish` (opt in with `DOCKER_PUBLISH_ENABLED` + your own
+  `IMAGE_NAME`), `marketing-deploy` and the GitHub Pages **docs deploy** (canonical-repo only —
+  the docs *build* still runs on fork PRs), and the `desktop-build` (a fork can `workflow_dispatch`
+  its own unsigned build). The `checks.yml` `workspace-config` step now runs fleet-wide
+  (`protoLabsAI/*`) and is skipped on external forks, so a fresh fork gets green CI out of the box;
+  the `server.py` guard still runs everywhere. `release.yml`/`docker-publish.yml` `IMAGE_NAME` is
+  now an overridable repo variable. Lint, tests, fleet-integration, live-smoke, web-e2e, issue-gate,
+  and secret-scan are unchanged (they're already fork-safe). See
+  [Customize & deploy → un-freeze the release pipeline](docs/guides/customize-and-deploy.md#3-un-freeze-the-release-pipeline).
+- **Fleet "New agent" now applies the archetype's persona**, not just its tools. Creating an
+  agent from an archetype writes its base `SOUL.md` into the new workspace (`POST /api/fleet`
+  gained a `soul` field), so a bundle agent arrives with its persona wired in.
+- **Cross-session memory injection is now an attributed digest inside an
+  untrusted-reference envelope** ([ADR 0069](docs/adr/0069-memory-delivery-layer.md)
+  phase 1). `<prior_sessions>` lists one line per recent session — id · timestamp ·
+  surface · topic (from the user's first message) · message count — instead of
+  verbatim message text, under a header stating these are *other, separate*
+  sessions; expand one on demand with `recall_session`. All auto-injected memory
+  (the digest, hot-memory facts, knowledge-retrieval hits) is wrapped in a single
+  `<injected_memory>` envelope marking it as possibly-stale reference data, never
+  instructions. Fixes a fresh thread confidently narrating other threads' history
+  as "the conversation so far", shrinks per-turn injection from ~2 000 tokens of
+  raw chatter to a ~10-line digest, and removes untrusted ingested content from
+  the prompt's trusted voice (OWASP ASI06 memory-poisoning posture).
+- **Memory rows carry provenance.** Harvested conversation summaries and extracted
+  facts now store their source session id in the `source` column, and
+  `memory_recall` / `memory_list` cite `(src: <session>, <date>, ns: <namespace>)`
+  per hit — the substrate for the ADR 0069 injection-record and trust-tier phases.
+- **The docs build now gates every PR.** The `Deploy docs to GitHub Pages` `build`
+  job (vitepress parse + dead-link check) runs on all PRs (~30 s, path filter
+  removed) and is a **required status check** on `main` — a dead docs link can no
+  longer auto-merge and freeze the Pages deploy.
+
+### Fixed
+- **Fleet agents now actually start in the desktop app, and a boot failure tells
+  you why.** Creating a new agent (the ADR 0042 new-agent flow) silently produced
+  a dead member in the frozen desktop build: members were spawned as
+  `<sys.executable> -m server …`, but in the PyInstaller sidecar `sys.executable`
+  *is* the server entrypoint, so every spawn died at argparse with
+  `unrecognized arguments: -m server` — visible only in the workspace's
+  `agent.log`, which nothing surfaced. The spawn (and the workspace bundle
+  installer) is now frozen-aware, and `supervisor.start()` watches the fresh
+  process: if it exits during boot, the state entry is reaped and the API returns
+  a readable 400 carrying the exit code + the fresh `agent.log` tail (the console
+  already toasts it; `fleet up` prints it per-member and keeps going).
+- **Settings `string_list` fields can now carry an empty-string entry** — a
+  literal `""` (or `''`) token in the comma-separated editor parses to the empty
+  string and round-trips back as `""`. Needed for
+  `knowledge.inject_namespaces`, where the `""` sentinel means "the
+  un-namespaced rows" (ADR 0069 D3a); previously the editor silently dropped it.
+- **Chat code blocks: no empty header gap, a distinct lighter well, and no panel-stretch.**
+  A fenced block with no language no longer renders an empty ~32px header band (the copy
+  action now floats over the code's top-right); the code well is lifted onto the lighter
+  `--pl-color-bg-raised` token so it reads distinctly from system-message/report cards and
+  select inputs (which use the darkest `--pl-color-bg-inset`); and the block + assistant
+  markdown column are hard-capped to the message width so a long unwrapped line scrolls
+  inside the block instead of widening the chat panel.
+- **Chat session-identity hygiene** ([ADR 0069](docs/adr/0069-memory-delivery-layer.md) D4).
+  Omitting `session_id` on `POST /api/chat` now mints a unique per-call id instead of
+  pooling every caller into one shared `api-default` thread; an empty session id skips
+  session-memory persistence instead of pooling into `unknown.json`; the streaming and
+  non-streaming chat paths share one `a2a:` thread-id prefix (previously the same
+  session split into two histories; existing `chat:*` REST threads orphan once); and
+  the non-streaming turn now holds the per-thread lock, closing a checkpointer
+  lost-update race with concurrent streaming/compact/rewind on the same session.
+- **Artifact plugin (0.15.0) — pointer lock now works in games/canvas/3D artifacts.**
+  `requestPointerLock()` from generated code threw *"Pointer lock requires the window to have
+  focus"*: pointer-lock is a Permissions-Policy feature that must be delegated via `allow=` at
+  **every** iframe nesting level, and the policy was missing even though the `allow-pointer-lock`
+  sandbox token was present. The console plugin-view iframe now sends `allow="… ; pointer-lock"`
+  and the nested artifact iframe carries `allow="pointer-lock"` too.
+- **Artifact plugin (0.15.0) — SVG / Mermaid now render crisply instead of pixelating on zoom.**
+  The graphic viewport CSS-transform-scaled a `will-change` raster layer, so WKWebView (the desktop
+  app's Safari engine) rasterized the SVG at 1× then GPU-scaled the bitmap → blurry on zoom-in. It's
+  replaced by a **crisp fit-to-window**: the `<svg>` scales as a vector to fit the frame (no transform,
+  no raster layer). Pan/zoom + the zoom buttons are intentionally dropped in favor of a sharp fit.
+- **Artifact plugin (0.15.0) — the selected artifact + version now survive a tab switch.** Switching
+  console tabs unmounts/remounts the plugin-view iframe, reloading the shell fresh; it used to snap
+  back to the latest artifact. The selection (`{selId, selVer, followNewest}`) is now persisted to
+  `localStorage`, with a fallback to auto-follow-newest if the pinned artifact was deleted.
+- **A stale untracked plugin copy no longer shadows a newer bundled one.** The loader let the
+  live/installed plugins dir override the bundled tree *unconditionally*, so a plugin that was
+  once git-installed and later bundled in-tree (e.g. the artifact plugin @ 0.11.3 vs the bundled
+  0.14.0) stayed stuck on the old installed copy forever — it never updated with the app. Now an
+  **untracked** live copy only wins when it's **not older** than the bundle; an intentional
+  install/override (tracked in `plugins.lock`) still wins at any version.
+- **Plugin install `git clone --no-hardlinks`** — cloning a plugin from a local path hardlinked
+  source objects and intermittently failed with `fatal: hardlink different from source` (a known
+  local-clone race that also silently ignores `--depth`); a no-op for the normal remote/network
+  clone. Fixes recurring CI flakiness in the installer tests.
+- **Console dev server no longer defaults to the prod backend.** `apps/web/vite.config.ts` proxied
+  `npm run dev` / `npm run preview` backend calls to `:7870` (the default/prod instance the desktop
+  app runs) by default — so browser-based console development silently read and **wrote your real
+  `~/.protoagent` data**. It now defaults to the **isolated dev instance `:7871`** (`scripts/dev.sh`),
+  which is fail-safe (a clean "can't connect" when no dev backend is up, never a silent prod hit),
+  and prints a **loud red guard** if `PROTOAGENT_API_BASE` is ever pointed at `:7870`.
+- **Removed the broken built-in "Project Manager" archetype.** It pointed at
+  `protoLabsAI/pm-stack`, which was split/renamed (→ `product-stack`, `leadEngineer`,
+  `portfolio-manager-stack`); the stale URL no longer installed what the card promised. Those
+  stacks self-register as archetypes when installed, and the URL is now a data edit rather than
+  a code constant.
+- **Instance collision warning no longer false-alarms on a shared box root** (#1552). The boot
+  "another instance can clobber your chat/knowledge/stores" warning keyed on the shared
+  `box_root`, so it fired for any second process on the machine — including a `dev` instance
+  (`~/.protoagent/dev`) that keeps entirely separate data. It now keys on **`instance_root`**:
+  it warns only when another live process shares *this* instance's data root (a genuine
+  clobber, e.g. the same instance run twice), and stays silent for box-only co-residents with
+  distinct `PROTOAGENT_INSTANCE` ids.
+- **Setup wizard: the archetype bundle-install result is no longer swallowed.** Finishing setup
+  unmounts the wizard, so the "tools are ready" / "couldn't auto-enable — turn them on in
+  Settings ▸ Plugins" outcome now shows as a **toast** (survives the unmount) instead of an
+  in-wizard message the user never saw.
+- **Setup wizard: picking a persona-less archetype no longer blanks the editor.** A bundle
+  archetype whose manifest declares no inline `soul:` now seeds the persona step with the base
+  SOUL as a fallback, rather than clearing the SOUL textarea.
+
+## [0.78.0] - 2026-07-01
+
+### Added
+- **Developer panel — view & toggle developer flags** (#1506, ADR 0068). A new **Settings ▸ Developer**
+  section (surfaced only off prod — a dev build, a non-prod `developer.channel`, or a `?dev` reveal —
+  so production operators never see it) lists every registered flag with its tier + resolved state and
+  lets you flip it **per-device** (device-local overrides, *Reset* to clear). Backed by `GET /api/flags`;
+  `useFlag(id)` gates console UI, and `?flag:<id>=on|off` gives a shareable per-load override.
+- **Developer flags — backend foundation** (#1506, ADR 0068, slice 1). A small local/static
+  feature-flag system to gate pre-release functionality: `runtime/flags.py` with a `Flag` registry
+  (`off`·`dev`·`beta`·`on` tiers) and `flag_enabled(id)` / `resolved_flags()`. Enablement resolves
+  a flag's tier against a runtime **channel** (`prod ⊂ beta ⊂ dev`) — derived from the dev sandbox
+  instance, a `PROTOAGENT_CHANNEL` env, or the new **`developer.channel`** setting — with a
+  `PROTOAGENT_FLAG_<ID>` env override on top. No flags ship yet; the `/api/flags` route and the
+  Developer panel are later slices.
 - **Chat composer: terminal-style input history** (#1496). Press **↑** to recall previously-sent
   messages into the composer (newest first), **↓** to walk back toward your in-progress draft — just
   like a shell. Recalled messages are editable before resending; history only triggers at the top/bottom
@@ -41,6 +464,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   operator surface** (plugin install, config rewrite, subagent runs, goal/watch set-paths) with `403`.
   Opt-in — unset ⇒ single-token mode, unchanged.
 - **Console set-goal form** (#1510) and **live `goal.iteration` progress** in the Goals panel (#1498).
+- **Chat: slash commands trigger mid-input + render as command bubbles** (#1530, #1528, #1529). Type
+  `/` at **any** caret position (not only the first character) to open the command popover; arrow-key
+  navigation auto-scrolls the focused item into view; an issued command renders as a distinct user
+  bubble (subtle tint + monospace + `/` badge) so it stays legible in the transcript.
+- **Agent switcher: always available, with a Fleet-settings shortcut** (#1544, #1556). The agent-name
+  dropdown in the header now shows even for a single agent (not only in a multi-agent fleet), so **New
+  agent** and a new **Fleet settings** link (→ the fleet management dialog) are always one click away.
+  The brand logo stays a plain mark.
+- **Chat: `Cmd/Ctrl+O` toggles the latest tool-call block** (#1526, ADR 0063). Expands the newest tool
+  call, then collapses it and walks upward through older ones on repeat; a reasoning-only turn is a
+  no-op. Rebindable in **Settings ▸ Keyboard**.
+- **Chat: `/compact` — summarize + archive a long thread** (#1527). Compresses the current conversation
+  into a summary and rewrites the live context to *[summary + recent messages]* so the agent keeps
+  context at a fraction of the token cost, while the **full raw transcript is archived to searchable
+  memory** (recallable via `memory_recall`). Never-lossy: it refuses rather than drop history it
+  couldn't archive, and keeps tool-call/response pairs intact across the cut.
 
 ### Changed
 - **Knowledge panel: Upload / Add now open in a dialog** (#1502) instead of expanding inline in the
@@ -55,6 +494,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   had to emit is retired for the `update_goal_plan` / `abandon_goal` tools.
 - The A2A-streaming and non-streaming **goal drive loops are unified** (#1497), fixing a fresh-context
   thread-id drift.
+- **Settings sub-panels share one container** (#1545) — the Keyboard and Delegates panels now render
+  through the same `SettingsSubPanel` chrome (DS `PanelHeader` + scrolling body) as the schema-driven
+  and other bespoke panels, so header/padding/scroll can't drift per panel.
+- **`wait` tool output is conversational** (#1536) — the tool returns a concise summary (e.g. "Wait
+  scheduled: 5 minutes. Will resume to: …") instead of the raw "Yielding for 300s — you'll be
+  re-invoked at <ISO>…", and its docstring tells the agent to paraphrase rather than echo it verbatim.
+- **Desktop app builds are on-demand** (#1547) — `desktop-build.yml` now runs on manual dispatch only,
+  not on every version tag (the macOS/Windows matrix was the dominant CI cost). Cut a desktop release
+  with `gh workflow run desktop-build.yml -f tag=vX.Y.Z` (attaches binaries + `latest.json`, promotes
+  to Latest); tag pushes still publish the Docker image + a non-Latest GitHub Release.
 
 ### Security
 - **RCE-via-chat closed** (#1492) — a `/goal` chat message can no longer arm a `command` / `test` / `ci`
@@ -70,6 +519,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Docs
 - New **ADR 0066** (federation token + operator channel) and **ADR 0067** (watch primitive); **ADR 0030**
   marked superseded. New **Watches** guide; the goal-mode + plugins guides updated for the drive-only model.
+- **PROTO.md § Run it**: agent-launched throwaway test servers should be **fully isolated** (own
+  `PROTOAGENT_BOX_ROOT`, not just an instance id) to avoid clobbering / the desktop co-residence warning
+  (#1553, #1552); the releasing + desktop docs updated for the manual desktop-build flow (#1547).
 
 ## [0.77.0] - 2026-07-01
 

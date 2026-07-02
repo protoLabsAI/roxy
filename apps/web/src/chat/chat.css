@@ -28,31 +28,131 @@
   min-height: 0;
 }
 
+/* ── Assistant markdown code blocks ─────────────────────────────────────────────
+   Polish for the DS streamdown code block inside chat:
+   1. Overflow — hard-cap the block (and the markdown root) to the message width so a
+      long unwrapped line SCROLLS inside the block (the DS gives the body overflow-x:auto)
+      instead of stretching the whole chat panel past its column.
+   2. Empty header — a fenced block with no language renders an empty ~32px header band
+      (an ugly gap). Hide it and float the copy action over the code's top-right instead
+      of reserving a header row (the block is position:relative, so the action anchors to it).
+   3. Colour — the DS default well is --pl-color-bg-inset (the DARKEST token, shared with
+      system-message/report cards and select inputs). Lift code blocks onto the lighter
+      --pl-color-bg-raised so they read as a distinct "code well". */
+/* Constrain the assistant content column (NOT the user bubble, which keeps its
+   max-width:80%) + the markdown root, so a code block can't push either wide. */
+.chat-session-slot .pl-message:not(.pl-message--user) .pl-message__content { min-width: 0; max-width: 100%; }
+.chat-session-slot .pl-markdown { min-width: 0; max-width: 100%; }
+/* The message-column ANCESTORS above .pl-message__content are flex/grid items that default to
+   min-width:auto — so a wide code line's min-content propagates all the way up and pins the
+   whole convo (and the resizable chat panel) to the code's width, killing the panel's ability
+   to slide narrow. The DS sets min-width:0 on .pl-convo and .pl-message__body but MISSES these
+   three, so the floor leaks through. Zero them so the constraint chain reaches .chat-session-slot
+   (the grid that's correctly sized to the panel) and the overflow lands in the code body's
+   overflow-x:auto instead. */
+.chat-session-slot .pl-convo-wrap,
+.chat-session-slot .pl-convo-scroll,
+.chat-session-slot .pl-message { min-width: 0; }
+.chat-session-slot .pl-markdown [data-streamdown="code-block"] {
+  max-width: 100%;
+  background: var(--pl-color-bg-raised);
+}
+.chat-session-slot .pl-markdown [data-streamdown="code-block-header"][data-language=""] { display: none; }
+.chat-session-slot .pl-markdown [data-streamdown="code-block-header"][data-language=""] + div {
+  margin-top: 0;
+  position: absolute;
+  top: 4px;
+  right: 4px;
+}
+
 /* The tab-bar wrapper exists only to scope the right-click context menu (ADR 0036) to the
    tab strip — it generates no box, so the DS TabBar stays the flex child it was. */
 .chat-tabbar-wrap {
   display: contents;
 }
 
-/* Background-agent report card (ADR 0050/0062). The DS system message is a de-emphasized
-   centered pill (bg-inset fill); for a report + "Read full report" button that reads wrong.
-   Restyle it as a bordered card sitting on the chat surface: same background as the surface
-   (transparent), a border instead of the fill, de-pilled + left-aligned + readable size. */
+/* Background-agent report card (ADR 0070 D4). The DS system message is a de-emphasized
+   centered near-black pill (bg-inset fill, 100px radius); a finished job's report is a
+   DOCUMENT teaser, not a status blip. The card itself is the bespoke .chat-report-card
+   inside the message content (raised surface, real corners, shadow, header row, clamped
+   fading excerpt, "Open report" CTA — built in ChatMessageView); here we only NEUTRALIZE
+   the DS pill on the content wrapper. Specificity is STACKED on the message root
+   (.pl-message--system.chat-report …) — the .chat-note pattern below — so the DS default
+   (.pl-message--system .pl-message__content, 0-2-0) can never win by load order; the
+   .chat-session-slot-anchored variant (0-4-0) also outranks our own base system-message
+   rule further down (0-3-0), and the bare variant covers a card rendered outside the
+   chat slot (the shared renderer also serves the ⌘K palette chat). */
 .chat-report.pl-message--system {
   justify-content: stretch;
 }
-.chat-report .pl-message__content {
-  background: transparent; /* match the chat surface — no bg-inset fill */
-  border: var(--pl-border-width) solid var(--pl-color-border);
-  border-radius: var(--pl-radius);
+.chat-session-slot .pl-message--system.chat-report .pl-message__content,
+.pl-message--system.chat-report .pl-message__content {
   display: block;
+  background: transparent;
+  border: none;
+  border-radius: 0;
+  padding: 0;
   text-align: left;
   font-size: 0.9rem;
   color: var(--pl-color-fg);
-  padding: 10px 14px;
 }
-.chat-report-open {
-  margin-top: 8px;
+.chat-report-card {
+  background: var(--pl-color-bg-raised); /* lifted OFF the surface — not the bg-inset well */
+  border: 1px solid var(--pl-color-border);
+  border-radius: var(--pl-radius);
+  /* Raised-element shadow — the DS .pl-convo__jump precedent, same literal fallback for
+     themes that don't define the popover shadow token. */
+  box-shadow: var(--pl-shadow-popover, 0 2px 8px rgba(0, 0, 0, 0.22));
+  padding: 14px 16px;
+  cursor: pointer; /* the whole card opens the report (selection-guarded in JSX) */
+}
+.chat-report-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.chat-report-head > svg {
+  flex: 0 0 auto;
+  color: var(--pl-color-fg-muted);
+}
+.chat-report-titles {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+}
+.chat-report-title {
+  font-weight: 600;
+  font-size: 0.95rem;
+  overflow-wrap: anywhere;
+}
+.chat-report-sub {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--pl-color-fg-muted);
+}
+/* The excerpt is a TEASER, not the content: clamp to ~7 text lines, and when the text
+   actually overflows (the --clamped modifier, measured in ChatMessageView) fade the tail
+   out so it visibly trails off into the card — the full report lives in the document
+   viewer behind the CTA. The mask is NOT unconditional: it scales to the element's own
+   box, so on a short, fully-visible report it would ghost the last line — the report's
+   conclusion — into a fake "there's more" truncation. */
+.chat-report-excerpt {
+  margin-top: 10px;
+  max-height: 10.5em; /* ≈7 lines at the markdown 1.5 line height */
+  overflow: hidden;
+}
+.chat-report-excerpt--clamped {
+  -webkit-mask-image: linear-gradient(to bottom, black 55%, transparent 100%);
+  mask-image: linear-gradient(to bottom, black 55%, transparent 100%);
+}
+.chat-report-excerpt .markdown > :first-child,
+.chat-report-excerpt .pl-markdown > :first-child {
+  margin-top: 0;
+}
+.chat-report-cta {
+  margin-top: 10px;
 }
 
 /* Per-turn token/cost footer under an assistant answer (#1372) — a quiet, monospace row of
@@ -154,8 +254,10 @@
 }
 
 /* Bypass-permissions indicator in the composer toolbar — a DS warning Badge (outline tone) in a
-   bare button so clicking it turns bypass off (same as `/bypass off`). The Badge owns the styling. */
-.composer-bypass-toggle {
+   bare button so clicking it turns bypass off (same as `/bypass off`). The Badge owns the styling.
+   The incognito chip (ADR 0069 D3b) mirrors it: clicking turns incognito off. */
+.composer-bypass-toggle,
+.composer-incognito-toggle {
   display: inline-flex;
   align-items: center;
   padding: 0;
@@ -176,6 +278,17 @@
   mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath d='M9 3v1H4v2h16V4h-5V3H9zM6 7l1 13h10l1-13H6z'/%3E%3C/svg%3E") center / contain no-repeat;
 }
 
+/* Incognito tab indicator (ADR 0069 D3b): the EyeOff glyph rides the icon slot
+   beside the status dot while the thread's toggle is on. */
+.session-tab-icons {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+}
+.session-incognito-icon {
+  opacity: 0.75;
+}
+
 .chat-session-slot {
   height: 100%;
   display: grid;
@@ -189,6 +302,41 @@
 /* Literal user input inside the DS Message bubble — preserve newlines/wrapping
    (assistant markdown reflows on its own). */
 .chat-user-text {
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/* An issued slash command rendered as a distinct USER bubble (#1529): a subtle accent
+   tint + monospace body + a small "/" badge, so a command sent to the agent reads as a
+   command in history — to operator and agent — not as prose. `.chat-slash-msg` sits ON
+   .pl-message--user (anchored under .chat-session-slot), so it outranks the DS base
+   user-bubble rule regardless of import order. */
+.chat-session-slot .pl-message--user.chat-slash-msg .pl-message__content {
+  background: color-mix(in srgb, var(--brand-violet) 12%, var(--bg-raised));
+  border-color: color-mix(in srgb, var(--brand-violet) 40%, var(--border-strong));
+}
+.chat-user-text.chat-slash-cmd {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 6px;
+  font-family: var(--font-mono);
+  font-size: 0.9em;
+}
+.chat-slash-badge {
+  flex-shrink: 0;
+  align-self: center;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 1.2em;
+  height: 1.2em;
+  border-radius: 4px;
+  background: var(--brand-violet);
+  color: #fff;
+  font-weight: 600;
+  line-height: 1;
+}
+.chat-slash-body {
   white-space: pre-wrap;
   word-break: break-word;
 }

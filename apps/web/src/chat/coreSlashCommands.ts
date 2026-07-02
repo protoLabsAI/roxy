@@ -7,7 +7,14 @@
 
 import { registerSlashCommand } from "../ext/slashRegistry";
 import { api } from "../lib/api";
+import type { ChatMessage } from "../lib/types";
 import { chatStore, DEFAULT_REASONING_EFFORT, REASONING_EFFORTS } from "./chat-store";
+
+// Local id for the system notes /compact posts (the command manages messages
+// directly, like /clear, so it needs to own the ids it can later replace).
+function noteId() {
+  return `sys-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+}
 
 registerSlashCommand({
   name: "new",
@@ -32,6 +39,75 @@ registerSlashCommand({
 });
 
 registerSlashCommand({
+  name: "compact",
+  description: "Summarize & archive older history, keeping recent context",
+  flag: "chat.compact", // pre-release (ADR 0068) — hidden + inert while the flag is off
+  run: (ctx) => {
+    if (!ctx.sessionId) return false; // no session → fall through
+    const sessionId = ctx.sessionId;
+    const messagesOf = () =>
+      chatStore.getSnapshot().sessions.find((s) => s.id === sessionId)?.messages ?? [];
+
+    // Optimistic note (own id so we can drop it once the server responds).
+    const pendingId = noteId();
+    chatStore.updateMessages(sessionId, [
+      ...messagesOf(),
+      {
+        id: pendingId,
+        role: "system",
+        content: "Compacting this conversation — archiving older history and summarizing…",
+        noteTone: "info",
+        createdAt: Date.now(),
+        status: "done",
+      },
+    ]);
+    ctx.focusComposer();
+
+    const note = (content: string, tone: ChatMessage["noteTone"]): ChatMessage => ({
+      id: noteId(),
+      role: "system",
+      content,
+      noteTone: tone,
+      createdAt: Date.now(),
+      status: "done",
+    });
+    // Drop only the optimistic note — preserve anything that streamed in meanwhile.
+    const withoutPending = () => messagesOf().filter((m) => m.id !== pendingId);
+
+    void api
+      .compactChatSession(sessionId)
+      .then((res) => {
+        // Never-lossy: only drop history when the server actually rewrote the
+        // checkpoint (archived + removed > 0). Otherwise just surface the status.
+        if (res.refused || !res.archived || res.removed <= 0) {
+          chatStore.updateMessages(sessionId, [
+            ...withoutPending(),
+            note(res.message, res.refused ? "warning" : "info"),
+          ]);
+          return;
+        }
+        // Mirror the server: replace the view with a summary bubble + the recent
+        // tail. Slice from the CURRENT messages (minus the pending note) so nothing
+        // that arrived during the compaction is lost.
+        const kept = res.kept > 0 ? withoutPending().slice(-res.kept) : [];
+        const summary = note(
+          `**Conversation compacted.** ${res.message}\n\n---\n\n${res.summary}`,
+          "success",
+        );
+        chatStore.updateMessages(sessionId, [summary, ...kept]);
+      })
+      .catch(() => {
+        chatStore.updateMessages(sessionId, [
+          ...withoutPending(),
+          note("Compaction failed — nothing was changed.", "danger"),
+        ]);
+      });
+
+    return true;
+  },
+});
+
+registerSlashCommand({
   name: "effort",
   description: "Reasoning effort: low | medium | high | max | off",
   usage: "/effort low|medium|high|max|off",
@@ -50,6 +126,28 @@ registerSlashCommand({
     } else {
       ctx.noteToThread(`Unknown effort \`${arg}\`. Options: ${opts}.`);
     }
+    ctx.focusComposer();
+    return true;
+  },
+});
+
+registerSlashCommand({
+  name: "incognito",
+  description: "Incognito for this tab: turns leave no memory and inject none",
+  usage: "/incognito on|off",
+  run: (ctx) => {
+    if (!ctx.sessionId) return false;
+    const arg = ctx.rest.trim().toLowerCase();
+    const session = chatStore.getSnapshot().sessions.find((s) => s.id === ctx.sessionId);
+    const cur = !!session?.incognito;
+    const next = arg === "on" ? true : arg === "off" ? false : !cur; // bare /incognito toggles
+    chatStore.setSessionIncognito(ctx.sessionId, next);
+    ctx.noteToThread(
+      next
+        ? "**Incognito ON** for this tab — every message now carries `incognito`: no session summary, no memory harvest, no memory injection, until you turn it off with `/incognito off`. Messages already sent before this were NOT incognito."
+        : "Incognito **off** — turns persist to memory and receive memory again.",
+      { tone: "info" },
+    );
     ctx.focusComposer();
     return true;
   },

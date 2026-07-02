@@ -845,6 +845,59 @@ select:disabled {
    `.markdown` rules + the streamdown Tailwind scan are gone (protoContent#297/#298). The
    `.markdown` class still rides the same element as an e2e/selector alias. */
 
+/* ── Markdown chrome: console-side gaps the DS can't cover ─────────────────────
+   @protolabsai/ui 0.53.1 folded in the responsive tables + the code-block/table vertical
+   stack (protoContent#382), so those overrides are gone. What remains here patches
+   CONSOLE-specific behaviour the DS package can't see. */
+
+/* GFM task-list checkbox: the console's global `input,textarea,select { width: 100% }` (below)
+   blows the markdown checkbox to the full row width, shoving the label onto the next line. The
+   DS can't fix that (it has no such global rule). Pin it back to intrinsic size, and drop the
+   disc marker the DS still leaves on the item (it has a checkbox, not a bullet). */
+.pl-markdown [data-streamdown="list-item"].task-list-item {
+  list-style: none;
+}
+.pl-markdown [data-streamdown="list-item"].task-list-item input[type="checkbox"] {
+  width: auto;
+}
+
+/* Table "copy as" dropdown (Markdown/CSV/TSV): streamdown styles the menu with inert Tailwind
+   (min-w-[120px], px-3, w-full) and an inline left offset (its right-0/top-full are inert), so
+   it collapses to ~22px and drifts off the wrapper's right edge. Give it a readable surface,
+   anchor it under the button, and let it escape the DS's overflow:hidden (which clips it below a
+   short table). The table's own horizontal scroll lives on the inner overflow-x:auto child, so
+   opening the wrapper up doesn't leak a wide table. */
+.pl-markdown [data-streamdown="table-wrapper"] {
+  overflow: visible;
+}
+.pl-markdown [data-streamdown="table-wrapper"] .relative > div {
+  min-width: 150px;
+  white-space: nowrap;
+  padding: 4px;
+  background: var(--pl-color-bg-raised);
+  border: var(--pl-border-width) solid var(--pl-color-border);
+  border-radius: var(--pl-radius);
+  box-shadow: 0 6px 20px rgb(0 0 0 / 28%);
+  /* streamdown positions the menu with an inline left offset (its right-0/top-full Tailwind is
+     inert), which shoved the 150px menu off the wrapper's right edge and out of view. Anchor it
+     explicitly under the button, right-aligned, so it stays on-screen. !important beats the
+     inline style. */
+  top: 100% !important;
+  right: 0 !important;
+  left: auto !important;
+}
+.pl-markdown [data-streamdown="table-wrapper"] .relative > div button {
+  display: block;
+  width: 100%;
+  padding: 6px 10px;
+  text-align: left;
+  white-space: nowrap;
+  border-radius: var(--pl-radius);
+}
+.pl-markdown [data-streamdown="table-wrapper"] .relative > div button:hover {
+  background: var(--pl-color-bg-inset);
+}
+
 /* Chat composer + slash-command autocomplete — moved to src/chat/chat.css (#832). */
 /* HITL request card — moved to src/chat/hitl.css (#832). */
 
@@ -1811,6 +1864,24 @@ textarea {
 .knowledge-chunk-form-row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
 .knowledge-chunk-form-row > :first-child { flex: 1; min-width: 180px; }
 .knowledge-chunk-actions { display: flex; gap: 2px; }
+/* Shift held → the delete button arms red (chat-tab quick-delete parity, #1582). */
+.knowledge-del-armed, .knowledge-del-armed svg { color: var(--pl-color-danger, #e5484d); }
+
+/* Collapsible source groups in the Knowledge Base (#1575). A group is a plain
+   list item holding a full-width header button + (when open) a nested card list. */
+.kb-group { list-style: none; display: flex; flex-direction: column; gap: 8px; }
+.kb-group-header {
+  display: flex; align-items: center; gap: 8px; width: 100%;
+  padding: 8px 12px; border: 1px solid var(--border); border-radius: var(--radius);
+  background: var(--bg-raised); color: var(--fg); cursor: pointer; text-align: left;
+}
+.kb-group-header:hover { border-color: var(--border-strong); }
+.kb-group-caret { flex: none; color: var(--fg-muted); transition: transform 0.12s ease; }
+.kb-group-title {
+  flex: 1; min-width: 0; font-size: 13px; font-weight: 600;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.kb-group-body { margin-left: 14px; }
 
 /* New/Edit skill dialog (PlaybooksSurface) — a little more space between fields than
    the knowledge inline form it grew out of. (Body padding is the app-wide
@@ -2019,6 +2090,7 @@ textarea {
 .fleet-switcher-trigger:hover {
   background: var(--bg-hover);
 }
+
 .fleet-switcher-name {
   display: inline-flex;
   align-items: center;

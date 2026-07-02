@@ -1,5 +1,19 @@
-import { describe, it, expect } from "vitest";
-import { ApiError, apiUrl, drainSseBuffer, frameIsForeign, isColdStart, textFromParts, hitlFromParts } from "./api";
+import { afterEach, beforeEach, describe, it, expect, vi } from "vitest";
+import {
+  ApiError,
+  api,
+  apiUrl,
+  drainSseBuffer,
+  frameIsForeign,
+  isColdStart,
+  isAgentNotRunning,
+  isAgentUnreachable,
+  isMemberScoped,
+  loadBackgroundReport,
+  textFromParts,
+  hitlFromParts,
+} from "./api";
+import { authRequired, clearAuthRequired } from "./auth";
 
 describe("cold-start detection (ApiError / isColdStart)", () => {
   it("ApiError carries the HTTP status", () => {
@@ -24,6 +38,84 @@ describe("cold-start detection (ApiError / isColdStart)", () => {
     // than flashing "Load failed" in the tasks/notes panels.
     expect(isColdStart(new TypeError("Load failed"))).toBe(true);
     expect(isColdStart(new Error("Failed to fetch"))).toBe(true);
+  });
+});
+
+describe("focused-agent-down detection (isAgentNotRunning)", () => {
+  it("true ONLY for a 409 (the fleet proxy's 'agent not running')", () => {
+    expect(isAgentNotRunning(new ApiError(409, "agent 'x' is not running"))).toBe(true);
+    // 502 is a proxy/boot hiccup, not a definitively-down agent — stays a cold-start retry, not recovery.
+    expect(isAgentNotRunning(new ApiError(502, "not reachable"))).toBe(false);
+    expect(isAgentNotRunning(new ApiError(404, "nope"))).toBe(false);
+    expect(isAgentNotRunning(new TypeError("Load failed"))).toBe(false);
+    expect(isAgentNotRunning(undefined)).toBe(false);
+  });
+});
+
+describe("unreachable-remote detection (isAgentUnreachable)", () => {
+  it("true ONLY for a 502 (the fleet proxy's 'can't reach the member') — a remote never 409s", () => {
+    expect(isAgentUnreachable(new ApiError(502, "agent is not reachable"))).toBe(true);
+    expect(isAgentUnreachable(new ApiError(409, "not running"))).toBe(false); // that's a local peer
+    expect(isAgentUnreachable(new ApiError(401, "unauthorized"))).toBe(false); // that's a bad token
+    expect(isAgentUnreachable(new TypeError("Load failed"))).toBe(false);
+    expect(isAgentUnreachable(undefined)).toBe(false);
+  });
+});
+
+describe("isMemberScoped — which 401s belong to a member vs the hub (ADR 0042 §I)", () => {
+  const focus = (slug: string | null) =>
+    window.history.replaceState({}, "", slug ? `/app/agent/${slug}/` : "/app/");
+
+  it("host window: nothing is member-scoped", () => {
+    focus(null);
+    expect(isMemberScoped("/api/runtime/status")).toBe(false);
+    expect(isMemberScoped("/a2a")).toBe(false);
+  });
+
+  it("member window: slug-routed agent paths are member-scoped, hub paths are not", () => {
+    focus("ava");
+    expect(isMemberScoped("/api/runtime/status")).toBe(true); // proxied to the member
+    expect(isMemberScoped("/a2a")).toBe(true);
+    expect(isMemberScoped("/api/fleet")).toBe(false); // hub control-plane — stays on the hub
+    expect(isMemberScoped("/api/runtime/status", true)).toBe(false); // host:true forces the hub
+  });
+});
+
+describe("member-scoped 401 must NOT hijack the hub AuthGate (ADR 0042 §I)", () => {
+  // The load-bearing behavior: a proxied member's bad/rotated token 401s, but that's the
+  // MEMBER's credential problem — tripping the global hub prompt would ask for (and overwrite)
+  // the wrong token. request() suppresses notifyAuthRequired() for member-scoped requests.
+  const focus = (slug: string | null) =>
+    window.history.replaceState({}, "", slug ? `/app/agent/${slug}/` : "/app/");
+  const unauthorized = () =>
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => ({
+        ok: false,
+        status: 401,
+        statusText: "Unauthorized",
+        text: async () => "unauthorized",
+      })),
+    );
+
+  beforeEach(() => clearAuthRequired());
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    clearAuthRequired();
+  });
+
+  it("a HOST-scoped 401 trips the global auth prompt", async () => {
+    focus(null);
+    unauthorized();
+    await expect(api.runtimeStatus()).rejects.toBeInstanceOf(ApiError);
+    expect(authRequired()).toBe(true);
+  });
+
+  it("a MEMBER-scoped 401 does NOT trip it (it's the member's token, not the hub's)", async () => {
+    focus("ava");
+    unauthorized();
+    await expect(api.runtimeStatus()).rejects.toBeInstanceOf(ApiError);
+    expect(authRequired()).toBe(false); // the boot gate / fleet panel own this recovery instead
   });
 });
 
@@ -149,6 +241,15 @@ describe("apiUrl — fleet slug routing (ADR 0042)", () => {
     expect(apiUrl("/api/fleet")).not.toContain("/agents/");
     expect(apiUrl("/api/archetypes")).not.toContain("/agents/");
   });
+
+  it("host:true keeps the SSE token on the hub in a member window (proxied /api/events is validated by the HUB key)", () => {
+    // The SSE-token fix: /api/events is proxied and the HUB's auth middleware validates the
+    // ?token= with the HUB's key before forwarding, so the token must be hub-signed. Without
+    // host:true, /api/sse-token would slug-route and be member-signed → 401 at the hub.
+    focus("m");
+    expect(apiUrl("/api/sse-token")).toContain("/agents/m/api/sse-token"); // default: slug-routed (the bug)
+    expect(apiUrl("/api/sse-token", { host: true })).not.toContain("/agents/"); // the fix
+  });
 });
 
 describe("frameIsForeign — cross-context stream guard (subagent-stream-isolation #1394 follow-up)", () => {
@@ -187,5 +288,87 @@ describe("frameIsForeign — cross-context stream guard (subagent-stream-isolati
   it("never treats an empty / resultless frame as foreign", () => {
     expect(frameIsForeign({}, SESSION)).toBe(false);
     expect(frameIsForeign({ result: {} }, SESSION)).toBe(false);
+  });
+});
+
+// ── Background report by-id fetch (ADR 0070 D4) ────────────────────────────────
+// api.backgroundJob hits GET /api/background/{id} (the only route carrying the FULL
+// result); loadBackgroundReport wraps it for the report card / document viewer with
+// a legacy list-and-filter fallback that fires ONLY on a 404.
+
+const JOB = "bg-abcdefabcdef";
+const GONE = /no longer available/;
+
+function json(body: unknown, status = 200) {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { "content-type": "application/json" },
+  });
+}
+
+/** Stub global fetch with a per-URL router; returns the list of requested paths. */
+function stubFetch(route: (path: string) => Response) {
+  const calls: string[] = [];
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (input: RequestInfo | URL) => {
+      const path = String(input);
+      calls.push(path);
+      return route(path);
+    }),
+  );
+  return calls;
+}
+
+describe("api.backgroundJob / loadBackgroundReport (ADR 0070 D4)", () => {
+  beforeEach(() => {
+    // The apiUrl slug-routing suite above leaves the jsdom URL focused on a member
+    // (/app/agent/m/) — reset to the host window so paths aren't /agents/m/-prefixed.
+    window.history.replaceState({}, "", "/app/");
+  });
+  afterEach(() => vi.unstubAllGlobals());
+
+  it("backgroundJob GETs the by-id route and returns the full row", async () => {
+    const calls = stubFetch(() =>
+      json({ id: JOB, status: "completed", subagent_type: "researcher", description: "dig", result: "the FULL report" }),
+    );
+    const job = await api.backgroundJob(JOB);
+    expect(calls).toEqual([`/api/background/${JOB}`]);
+    expect(job.id).toBe(JOB);
+    expect(job.result).toBe("the FULL report");
+  });
+
+  it("loadBackgroundReport resolves the by-id result without touching the list", async () => {
+    const calls = stubFetch(() => json({ id: JOB, status: "completed", result: "full text" }));
+    await expect(loadBackgroundReport(JOB)).resolves.toBe("full text");
+    expect(calls).toEqual([`/api/background/${JOB}`]);
+  });
+
+  it("falls back to list-and-filter ONLY on a 404 (pre-ADR-0070 server)", async () => {
+    const calls = stubFetch((path) =>
+      path === `/api/background/${JOB}`
+        ? json({ detail: "not found" }, 404)
+        : json({ enabled: true, jobs: [{ id: JOB, status: "completed", result: "from the list" }] }),
+    );
+    await expect(loadBackgroundReport(JOB)).resolves.toBe("from the list");
+    expect(calls).toEqual([`/api/background/${JOB}`, "/api/background"]);
+  });
+
+  it("404 + job absent from the list → the 'no longer available' placeholder", async () => {
+    stubFetch((path) =>
+      path === `/api/background/${JOB}` ? json({ detail: "gone" }, 404) : json({ enabled: true, jobs: [] }),
+    );
+    await expect(loadBackgroundReport(JOB)).resolves.toMatch(GONE);
+  });
+
+  it("a completed row with an empty result also reads as unavailable", async () => {
+    stubFetch(() => json({ id: JOB, status: "completed", result: "" }));
+    await expect(loadBackgroundReport(JOB)).resolves.toMatch(GONE);
+  });
+
+  it("non-404 failures PROPAGATE (no silent fallback that hides a real error)", async () => {
+    const calls = stubFetch(() => json({ detail: "boom" }, 500));
+    await expect(loadBackgroundReport(JOB)).rejects.toMatchObject({ status: 500 });
+    expect(calls).toEqual([`/api/background/${JOB}`]); // never reached the list
   });
 });

@@ -2,10 +2,12 @@ import { Button } from "@protolabsai/ui/primitives";
 import { Message, MessageAction, MessageActions } from "@protolabsai/ui/ai";
 import { Tooltip } from "@protolabsai/ui/overlays";
 import { Spinner } from "@protolabsai/ui/data";
-import { ArrowDownToLine, Check, Clock, Coins, Copy, GitBranch, Gauge, Maximize2, RotateCcw } from "lucide-react";
+import { ArrowDownToLine, Check, Clock, Coins, Copy, FileText, GitBranch, Gauge, History, Maximize2, RotateCcw } from "lucide-react";
+import { useLayoutEffect, useRef, useState } from "react";
 
 import { openDocument } from "../docviewer";
-import { api } from "../lib/api";
+import { slashCommandName } from "../ext/slashRegistry";
+import { loadBackgroundReport } from "../lib/api";
 import { useUI } from "../state/uiStore";
 import type { ChatMessage, ChatPart, ContextWindow, TurnUsage } from "../lib/types";
 import { ChatComponent } from "./ChatComponent";
@@ -21,6 +23,7 @@ export type ChatMessageActions = {
   copiedId?: string | null;
   onCopy?: (m: ChatMessage) => void;
   onFork?: (m: ChatMessage) => void;
+  onRewind?: (m: ChatMessage) => void;
   onRegenerate?: (id: string) => void;
   lastAssistantId?: string;
   regenDisabled?: boolean;
@@ -43,17 +46,43 @@ export function ChatMessageView({
   const streaming = message.status === "streaming";
   // Per-turn token/cost footer is an opt-out display pref (Settings ▸ Chat, #1372).
   const showChatUsage = useUI((s) => s.showChatUsage);
+  // An issued slash command (/goal …) renders as a distinct user bubble (subtle tint /
+  // monospace / "/" badge) so it reads as a command in history, to operator and agent (#1529).
+  const userSlashCmd = message.role === "user" ? slashCommandName(message.content) : null;
+  // Literal user text — a monospace "/command" chip when it's a slash command, else plain
+  // whitespace-preserving text. Shared by the ordered-parts and history render paths.
+  const renderUserText = (text: string, key?: string) =>
+    slashCommandName(text) ? (
+      <span className="chat-user-text chat-slash-cmd" key={key}>
+        <span className="chat-slash-badge" aria-hidden>
+          /
+        </span>
+        <span className="chat-slash-body">{text.replace(/^\s*\//, "")}</span>
+      </span>
+    ) : (
+      <span className="chat-user-text" key={key}>
+        {text}
+      </span>
+    );
+  // Background-agent report (ADR 0050 → ADR 0070 D4): a finished job's report renders as a
+  // dedicated CARD — none of the streaming/parts machinery below applies (BackgroundWatch
+  // injects it display-only: role "system", plain content, never streams).
+  if (message.report) {
+    return <BackgroundReportCard message={message} report={message.report} />;
+  }
   return (
     <Message
       role={message.role}
       streaming={streaming}
       className={
-        message.report
-          ? "chat-report"
-          : // Any non-report system message is a local note → compact .chat-note card; the
-            // tone modifier is appended only when set, so neutral notes still get the styling.
-            message.role === "system"
-            ? `chat-note${message.noteTone ? ` chat-note--${message.noteTone}` : ""}`
+        // Any system message here is a local note → compact .chat-note card; the tone
+        // modifier is appended only when set, so neutral notes still get the styling.
+        // (Report messages returned above.)
+        message.role === "system"
+          ? `chat-note${message.noteTone ? ` chat-note--${message.noteTone}` : ""}`
+          : // An issued slash command → distinct .chat-slash-msg user bubble (#1529).
+            userSlashCmd
+            ? "chat-slash-msg"
             : undefined
       }
     >
@@ -78,7 +107,7 @@ export function ChatMessageView({
           const { fold, workParts, answerParts } = foldPlan(parts, streaming);
           const renderText = (part: ChatPart, key: string) =>
             part.kind !== "text" || !part.text.trim() ? null : message.role === "user" ? (
-              <span className="chat-user-text" key={key}>{part.text}</span>
+              renderUserText(part.text, key)
             ) : (
               <Markdown key={key}>{part.text}</Markdown>
             );
@@ -117,7 +146,7 @@ export function ChatMessageView({
           ) : null}
           {message.content ? (
             message.role === "user" ? (
-              <span className="chat-user-text">{message.content}</span>
+              renderUserText(message.content)
             ) : (
               <Markdown>{message.content}</Markdown>
             )
@@ -138,31 +167,6 @@ export function ChatMessageView({
       {message.components && message.components.length > 0 && !message.parts?.some((p) => p.kind === "component")
         ? message.components.map((spec, i) => <ChatComponent key={i} spec={spec} />)
         : null}
-      {/* Background-agent report (ADR 0050/0062): the bubble shows the server's preview; this
-          opens the FULL report in the full-screen document viewer (fetched by job id). */}
-      {message.report ? (
-        <Button
-          className="chat-report-open"
-          variant="ghost"
-          size="sm"
-          onClick={() =>
-            openDocument({
-              title: message.report!.title,
-              subtitle: "Background agent report",
-              load: () =>
-                api
-                  .background()
-                  .then(
-                    (r) =>
-                      r.jobs.find((j) => j.id === message.report!.jobId)?.result ||
-                      "_The full report is no longer available — it may have been cleared from the Background agents panel._",
-                  ),
-            })
-          }
-        >
-          <Maximize2 size={14} /> Read full report
-        </Button>
-      ) : null}
       {showChatUsage && message.role === "assistant" && !streaming && (message.usage || message.contextWindow) ? (
         <UsageFooter usage={message.usage} context={message.contextWindow} />
       ) : null}
@@ -178,6 +182,9 @@ export function ChatMessageView({
           {actions.onFork ? (
             <MessageAction label="Fork from here" icon={<GitBranch size={14} />} onClick={() => actions.onFork!(message)} />
           ) : null}
+          {actions.onRewind ? (
+            <MessageAction label="Rewind to here" icon={<History size={14} />} onClick={() => actions.onRewind!(message)} />
+          ) : null}
           {actions.onRegenerate && message.id === actions.lastAssistantId ? (
             <MessageAction
               label="Regenerate"
@@ -188,6 +195,80 @@ export function ChatMessageView({
           ) : null}
         </MessageActions>
       ) : null}
+    </Message>
+  );
+}
+
+// The background-report CARD (ADR 0070 D4). A finished job's report is a document, not a
+// status pill: raised surface + shadow (styling in chat.css), a title header, a clamped
+// excerpt that fades out at the bottom (a teaser — the full text lives in the document
+// viewer), and an explicit "Open report" CTA. The full report is fetched BY ID
+// (GET /api/background/{id}); loadBackgroundReport keeps a legacy list-and-filter
+// fallback for pre-ADR-0070 servers. The whole card is click-to-open as a convenience
+// (guarded so a text selection is never stolen); the Button is the accessible control.
+function BackgroundReportCard({
+  message,
+  report,
+}: {
+  message: ChatMessage;
+  report: NonNullable<ChatMessage["report"]>;
+}) {
+  const open = () =>
+    openDocument({
+      title: report.title,
+      subtitle: "Background agent report",
+      load: () => loadBackgroundReport(report.jobId),
+    });
+  // The bottom fade-out is a CLAMP indicator, not decoration: apply it only when the
+  // excerpt actually overflows its max-height. An unconditional mask scales to the
+  // element's own box, so a SHORT report (which fits entirely) would have its last
+  // line faded toward invisible — the report's conclusion, misread as truncation.
+  // Re-measured on resize (width changes rewrap the text and move the overflow point).
+  const excerptRef = useRef<HTMLDivElement | null>(null);
+  const [clamped, setClamped] = useState(false);
+  useLayoutEffect(() => {
+    const el = excerptRef.current;
+    if (!el) return;
+    const measure = () => setClamped(el.scrollHeight > el.clientHeight + 1);
+    measure();
+    const ro = new ResizeObserver(measure);
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [message.content]);
+  return (
+    <Message role={message.role} className="chat-report">
+      <div
+        className="chat-report-card"
+        onClick={() => {
+          // Convenience click-anywhere — but selecting excerpt text must not open.
+          if (window.getSelection()?.isCollapsed !== false) open();
+        }}
+      >
+        <div className="chat-report-head">
+          <FileText size={16} aria-hidden />
+          <div className="chat-report-titles">
+            <span className="chat-report-title">{report.title}</span>
+            <span className="chat-report-sub">Background report</span>
+          </div>
+        </div>
+        {message.content ? (
+          <div ref={excerptRef} className={`chat-report-excerpt${clamped ? " chat-report-excerpt--clamped" : ""}`}>
+            <Markdown>{message.content}</Markdown>
+          </div>
+        ) : null}
+        <div className="chat-report-cta">
+          <Button
+            className="chat-report-open"
+            size="sm"
+            onClick={(e) => {
+              e.stopPropagation(); // the card's own click-to-open would double-fire
+              open();
+            }}
+          >
+            <Maximize2 size={14} /> Open report
+          </Button>
+        </div>
+      </div>
     </Message>
   );
 }

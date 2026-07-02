@@ -20,7 +20,7 @@ from graph.middleware.memory import SessionSummaryMiddleware
 from graph.middleware.message_capture import MessageCaptureMiddleware
 from graph.state import ProtoAgentState
 from graph.subagents.config import SUBAGENT_REGISTRY
-from tools.lg_tools import HITL_TOOL_NAMES, _session_id_from, get_all_tools
+from tools.lg_tools import HITL_TOOL_NAMES, _session_id_from, drop_disabled_tools, get_all_tools
 
 
 def _build_middleware(config: LangGraphConfig, knowledge_store=None, skills_index=None, extra_middleware=None):
@@ -98,6 +98,8 @@ def _build_middleware(config: LangGraphConfig, knowledge_store=None, skills_inde
                 top_k=config.knowledge_top_k,
                 skills_index=_skills_index,
                 skills_top_k=config.skills_top_k,
+                inject_namespaces=config.knowledge_inject_namespaces,
+                inject_min_trust=config.knowledge_inject_min_trust,
             )
         )
 
@@ -175,6 +177,14 @@ def _resolve_aux_model(config, specific: str = "") -> str | None:
         if cleaned:
             return cleaned
     return None
+
+
+def _incognito_from(state: Any) -> bool:
+    """Whether the CURRENT turn is incognito, read from injected graph state (the
+    same source ``_session_id_from`` uses — the tracing contextvar is not visible
+    in tool bodies). Propagated onto spawned background jobs (ADR 0070) so their
+    completions honor the no-memory-trail contract (ADR 0069 D3b)."""
+    return bool(state.get("incognito")) if isinstance(state, dict) else False
 
 
 def _auto_background_seconds() -> float:
@@ -366,6 +376,10 @@ async def run_manual_subagent(
     )
     if extra_tools:
         all_tools = all_tools + list(extra_tools)
+    # Operator denylist over the extras (get_all_tools filtered the core set) — the
+    # out-of-graph runner must not see tools the lead graph dropped (parity, see
+    # create_agent_graph).
+    all_tools = drop_disabled_tools(all_tools)
     tool_map = {t.name: t for t in all_tools}
     available_subagents = ", ".join(SUBAGENT_REGISTRY.keys()) or "(none configured)"
 
@@ -496,11 +510,15 @@ def _build_task_tools(config: LangGraphConfig, all_tools: list[BaseTool], backgr
             # Resolve the originating session from injected graph state, not the
             # tracing contextvar — the contextvar reads empty in a tool body, so
             # the completion could never drain back to the spawning chat (ADR 0050).
+            # The state's incognito flag rides along (ADR 0070): a job spawned from
+            # an incognito thread must leave no memory trail at completion (no
+            # push-resume, no knowledge indexing) — the report still drains here.
             job_id = await background_mgr.spawn(
                 origin_session=_session_id_from(state),
                 subagent_type=subagent_type,
                 description=description,
                 prompt=prompt,
+                origin_incognito=_incognito_from(state),
             )
             return job_id
 
@@ -668,6 +686,7 @@ def _build_task_tools(config: LangGraphConfig, all_tools: list[BaseTool], backgr
                     subagent_type=st,
                     description=desc,
                     prompt=prm,
+                    origin_incognito=_incognito_from(state),
                 )
                 started += 1
                 lines.append(f"Task {i}: {job_id} ({st}: {desc})")
@@ -797,6 +816,19 @@ def create_agent_graph(
     """
     llm = create_llm(config)
 
+    # Sync the operator denylist from THIS config — the server boot/reload path already
+    # set it, but out-of-server builders (eval sweeps, scripts) pass a config directly
+    # and would otherwise silently keep whatever the process global last held.
+    from tools.lg_tools import set_disabled_tools
+
+    set_disabled_tools(getattr(config, "tools_disabled", []))
+
+    # Everything the denylist drops, across every assembly seam below. Stamped on the
+    # graph (like bound_tools) so the operator Tools tab can render disabled tools as
+    # toggled-off rows — without this a disabled tool vanishes from the catalog and
+    # can never be re-enabled from the console.
+    disabled_tools: list = []
+
     all_tools = get_all_tools(
         knowledge_store,
         scheduler=scheduler,
@@ -813,10 +845,16 @@ def create_agent_graph(
         graph_config=config,
         # Lets knowledge_ingest detach a slow URL/media ingest as a background job (ADR 0050).
         background_mgr=background_mgr,
+        dropped=disabled_tools,
     )
 
     if extra_tools:
         all_tools.extend(extra_tools)
+    # Operator denylist (config ``tools.disabled``) over the plugin/MCP extras too —
+    # get_all_tools already filtered the core set, but extra_tools bypassed it. Applied
+    # BEFORE the subagent tool_map snapshot below so a disabled tool can't ride into a
+    # subagent via an allowlist either.
+    all_tools = drop_disabled_tools(all_tools, disabled_tools)
 
     if include_subagents:
         all_tools.extend(
@@ -851,6 +889,13 @@ def create_agent_graph(
         if _produced:
             all_tools.extend(_produced if isinstance(_produced, list) else [_produced])
 
+    # Operator denylist, final pass — covers the tools appended since the extra_tools
+    # filter above (task/task_batch, the filesystem tools incl. ``run_command``, late-seam
+    # tools). Sits before the deferred build so search_tools never advertises a dropped
+    # name. This is what makes ``tools.disabled: [run_command]`` actually work (#1527-era
+    # gap: the filter used to live only inside get_all_tools, which fs tools bypass).
+    all_tools = drop_disabled_tools(all_tools, disabled_tools)
+
     # Deferred tools (ADR 0005 #3) — opt-in progressive disclosure. The
     # search_tools meta-tool is built over the full set (so it can surface any
     # of them) and ToolDeferralMiddleware trims the per-call schemas to base +
@@ -860,6 +905,12 @@ def create_agent_graph(
 
         keep = resolve_deferred_keep(config.tools_deferred_keep)
         all_tools.append(build_search_tools_tool(all_tools, keep))
+        # The meta-tool is denylistable like everything else — without this pass,
+        # ``tools.disabled: [search_tools]`` silently re-binds it (it's appended after
+        # the final filter above), which a Tools-tab row toggle would surface as a
+        # switch that snaps back on. Everything else was already filtered, so only
+        # search_tools can drop here.
+        all_tools = drop_disabled_tools(all_tools, disabled_tools)
 
     middleware = _build_middleware(
         config, knowledge_store, skills_index=skills_index, extra_middleware=extra_middleware
@@ -891,6 +942,9 @@ def create_agent_graph(
     # and drifting from it (set_goal advertised-but-unbound bd-2aa; task /
     # filesystem / execute_code under-reported bd-67j).
     agent.bound_tools = list(all_tools)
+    # The denylist's complement — what ``tools.disabled`` dropped, kept as tool objects
+    # so /api/tools can list them (name/description/category) as toggle-off rows.
+    agent.disabled_tools = list(disabled_tools)
     return agent
 
 

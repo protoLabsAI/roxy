@@ -2,6 +2,7 @@ import { useQuery } from "@tanstack/react-query";
 import { DropdownSelect, Field, FormField, Input, RadioCard, RadioCardGroup, SecretInput, Textarea } from "@protolabsai/ui/forms";
 import { Button, Callout } from "@protolabsai/ui/primitives";
 import { Alert, Spinner } from "@protolabsai/ui/data";
+import { useToast } from "@protolabsai/ui/overlays";
 import {
   Bot,
   Check,
@@ -23,6 +24,7 @@ import { errMsg } from "../lib/format";
 import { lucideIcon } from "../lib/lucideIcon";
 import { acpAgentsQuery, archetypesQuery } from "../lib/queries";
 import type { AgentConfig, Archetype, ConfigPayload } from "../lib/types";
+import { personaSoul } from "./persona";
 
 // Four steps: intro, then "who the agent is" (name + persona), then "how it thinks"
 // (the model/coding-agent runtime), then a summary. Identity + persona are one step.
@@ -153,9 +155,9 @@ export function SetupWizard({
 }) {
   const [step, setStep] = useState<Step>("welcome");
   const [state, setState] = useState<WizardState>(() => defaultState());
-  // Starter archetypes (Basic + Project Manager + installed bundles) — the same
-  // source the fleet new-agent picker uses. Each carries a base SOUL the persona
-  // step seeds when picked (ADR 0042).
+  // Starter archetypes (the archetype-catalog: Basic + Custom, plus any installed bundle
+  // that self-registers) — the same GET /api/archetypes source the fleet new-agent picker
+  // uses. Each carries a base SOUL the persona step seeds when picked (ADR 0042).
   const archetypes = useQuery(archetypesQuery());
   const acpAgentList = useQuery(acpAgentsQuery()).data?.agents ?? [];
   const [models, setModels] = useState<string[]>([]);
@@ -168,6 +170,9 @@ export function SetupWizard({
   // Result of the last "Test connection" probe (a real completion). null = not
   // yet tested; invalidated whenever the key/base/model changes.
   const [tested, setTested] = useState<null | { ok: boolean; error: string }>(null);
+  // The bundle-install outcome is surfaced as a toast (not an in-wizard Callout): finishing
+  // setup unmounts the wizard, so a Callout would vanish before it's read.
+  const toast = useToast();
 
   const index = steps.indexOf(step);
 
@@ -271,9 +276,11 @@ export function SetupWizard({
 
   // Picking an archetype card seeds the editor with that archetype's base SOUL
   // — the same archetypes the fleet new-agent picker offers. The textarea stays
-  // freely editable below; this is an explicit "load this persona" action.
+  // freely editable below; this is an explicit "load this persona" action. A bundle
+  // archetype may ship no inline persona, so fall back to the base SOUL rather than
+  // blanking the editor (see personaSoul).
   function pickArchetype(a: Archetype) {
-    update({ archetype: a.id, soul: a.soul });
+    update({ archetype: a.id, soul: personaSoul(a, archetypeList) });
   }
 
   // Pre-fill the editor once with the default archetype's base SOUL so the persona
@@ -287,12 +294,12 @@ export function SetupWizard({
     if (!loaded || seededSoul.current || !archetypeList.length || state.soul.trim()) return;
     const a = archetypeList.find((x) => x.id === state.archetype) ?? archetypeList[0];
     seededSoul.current = true;
-    update({ archetype: a.id, soul: a.soul });
+    update({ archetype: a.id, soul: personaSoul(a, archetypeList) });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [loaded, archetypeList, state.soul, state.archetype]);
 
   // The picked archetype drives the finish summary AND (Plan C) the bundle install:
-  // an archetype with a bundle (e.g. Project Manager → pm-stack) installs its plugins
+  // an archetype with a bundle (e.g. Product Manager → product-stack) installs its plugins
   // into this host on finish, so the persona arrives WITH its tools.
   const pickedArchetype = archetypeList.find((a) => a.id === state.archetype);
   const personaLabel = pickedArchetype?.label ?? state.archetype;
@@ -376,28 +383,39 @@ export function SetupWizard({
       if (state.initTasks) {
         await api.initTasks();
       }
-      // Plan C: if the chosen archetype carries a plugin bundle (e.g. Project
-      // Manager → pm-stack), install it into THIS host on finish — so the new user
+      // Plan C: if the chosen archetype carries a plugin bundle (e.g. Product
+      // Manager → product-stack), install it into THIS host on finish — so the new user
       // gets the persona AND its tools/board in one shot, not just the prose.
       // installPlugin auto-enables + hot-reloads the bundle's plugins (no restart).
       // A failure is non-fatal: setup is already written, so we finish anyway and
       // point the user at Settings ▸ Plugins.
+      // Surface the outcome as a TOAST, not an in-wizard Callout: onFinished() below
+      // unmounts the wizard (setup_complete flips true), so a Callout would vanish before
+      // it's read — especially the enable/failure guidance the user needs to act on. The
+      // in-progress "Setting up…" message stays inline (the wizard is still open during the
+      // install await).
       if (pickedBundle) {
         setMessage(`Setting up the ${personaLabel} tools — this can take a few seconds…`);
         try {
           const r = await api.installPlugin(pickedBundle);
-          setMessage(
-            r.enable_error
-              ? `Setup complete. The ${personaLabel} tools installed but couldn't auto-enable (${r.enable_error}) — turn them on in Settings ▸ Plugins.`
-              : `Setup complete — ${personaLabel} tools are ready.`,
-          );
+          if (r.enable_error) {
+            toast({
+              tone: "info",
+              title: "Setup complete",
+              message: `${personaLabel} tools installed but couldn't auto-enable (${r.enable_error}) — turn them on in Settings ▸ Plugins.`,
+            });
+          } else {
+            toast({ tone: "success", title: "Setup complete", message: `${personaLabel} tools are ready.` });
+          }
         } catch (exc) {
-          setMessage(
-            `Setup complete, but installing the ${personaLabel} tools failed (${errMsg(exc)}). You can add them later in Settings ▸ Plugins.`,
-          );
+          toast({
+            tone: "error",
+            title: "Setup complete",
+            message: `Installing the ${personaLabel} tools failed (${errMsg(exc)}). Add them later in Settings ▸ Plugins.`,
+          });
         }
       } else {
-        setMessage(response.message);
+        toast({ tone: "success", title: "Setup complete", message: response.message || "Your agent is ready." });
       }
       onFinished();
     } catch (exc) {

@@ -37,6 +37,12 @@ export type ClientSlashCommand = {
   description: string;
   /** Optional usage hint. */
   usage?: string;
+  /** Optional developer-flag id (ADR 0068). When set, the host lists and dispatches the
+   *  command only while the flag resolves ON (`useFlagPredicate`) — a flag-off command
+   *  behaves as if it were never registered (the token falls through to the server /
+   *  draft path). Registration itself is unconditional, so flipping the flag needs no
+   *  re-registration. */
+  flag?: string;
   /** Run when the user picks or submits `/<name>`. Return `true` if handled (the send is
    *  short-circuited + the draft cleared); return `false` to fall through to the default
    *  (insert `/<name> ` into the draft to edit + send). Fire async work and return `true`
@@ -63,4 +69,36 @@ export function registeredSlashCommands(): ClientSlashCommand[] {
 export function findSlashCommand(token: string): ClientSlashCommand | undefined {
   const t = (token || "").trim().toLowerCase();
   return _commands.find((c) => c.name === t);
+}
+
+/** Parse the slash-command token the caret currently sits in — powers the MID-INPUT
+ *  popover (#1530), so typing "/" opens the menu at ANY cursor position, not only when
+ *  "/" is the first character. A token is a "/" at the start of the input OR immediately
+ *  after whitespace, running up to the caret with no intervening whitespace. Returns the
+ *  `query` (the text after the "/", up to the caret — what filters the popover), the token's
+ *  `start` index, and its `end` index (the token runs to the next whitespace, which may be
+ *  PAST the caret when completing mid-token — both bound a caret-anchored replace that
+ *  preserves surrounding text), or null when the caret is not inside a token. */
+export function slashTokenAt(
+  text: string,
+  caret: number,
+): { query: string; start: number; end: number } | null {
+  const pos = Math.max(0, Math.min(caret, text.length));
+  let start = pos;
+  while (start > 0 && !/\s/.test(text[start - 1])) start -= 1;
+  if (text[start] !== "/") return null;
+  // End of the token = next whitespace at/after the caret, so completing with the caret in
+  // the MIDDLE of "/token" replaces the whole token, not just up to the caret (no tail left).
+  let end = pos;
+  while (end < text.length && !/\s/.test(text[end])) end += 1;
+  return { query: text.slice(start + 1, pos), start, end };
+}
+
+/** The command name of a user message that IS a slash command (e.g. "/goal ship it" →
+ *  "goal"), or null. Used to render an issued command as a distinct user bubble (#1529).
+ *  Anchored at the start and requiring a letter-led word that ends at whitespace or EOL, so
+ *  a file path like "/home/user" (a "/" followed by more path) is NOT mistaken for one. */
+export function slashCommandName(content: string): string | null {
+  const m = /^\/([a-z][\w-]*)(?=\s|$)/i.exec(content.trim());
+  return m ? m[1] : null;
 }

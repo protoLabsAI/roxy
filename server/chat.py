@@ -26,7 +26,11 @@ from runtime.state import STATE
 log = logging.getLogger("protoagent.server")
 
 
-_BG_RESULT_CAP = 6000  # chars of a background result injected into the spawning turn
+# Chars of a background result injected into the spawning turn. Shrunk 6000 → 3000
+# (ADR 0070 D2): a substantial report is now ALSO indexed into the knowledge store at
+# completion, so the notification carries a summary-sized excerpt plus a pointer to
+# the searchable full text instead of a third of the context window.
+_BG_RESULT_CAP = 3000
 
 
 def _drain_background_messages(session_id: str) -> list:
@@ -53,7 +57,22 @@ def _drain_background_messages(session_id: str) -> list:
     for j in jobs:
         result = j.result or ""
         if len(result) > _BG_RESULT_CAP:
-            result = result[:_BG_RESULT_CAP] + f"\n\n…[truncated to {_BG_RESULT_CAP} chars]"
+            # Completed, non-incognito reports this size were indexed at completion
+            # (ADR 0070 D2) — say so; incognito/failed/chained (background-origin)
+            # ones only live in the jobs DB.
+            searchable = (
+                " — the full report is indexed and searchable via memory_recall"
+                if (
+                    j.status == "completed"
+                    and not getattr(j, "origin_incognito", False)
+                    and not (j.origin_session or "").startswith("background:")
+                )
+                else ""
+            )
+            result = result[:_BG_RESULT_CAP] + (
+                f"\n\n…[truncated to {_BG_RESULT_CAP} chars{searchable}; the operator can open "
+                f"the full text from the console background report card (job id {j.id})]"
+            )
         body = (
             "<task-notification>\n"
             "A background agent finished a task you delegated earlier:\n"
@@ -99,11 +118,11 @@ def _goal_continuation_config(config: dict, goal_state) -> dict:
     Same-session goals reuse ``config`` (the checkpointer keeps the transcript so the model
     sees prior iterations). Fresh-context goals (Ralph loop) get a scoped, per-iteration
     ``thread_id`` so the checkpointer starts clean each turn — derived from the CURRENT
-    ``config`` thread_id so the streaming (``a2a:…``) and non-streaming (``chat:…``) drive
-    loops build it identically instead of each hand-rolling it. (They had drifted: the two
-    paths re-derived the base thread_id differently and only the streaming one set
-    ``recursion_limit`` — this unifies both.) Durable state lives in the goal's plan
-    artifact on disk, not the thread.
+    ``config`` thread_id so the streaming and non-streaming drive loops (both ``a2a:…``
+    since ADR 0069 unified the prefix) build it identically instead of each hand-rolling
+    it. (They had drifted: the two paths re-derived the base thread_id differently and
+    only the streaming one set ``recursion_limit`` — this unifies both.) Durable state
+    lives in the goal's plan artifact on disk, not the thread.
     """
     if not (goal_state and getattr(goal_state, "fresh_context", False)):
         return config
@@ -281,7 +300,14 @@ def _setup_required_message() -> list[dict[str, Any]]:
 # ---------------------------------------------------------------------------
 
 
-async def chat(message: str, session_id: str, *, model: str | None = None) -> list[dict[str, Any]]:
+async def chat(
+    message: str,
+    session_id: str,
+    *,
+    model: str | None = None,
+    incognito: bool = False,
+    hitl_resume: bool = False,
+) -> list[dict[str, Any]]:
     """Route a user message through LangGraph and return the final assistant
     response as a list of ``{"role": "assistant", "content": ...}`` dicts.
 
@@ -289,11 +315,15 @@ async def chat(message: str, session_id: str, *, model: str | None = None) -> li
     endpoint. The A2A handler uses ``_chat_langgraph_stream`` instead to
     capture tool events and emit the cost-v1 DataPart on the terminal
     artifact. ``model`` overrides the lead model for this turn (per-tab / per
-    OpenAI request); unset → the configured default.
+    OpenAI request); unset → the configured default. ``incognito`` (ADR 0069
+    D3b) marks the turn as leaving no memory trail: no session-summary
+    persistence, no memory injection. ``hitl_resume`` marks the message as the
+    operator's answer to a pending HITL interrupt (#1560 — the desktop /api/chat
+    fallback's analogue of the streaming path's ``hitl_resume`` metadata).
     """
     if STATE.graph is None:
         return _setup_required_message()
-    return await _chat_langgraph(message, session_id, model=model)
+    return await _chat_langgraph(message, session_id, model=model, incognito=incognito, hitl_resume=hitl_resume)
 
 
 # Cap tool input/output previews so a single frame stays small on the wire.
@@ -389,8 +419,8 @@ async def _clear_pending_interrupt(config: dict) -> None:
 
 def _last_tool_text(result) -> str:
     """The last tool result's text in a turn — the fallback when a turn produced
-    no assistant text (e.g. a ``wait`` yield, whose 'Yielding…' confirmation is a
-    ToolMessage, not an AIMessage)."""
+    no assistant text (e.g. a ``wait`` yield, whose 'Wait scheduled…' confirmation
+    is a ToolMessage, not an AIMessage)."""
     from langchain_core.messages import ToolMessage
 
     for msg in reversed((result or {}).get("messages", [])):
@@ -400,7 +430,15 @@ def _last_tool_text(result) -> str:
 
 
 async def _run_turn_stream(
-    message: str, session_id: str, config: dict, *, resume_value=None, images=None, model=None, reasoning_effort=None
+    message: str,
+    session_id: str,
+    config: dict,
+    *,
+    resume_value=None,
+    images=None,
+    model=None,
+    reasoning_effort=None,
+    incognito=False,
 ):
     """Run one graph turn over ``astream_events``.
 
@@ -437,6 +475,10 @@ async def _run_turn_stream(
         else {
             "messages": _drain_background_messages(session_id) + [human],
             "session_id": session_id,
+            # Incognito (ADR 0069 D3b): always stamped explicitly — the channel
+            # persists in the checkpointer, so an omitted key would silently
+            # inherit a previous turn's value instead of the caller's intent.
+            "incognito": bool(incognito),
             # Per-tab model + reasoning-effort override (ModelOverrideMiddleware reads
             # both); omit each key when unset so the configured default applies.
             **({"model": model} if model else {}),
@@ -811,7 +853,10 @@ def _thread_lock(thread_id: str) -> asyncio.Lock:
 # Live operator turns carry an empty origin (they keep parking — a human is watching);
 # inbound `a2a` calls are excluded too, because the remote caller can itself resume the
 # input-required task. For everything here, we auto-answer the interrupt instead of parking.
-_AUTONOMOUS_ORIGINS = frozenset({"scheduler", "inbox", "webhook", "background"})
+# "background-resume" is the ADR 0070 push-resume nudge — server-fired like the rest
+# (the manager discards the A2A response), so a briefing turn that asks a question
+# must auto-answer, not park.
+_AUTONOMOUS_ORIGINS = frozenset({"scheduler", "inbox", "webhook", "background", "background-resume"})
 
 # What we resume an autonomous turn's HITL interrupt with, so the agent stops waiting and
 # finishes the turn instead of deadlocking. Bounded by the cap below so a model that keeps
@@ -823,6 +868,65 @@ _AUTONOMOUS_HITL_SENTINEL = (
     "input — proceed using your best judgment and explicitly state any assumption you made."
 )
 _MAX_AUTONOMOUS_AUTOANSWERS = 3
+
+
+def _is_autonomous(request_metadata: dict | None) -> bool:
+    """Whether this turn runs with no operator watching (see _AUTONOMOUS_ORIGINS)."""
+    return ((request_metadata or {}).get("origin") or "").strip().lower() in _AUTONOMOUS_ORIGINS
+
+
+def _is_hitl_resume(request_metadata: dict | None) -> bool:
+    """Whether this message IS the operator's answer to the pending HITL pause.
+
+    The console stamps ``hitl_resume`` on the message metadata when it submits or
+    dismisses a form / question / approval card — that message must resume the parked
+    interrupt (``Command(resume=…)``), not run a fresh graph turn. A2A callers that
+    resume properly (message/send on the parked taskId) never need this marker — the
+    executor already flips ``resume`` for them."""
+    return bool((request_metadata or {}).get("hitl_resume"))
+
+
+# _hold_if_hitl_pending's "this message answers the pending interrupt" signal — a
+# sentinel (not a string) so it can never collide with an interrupt VALUE.
+_HITL_RESUME = object()
+
+
+async def _hold_if_hitl_pending(message: str, session_id: str, config: dict, *, request_metadata: dict | None):
+    """The HITL hold (#1560): decide what a FRESH message may do while this thread is
+    parked at a ``request_user_input`` / ``ask_human`` / approval ``interrupt()``.
+
+    LangGraph treats fresh input on an interrupted thread as "abandon the interrupt and
+    continue" — the un-answered tool_call is left dangling (later stripped by
+    ToolCallRepairMiddleware) and the model sees the new message BEFORE (and instead of)
+    the form answer, while the parked task can never resolve. So while a HITL interrupt
+    is pending:
+
+    - the operator's actual answer (``hitl_resume`` metadata) → resume the graph
+      properly (returns the ``_HITL_RESUME`` sentinel);
+    - any other operator message → HOLD it: park it in the per-session steering queue
+      (returns the interrupt payload). It stays queued while the form is open — the
+      queue only drains at a model call, and the parked graph makes none — and folds in
+      via ``SteeringMiddleware`` at the FIRST model call after the form resolves
+      (submitted OR dismissed), i.e. immediately after the form response, in arrival
+      order. A dismissal is also a resume, so held messages can never deadlock; the
+      pending-form state itself lives in the durable LangGraph checkpoint (re-read
+      here every time), so a restart can't strand the hold.
+
+    Autonomous turns are exempt (they must never park — unchanged clobber semantics),
+    and with no pending interrupt this returns ``None`` and the turn is untouched.
+    Callers must hold the per-thread lock (the check must not race a parking turn)."""
+    if _is_autonomous(request_metadata):
+        return None
+    pending_val = await _pending_interrupt_value(config)
+    if pending_val is None:
+        return None
+    if _is_hitl_resume(request_metadata):
+        return _HITL_RESUME
+    from graph import steering
+
+    steering.enqueue(session_id, message)
+    log.info("[hitl] holding operator message for session %s — form pending", session_id)
+    return pending_val
 
 
 async def _run_native_turn(message, session_id, config, *, request_metadata=None, resume=False, images=None):
@@ -837,6 +941,9 @@ async def _run_native_turn(message, session_id, config, *, request_metadata=None
     # runs — initial, kicker, goal continuation. Unset → the configured default.
     _model = ((request_metadata or {}).get("model") or "").strip() or None
     _effort = ((request_metadata or {}).get("reasoning_effort") or "").strip() or None
+    # Incognito thread (ADR 0069 D3b): the console/A2A caller sets metadata
+    # `incognito: true` per message — no session persistence, no memory injection.
+    _incognito = bool((request_metadata or {}).get("incognito"))
     # When a goal is already active, the whole turn is goal-driven (suppress cross-session
     # prior_sessions on the initial turn + kicker, matching the continuation turns).
     goal_active = STATE.goal_controller is not None and STATE.goal_controller.active_goal(session_id) is not None
@@ -849,7 +956,7 @@ async def _run_native_turn(message, session_id, config, *, request_metadata=None
     # An autonomous turn (no operator watching) must never deadlock on a HITL pause: when one
     # of these turns hits input_required we resume the graph with a "no operator" sentinel and
     # run another pass, up to a cap, instead of parking the task forever (see _AUTONOMOUS_*).
-    _autonomous = ((request_metadata or {}).get("origin") or "").strip().lower() in _AUTONOMOUS_ORIGINS
+    _autonomous = _is_autonomous(request_metadata)
     _resume_value = (message if resume else None)
     _auto_answers = 0
     with goal_turn(goal_active):
@@ -864,6 +971,7 @@ async def _run_native_turn(message, session_id, config, *, request_metadata=None
                 images=images,
                 model=_model,
                 reasoning_effort=_effort,
+                incognito=_incognito,
             ):
                 if kind == "__raw__":
                     accumulated_raw = payload
@@ -931,7 +1039,7 @@ async def _run_native_turn(message, session_id, config, *, request_metadata=None
             cont_raw = ""
             with goal_turn():
                 async for kind, payload in _run_turn_stream(
-                    decision.message, session_id, cont_config, model=_model, reasoning_effort=_effort
+                    decision.message, session_id, cont_config, model=_model, reasoning_effort=_effort, incognito=_incognito
                 ):
                     if kind == "__raw__":
                         cont_raw = payload
@@ -1138,6 +1246,20 @@ async def _chat_langgraph_stream(
             # queue; different contexts never block each other). The turn body lives in
             # _run_native_turn so the lock wraps it without a deep in-line reindent.
             async with _thread_lock(_tid):
+                # HITL hold (#1560): while this thread is parked at a form/question/
+                # approval interrupt, a fresh operator message is HELD in the steering
+                # queue (it folds in right after the form response) and the turn re-parks
+                # on the same payload; the marked form answer converts to a real resume.
+                # No pending interrupt ⇒ hold is None and nothing changes.
+                if not resume:
+                    hold = await _hold_if_hitl_pending(
+                        message, session_id, config, request_metadata=request_metadata
+                    )
+                    if hold is _HITL_RESUME:
+                        resume = True
+                    elif hold is not None:
+                        yield ("input_required", _interrupt_payload(hold))
+                        return
                 async for frame in _run_native_turn(
                     message, session_id, config, request_metadata=request_metadata, resume=resume, images=images
                 ):
@@ -1162,7 +1284,124 @@ async def _chat_langgraph_stream(
             tracing.flush()
 
 
-async def _chat_langgraph(message: str, session_id: str, *, model: str | None = None) -> list[dict[str, Any]]:
+def _compaction_message(result: dict) -> str:
+    """Human-readable status line for a compaction result — surfaced as the
+    system-note in the chat thread (and returned to non-UI callers)."""
+    reason = result.get("reason") or ""
+    if reason == "too_short":
+        return f"Nothing to compact — this conversation is already short ({result.get('kept', 0)} messages)."
+    if reason == "no_store":
+        return (
+            "Compaction skipped — no searchable knowledge store is configured, so the raw history "
+            "couldn't be archived. Nothing was changed (your full context is intact)."
+        )
+    if reason in ("empty", "empty_archive", "archive_error"):
+        return "Compaction skipped — the conversation couldn't be archived, so nothing was changed."
+    if reason in ("no_summary", "summary_error"):
+        return (
+            f"Archived {result.get('archived_chunks', 0)} chunk(s) to searchable memory, but the summary "
+            "couldn't be generated — kept your full context rather than compacting it."
+        )
+    if reason == "no_checkpointer":
+        return "Compaction unavailable — no conversation checkpoint to compact."
+    removed, kept = result.get("removed", 0), result.get("kept", 0)
+    return (
+        f"Compacted this conversation — archived {removed} older message(s) to searchable memory and kept the "
+        f"last {kept}. The agent now carries a summary of the earlier messages plus the recent ones, at a "
+        f"fraction of the token cost; the full raw history stays searchable via memory recall."
+    )
+
+
+async def compact_session(session_id: str, *, request_metadata: dict | None = None) -> dict:
+    """Compact a chat session's live context (the ``/compact`` gesture, #1527).
+
+    Resolves the session's checkpointer ``thread_id`` (the A2A ``a2a:<session_id>``
+    thread — the one the live streaming turns write to) and runs
+    ``compact_thread`` under the per-thread lock, so a compaction can never race a
+    live streaming turn on the same thread (mirrors the turn driver). Returns the
+    ``compact_thread`` result dict plus a human-readable ``message``.
+    """
+    base = {"summary": "", "archived_chunks": 0, "kept": 0, "removed": 0, "archived": False, "refused": True}
+    if STATE.graph is None:
+        return {**base, "reason": "setup", "message": "Setup required — finish the setup wizard first."}
+
+    from graph.compaction_op import compact_thread
+
+    tid = _resolve_thread_id(request_metadata, session_id)
+    async with _thread_lock(tid):
+        result = await compact_thread(
+            STATE.graph,
+            STATE.checkpointer,
+            STATE.knowledge_store,
+            STATE.graph_config,
+            tid,
+            session_id,
+        )
+    return {**result, "message": _compaction_message(result)}
+
+
+def _rewind_message(result: dict) -> str:
+    """Human-readable status line for a rewind result (surfaced to non-UI callers /
+    logs; the console just truncates its own thread on success)."""
+    reason = result.get("reason") or ""
+    if reason == "not_found":
+        return "Couldn't rewind — that message is no longer in the agent's live context."
+    if reason == "no_checkpointer":
+        return "Rewind unavailable — no conversation checkpoint to rewind."
+    if reason == "noop":
+        return "Nothing to rewind — that's already the last message."
+    return f"Rewound the conversation — discarded {result.get('removed', 0)} later message(s)."
+
+
+async def rewind_session(
+    session_id: str,
+    *,
+    message_id: str | None = None,
+    index: int | None = None,
+    content: str | None = None,
+    occurrence: int | None = None,
+    request_metadata: dict | None = None,
+) -> dict:
+    """Rewind a chat session's live context to a target message (the "Rewind to
+    here" gesture, #1535): discard everything after it and rewrite the LangGraph
+    checkpoint in place.
+
+    Resolves the session's checkpointer ``thread_id`` (the A2A ``a2a:<session_id>``
+    thread the live streaming turns write to) and runs ``rewind_thread`` under the
+    per-thread lock, so a rewind can never race a live streaming turn on the same
+    thread (mirrors ``compact_session``). The checkpoint is the agent's REAL
+    context, so a client-only truncate would leave it intact — the rewrite here is
+    what actually rolls the agent's memory back. Returns the ``rewind_thread``
+    result dict plus a human-readable ``message``.
+    """
+    base = {"found": False, "kept": 0, "removed": 0}
+    if STATE.graph is None:
+        return {**base, "reason": "setup", "message": "Setup required — finish the setup wizard first."}
+
+    from graph.rewind_op import rewind_thread
+
+    tid = _resolve_thread_id(request_metadata, session_id)
+    async with _thread_lock(tid):
+        result = await rewind_thread(
+            STATE.graph,
+            STATE.checkpointer,
+            tid,
+            target_index=index,
+            target_id=message_id,
+            target_content=content,
+            occurrence=occurrence,
+        )
+    return {**result, "message": _rewind_message(result)}
+
+
+async def _chat_langgraph(
+    message: str,
+    session_id: str,
+    *,
+    model: str | None = None,
+    incognito: bool = False,
+    hitl_resume: bool = False,
+) -> list[dict[str, Any]]:
     """Non-streaming LangGraph entry — used by the console + OpenAI-compat."""
     from observability import tracing
     from langchain_core.messages import HumanMessage, AIMessage
@@ -1170,7 +1409,10 @@ async def _chat_langgraph(message: str, session_id: str, *, model: str | None = 
     from graph.goals.goal_turn import goal_turn
 
     # Per-turn model override (ModelOverrideMiddleware reads state["model"]).
-    _model_extra = {"model": model} if (model or "").strip() else {}
+    # Incognito is stamped explicitly every turn (the channel persists in the
+    # checkpointer — an omitted key would inherit the previous turn's value).
+    _state_extra = {"model": model} if (model or "").strip() else {}
+    _state_extra["incognito"] = bool(incognito)
 
     async with tracing.trace_session(
         session_id=session_id,
@@ -1205,11 +1447,12 @@ async def _chat_langgraph(message: str, session_id: str, *, model: str | None = 
             if parsed_skill is not None:
                 message = _skill_directive(*parsed_skill)
 
-            # `chat:` namespaces non-streaming sessions in the shared checkpointer,
-            # apart from the A2A `a2a:` ones (was `gradio:` — renamed when the Gradio
-            # UI was removed; non-streaming chat is short-lived so the one-time
-            # re-key on upgrade is harmless).
-            config = {"configurable": {"thread_id": f"chat:{session_id}"}}
+            # Same thread-id resolution as the streaming path (ADR 0069 D4): the
+            # non-streaming turns used to key `chat:{session_id}` apart from the
+            # streaming `a2a:{session_id}` ones, so the SAME session reached via
+            # both APIs split into two histories. Old `chat:*` checkpoints orphan
+            # once on upgrade — non-streaming chat is short-lived, so harmless.
+            config = {"configurable": {"thread_id": _resolve_thread_id(None, session_id)}}
 
             def _last_ai(result) -> str:
                 for msg in reversed(result.get("messages", [])):
@@ -1222,11 +1465,43 @@ async def _chat_langgraph(message: str, session_id: str, *, model: str | None = 
             goal_active = (
                 STATE.goal_controller is not None and STATE.goal_controller.active_goal(session_id) is not None
             )
-            with goal_turn(goal_active):
-                result = await STATE.graph.ainvoke(
-                    {"messages": [HumanMessage(content=message)], "session_id": session_id, **_model_extra},
-                    config=config,
+            # Sharing the streaming thread means sharing its serialization contract:
+            # every other writer to `a2a:{sid}` (the streaming turn driver,
+            # compact_session, rewind_session) holds the per-thread lock — an
+            # unlocked graph turn here could lost-update a concurrent one (e.g. the
+            # desktop /api/chat fallback racing a console /compact on the same tab).
+            async with _thread_lock(config["configurable"]["thread_id"]):
+                # HITL hold (#1560) — same contract as the streaming path: while the
+                # thread is parked at a form/question/approval interrupt, hold a fresh
+                # operator message (it folds in right after the form response) and echo
+                # the pending ask; the marked answer resumes the graph properly.
+                hold = await _hold_if_hitl_pending(
+                    message, session_id, config, request_metadata=({"hitl_resume": True} if hitl_resume else None)
                 )
+                if hold is not None and hold is not _HITL_RESUME:
+                    payload = _interrupt_payload(hold)
+                    question = payload.get("question") or payload.get("title") or "The agent needs input to continue."
+                    return [
+                        {
+                            "role": "assistant",
+                            "content": (
+                                f"🙋 **Input needed first:** {question}\n\n"
+                                "_(Your message is queued — the agent gets it right after you answer.)_"
+                            ),
+                        }
+                    ]
+                if hold is _HITL_RESUME:
+                    from langgraph.types import Command
+
+                    graph_input = Command(resume=message)
+                else:
+                    graph_input = {
+                        "messages": [HumanMessage(content=message)],
+                        "session_id": session_id,
+                        **_state_extra,
+                    }
+                with goal_turn(goal_active):
+                    result = await STATE.graph.ainvoke(graph_input, config=config)
             raw = _last_ai(result)
             response = extract_output(raw)
 
@@ -1267,15 +1542,20 @@ async def _chat_langgraph(message: str, session_id: str, *, model: str | None = 
                     # reuse `config`. Same shared helper as the streaming path (no drift).
                     cont_config = _goal_continuation_config(config, decision.state)
 
-                    with goal_turn():
-                        result = await STATE.graph.ainvoke(
-                            {
-                                "messages": [HumanMessage(content=decision.message)],
-                                "session_id": session_id,
-                                **_model_extra,
-                            },
-                            config=cont_config,
-                        )
+                    # Lock the BASE thread (mirrors the streaming driver, which holds it
+                    # across the whole goal loop): same-session iterations write `config`'s
+                    # thread directly; fresh-context ones still exclude compact/rewind/
+                    # streaming turns keyed on the base id.
+                    async with _thread_lock(config["configurable"]["thread_id"]):
+                        with goal_turn():
+                            result = await STATE.graph.ainvoke(
+                                {
+                                    "messages": [HumanMessage(content=decision.message)],
+                                    "session_id": session_id,
+                                    **_state_extra,
+                                },
+                                config=cont_config,
+                            )
                     nxt = extract_output(_last_ai(result))
                     if nxt:
                         response = nxt
