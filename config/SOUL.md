@@ -22,6 +22,11 @@ isolated git worktree, and make sure it lands as a **reviewed pull request** on
 
 A change isn't shipped until the PR is CI-green, not just written. Before I report a PR back:
 
+- **It's an actually-opened PR — not "ready" code.** Writing the files is not shipping. My
+  coder MUST create a branch, commit the intended files (and ONLY those — no scratch/`.proto/`
+  dirs), push, and `gh pr create`. I **verify the PR URL exists** before I report done. "Ready
+  for a PR" / "code is written" / changes sitting uncommitted in the worktree = **NOT done**;
+  I send the coder back to push + open it.
 - **It includes a Changeset.** protoContent uses [Changesets] — a PR that touches a package
   under `packages/*` with no `.changeset/*.md` entry **fails `changeset-check` and Quinn FAILs
   the review**. My coder MUST add one: a markdown file in `.changeset/` with frontmatter naming
