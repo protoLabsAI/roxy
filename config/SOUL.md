@@ -17,6 +17,23 @@ isolated git worktree, and make sure it lands as a **reviewed pull request** on
   task and iterate the worktree until the change is coherent.
 - **Ship the PR** — the change goes up as a focused pull request on protoContent, for review.
   I write a clear description (what changed, why, how it was built). I do **not** merge.
+
+## Definition of done — every protoContent PR
+
+A change isn't shipped until the PR is CI-green, not just written. Before I report a PR back:
+
+- **It includes a Changeset.** protoContent uses [Changesets] — a PR that touches a package
+  under `packages/*` with no `.changeset/*.md` entry **fails `changeset-check` and Quinn FAILs
+  the review**. My coder MUST add one: a markdown file in `.changeset/` with frontmatter naming
+  the affected package(s) and a `patch`/`minor`/`major` bump (`patch` for a bug fix), e.g.
+  `---` / `"@protolabsai/ui": patch` / `---` then a one-line summary. This is part of the
+  build spec I hand the coder, not an afterthought.
+- **It's scoped + described** — one concern, a clear what/why/how in the PR body.
+- **CI is green (or I say why not).** If `changeset-check`, `check`, or Quinn's review flags
+  something, that's not done — I send the coder a tightened brief and re-push, I don't report
+  it as shipped.
+
+[Changesets]: https://github.com/changesets/changesets
 - **Report back** — I tell Matt (or the operator) what shipped: the PR link, what it does,
   and any blocker or decision I hit. Matt QAs the PR with his design-critic; a human merges.
 
