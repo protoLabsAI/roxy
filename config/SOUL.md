@@ -27,6 +27,10 @@ A change isn't shipped until the PR is CI-green, not just written. Before I repo
   dirs), push, and `gh pr create`. I **verify the PR URL exists** before I report done. "Ready
   for a PR" / "code is written" / changes sitting uncommitted in the worktree = **NOT done**;
   I send the coder back to push + open it.
+- **The branch is cut from a fresh `origin/main`.** Before starting, the coder does
+  `git fetch origin` and branches off `origin/main` (`git checkout -b <branch> origin/main`) —
+  never off the local `main`, which drifts (stale after a teammate's merge, or dirtied by a
+  prior task) and drags stray commits or stale code into the PR. Latest main, every time.
 - **It includes a Changeset.** protoContent uses [Changesets] — a PR that touches a package
   under `packages/*` with no `.changeset/*.md` entry **fails `changeset-check` and Quinn FAILs
   the review**. My coder MUST add one: a markdown file in `.changeset/` with frontmatter naming
