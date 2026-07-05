@@ -162,10 +162,11 @@ class A2aAdapter(Adapter):
         return d
 
     async def dispatch(self, d: Delegate, query: str, *, timeout: float | None = None) -> str:
+        import asyncio
+
         import httpx
 
         import security
-        from tools.peer_tools import _TERMINAL, _extract_text
 
         blocked = security.check_url(d.url)
         if blocked:
@@ -178,6 +179,24 @@ class A2aAdapter(Adapter):
             if d.auth_scheme == "apiKey":
                 headers["X-API-Key"] = d.auth_token
 
+        # A2A 1.0 (a2a-sdk >=1.0): JSON-RPC methods `SendMessage` / `GetTask`, the
+        # `ROLE_USER` enum, and a `result.task` envelope. The pre-1.0 `message/send`
+        # + lowercase `user` is the v0.3 LEGACY dialect (a2a-sdk `compat/v0_3`), which
+        # the fleet servers reject with -32601 — so we speak the current spec here.
+        def _text(result) -> str | None:
+            task = (result or {}).get("task", result) or {}
+            for art in task.get("artifacts") or []:
+                chunks = [p.get("text", "") for p in art.get("parts", []) if p.get("text")]
+                if any(chunks):
+                    return "\n".join(c for c in chunks if c)
+            msg = (task.get("status") or {}).get("message") or {}
+            chunks = [p.get("text", "") for p in (msg.get("parts") or []) if p.get("text")]
+            return "\n".join(c for c in chunks if c) or None
+
+        def _terminal(state) -> bool:
+            return str(state or "").upper().endswith(
+                ("COMPLETED", "FAILED", "CANCELED", "CANCELLED", "REJECTED"))
+
         async def _rpc(client, method, params):
             body = {"jsonrpc": "2.0", "id": str(uuid.uuid4()), "method": method, "params": params}
             r = await client.post(d.url, json=body, headers=headers)
@@ -188,24 +207,25 @@ class A2aAdapter(Adapter):
                 raise DelegateError(str(data["error"]))
             return data.get("result") or {}
 
-        async with httpx.AsyncClient(timeout=timeout or 30) as client:
-            result = await _rpc(client, "message/send", {"message": {
-                "role": "user", "parts": [{"kind": "text", "text": query}],
+        async with httpx.AsyncClient(timeout=timeout or 60) as client:
+            result = await _rpc(client, "SendMessage", {"message": {
+                "role": "ROLE_USER", "parts": [{"text": query}],
                 "messageId": str(uuid.uuid4()),
             }})
-            text = _extract_text(result)
+            text = _text(result)
             if text:
                 return text
-            task_id = result.get("id")
-            state = (result.get("status") or {}).get("state")
-            import asyncio
+            task = (result or {}).get("task", result) or {}
+            task_id = task.get("id")
+            state = (task.get("status") or {}).get("state")
             polls = 0
-            while task_id and state not in _TERMINAL and polls < 30:
+            while task_id and not _terminal(state) and polls < 30:
                 await asyncio.sleep(1.0)
                 polls += 1
-                result = await _rpc(client, "tasks/get", {"id": task_id})
-                state = (result.get("status") or {}).get("state")
-            text = _extract_text(result)
+                result = await _rpc(client, "GetTask", {"name": task_id})
+                task = (result or {}).get("task", result) or {}
+                state = (task.get("status") or {}).get("state")
+            text = _text(result)
             if text:
                 return text
             raise DelegateError(f"no text returned (state={state})")
