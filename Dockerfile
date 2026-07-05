@@ -41,6 +41,20 @@ RUN set -eux; \
     rm -f "/tmp/${asset}" "/tmp/${asset}.sha256"; \
     br --version
 
+# Node.js + protoCLI (`proto`) — the ACP coding agent roxy's coders drive.
+# roxy is an orchestrator: she decomposes work and hands the actual code-writing to
+# a CLI coder over ACP (`proto --acp`, the coding_agent plugin's client). protoCLI is
+# the fleet-native coder — a node CLI (npm @protolabsai/proto) that talks to the same
+# gateway roxy uses (no extra cloud key). Node 20 LTS via NodeSource; ~150MB. `proto`
+# is invoked per-feature in an isolated git worktree, so git (above) + proto is the
+# whole coder toolchain. Pin PROTOCLI_VERSION to upgrade deterministically.
+ARG PROTOCLI_VERSION=latest
+RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
+    && apt-get install -y --no-install-recommends nodejs \
+    && rm -rf /var/lib/apt/lists/* \
+    && npm install -g "@protolabsai/proto@${PROTOCLI_VERSION}" \
+    && command -v proto && proto --version || (echo "proto install failed" >&2; exit 1)
+
 # Non-root sandbox user
 ARG SANDBOX_UID=1001
 RUN useradd -m -s /bin/bash -u ${SANDBOX_UID} sandbox

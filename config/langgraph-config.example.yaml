@@ -1,266 +1,83 @@
-# Roxy — ProtoMaker Portfolio Manager (a protoAgent fork)
+# Roxy — protoContent Delivery Manager (SHIPPED TEMPLATE).
 #
-# Roxy MONITORS and UNBLOCKS a portfolio of ProtoMaker workspaces — she does
-# not write code. Copy this to ``config/langgraph-config.yaml`` (gitignored)
-# and set your real project paths + A2A bearer there. The committed file is the
-# example template. See docs (upstream): guides/operator-fork.md.
+# This is the tracked `.example` that seeds the live config into the config volume on
+# first boot (graph/config_io.ensure_live_config). Edit HERE — the untracked
+# config/langgraph-config.yaml is a developer's local copy (git- + docker-ignored) and
+# never reaches the image.
+#
+# Roxy takes a build brief (from Matt over A2A, or the operator), hands the actual coding
+# to a protoCLI coder confined to a protoContent working clone, and makes sure it lands as
+# a REVIEWED PR on protoLabsAI/protoContent. She directs + reports; she never merges.
+# See config/SOUL.md for the persona.
+#
+# Runtime shape: gateway at http://gateway:4000/v1 (OPENAI_API_KEY = gateway key); the
+# coder (proto) inherits the container env — gateway key, GH_TOKEN, and the git credential
+# rewrite the entrypoint installs — so it branches/commits/pushes and opens the PR itself
+# (gh) in /sandbox/work/protoContent (cloned by the entrypoint).
 
-# Agent identity — namespaces metrics/stores + names the agent on its card.
 identity:
-  name: roxy
+  name: roxy-protoContent
 
-# A2A — Roxy is summoned over A2A (message/send · message/stream) and dispatched
-# by the protoWorkstacean bus. Set a bearer so inbound is authenticated (or via
-# the A2A_AUTH_TOKEN env). Leave blank only for trusted local testing.
+# Inbound A2A bearer — Matt (and the operator) summon Roxy over A2A (message/send,
+# message/stream). Left UNSET on purpose: an empty config token makes the server fall
+# back to the A2A_AUTH_TOKEN env (the Infisical ROXY_A2A_TOKEN the stack injects), so the
+# real secret isn't shadowed by a baked dev token. Matt reads the same value via
+# credentialsEnv:ROXY_A2A_TOKEN. Set a literal token here only for a bare local run.
 auth:
-  token: ""  # set in the live (gitignored) config or A2A_AUTH_TOKEN env
+  token: ""
 
-# Fenced multi-project filesystem (ADR 0007) — Roxy's read-only window onto the
-# portfolio. Every project is write:false (she monitors, never edits);
-# allow_run gives her git/gh/br READS via run_command. Replace these example
-# projects with your real workspace paths in the live config.
-filesystem:
-  enabled: true
-  allow_run: true
-  projects:
-    - { name: orbis,    path: /work/ORBIS,    write: false }
-    - { name: pixelgen, path: /work/pixelgen, write: false }
-    # - { name: <project>, path: /work/<dir>, write: false }
-
-
+# Model — the protolabs LiteLLM gateway. `protolabs/reasoning` is the live alias.
+# api_key blank on purpose → falls back to OPENAI_API_KEY (the gateway key, from
+# Infisical). Do NOT hardcode the secret here.
 model:
   provider: openai
-  # Default LiteLLM gateway alias. Set an alias called ``protolabs/reasoning``
-  # (or whatever you rename it to) in your gateway config pointing at the
-  # real model — swapping the model becomes a gateway edit, not a code
-  # change in the fork.
   name: protolabs/reasoning
   api_base: http://gateway:4000/v1
-  api_key: ""  # falls back to OPENAI_API_KEY env
+  api_key: ""           # → OPENAI_API_KEY env (from Infisical)
   temperature: 0.2
-  max_tokens: 32768  # 32k — required headroom for the Qwen models we run
+  max_tokens: 32768
   max_iterations: 50
-  request_timeout: 120   # per-call timeout (s) on the model client — bounds a hung/slow gateway
-  max_retries: 2         # transient-error retries inside the client
-  # Advanced sampling — all optional; omit to use the gateway / model-card
-  # defaults. top_p + presence_penalty are standard OpenAI params; top_k +
-  # repetition_penalty + chat_template_kwargs ride extra_body for vLLM-style
-  # gateways. Typical self-hosted Qwen card:
-  #   top_p: 0.95
-  #   top_k: 20
-  #   presence_penalty: 0.0
-  #   repetition_penalty: 1.05
-  #   chat_template_kwargs: { preserve_thinking: true }
 
-subagents:
-  researcher:
-    enabled: true
-    tools:
-      - current_time
-      - web_search
-      - fetch_url
-      - memory_recall
-      - memory_list
-    max_turns: 40
-    # Per-subagent model override (blank = routing.aux_model, then the main model).
-    # Pin a heavy-reasoning subagent to the main model even when aux_model routes
-    # the rest to a cheaper alias, e.g.:  model: protolabs/reasoning
-    model: ""
+# Plugins. delegates = the fleet spine (inbound A2A + delegate_to, so Roxy can escalate to
+# Matt/operator). coding_agent = the ACP coder (proto) that writes the code. github is
+# intentionally NOT enabled — it isn't baked into this fork, and the coder does its own
+# git/gh (push + `gh pr create`) from its confined shell, returning the PR URL.
+plugins:
+  enabled: [delegates, coding_agent]
 
+# coding_agent (ADR 0024) — proto (protoCLI) as an ACP coder, CONFINED to the protoContent
+# working clone. It inherits the container env (gateway key for its ~/.proto/settings.json,
+# GH_TOKEN + git credential rewrite from the entrypoint), so per task it branches off main,
+# edits, commits, pushes, and opens the PR. `auto` permissions = file+shell authority scoped
+# to the workdir (that dir IS the confinement boundary). Coding is slow — generous timeouts.
+coding_agent:
+  default_timeout_s: 900
+  agents:
+    - name: proto
+      command: proto
+      args: ["--acp"]
+      workdir: /sandbox/work/protoContent   # the entrypoint clones protoContent here
+      permissions: auto
+      timeout_s: 1200
+
+# filesystem — a READ window onto the same working clone, so Roxy can inspect what the
+# coder actually changed (diffs, files) before she reports the PR back. She never writes or
+# runs shell herself (allow_run:false → no HITL-gated run_command stalls headless); the
+# coder does all the writing, inside coding_agent's confinement.
+filesystem:
+  enabled: true
+  allow_run: false
+  projects:
+    - { name: protoContent, path: /sandbox/work/protoContent, write: false }
+
+# Subsystems default ON. Memory/knowledge/scheduler/audit all on.
 middleware:
-  # All four subsystems default ON. The template constructs the
-  # knowledge store + scheduler backends automatically (see
-  # ``server.py::_build_knowledge_store`` and ``_build_scheduler``).
-  # Flip any of these to ``false`` to opt out — the corresponding
-  # tools (memory_*, schedule_*) are dropped from the agent loop
-  # without touching the researcher subagent's tool allowlist.
   knowledge: true
   audit: true
   memory: true
   scheduler: true
 
-knowledge:
-  db_path: /sandbox/knowledge/agent.db
-  # Semantic recall: hybrid FTS5 + vector search (RRF-fused) via embed_model.
-  # Off by default (keyword-only) — turn on once your gateway serves an
-  # embedding model. Degrades to keyword search on embedding outage.
-  # Hybrid semantic + keyword recall (RRF). On by default; falls back to
-  # keyword-only via the circuit breaker if the gateway can't embed.
-  embeddings: true
-  # The embedding model your gateway serves (NOT the chat model). Default is the
-  # protoLabs gateway's; forks on another gateway set theirs (check GET /v1/models).
-  embed_model: qwen3-embedding
-  # Extract durable facts from a conversation on retirement (aux model) and
-  # consolidate them into the store. Rides the harvest pass (ADR 0021).
-  facts: true
-  top_k: 5
-
-# Session memory loading — prior summaries injected into system prompt
-# by KnowledgeMiddleware when it is active. Persistence via MemoryMiddleware
-# uses the same path. Mount a volume at this path to survive container restarts.
-memory:
-  path: /sandbox/memory/
-  max_sessions: 10
-  max_tokens: 2000
-
-# Skill index — SQLite FTS5 store for learned skill-v1 artifacts.
-# Skills emitted by task() are indexed here and injected into the system
-# prompt as a <learned_skills> block at inference time.
-skills:
-  db_path: /sandbox/skills.db
-  top_k: 5
-  max_tokens: 2000
-
-# A2A card identity (#570) — declare your fork's advertised skills + card
-# description HERE (or contribute skills from a plugin via register_a2a_skill)
-# rather than editing server/a2a.py. Omit both and the template ships one
-# free-text "chat" placeholder so a fresh clone stays callable. The card `name`
-# already follows identity.name / AGENT_NAME.
-a2a:
-  # Deploy-time guard: refuse to start if the card would advertise a loopback URL
-  # (e.g. A2A_PUBLIC_URL unset on a deployed agent → http://127.0.0.1:.../a2a,
-  # unreachable to remote consumers). Leave off for local/desktop runs (loopback
-  # is correct same-host); turn ON for any agent other agents dial over the network.
-  # require_routable_url: true
-  # description: "Acme Bot — turns support tickets into triaged, drafted replies."
-  # skills:
-  #   - id: triage_ticket
-  #     name: Triage Ticket
-  #     description: Classify a support ticket and draft a reply.
-  #     tags: [support]
-  #     examples: ["triage ticket #1234"]
-  #     # Structured output (optional): the executor enforces the schema (#476)
-  #     # and emits a typed DataPart advertised in the card's output_modes.
-  #     # result_mime: application/vnd.protolabs.triage-v1+json
-  #     # output_schema: { type: object, properties: { ... }, required: [ ... ] }
-
-# Outbound A2A SSRF guard (#572) — opt-in CIDR allowlist for the destinations
-# the agent POSTs to: push-notification callbacks (caller-supplied) + peer_consult
-# (PEER_<HANDLE>_URL). Empty/unset = today's behavior (callbacks keep their
-# default private-IP denylist; peer_consult is unrestricted). When set, a
-# destination is allowed only if every resolved IP falls inside a listed CIDR —
-# e.g. lock outbound to your tailnet / private fleet network.
-security:
-  # callback_allowlist:
-  #   - 100.64.0.0/10   # tailnet
-  #   - 10.0.0.0/8      # private fleet
-
-# Workflows — reusable declarative multi-step subagent recipes (ADR 0002),
-# run via the run_workflow tool. Bundled examples ship in the repo workflows/
-# dir; `dir` is the writable root for user/agent-emitted recipes (same
-# /sandbox→~/.protoagent fallback as the stores).
-workflows:
-  enabled: true
-  dir: /sandbox/workflows
-
-# Context compaction — summarize old history near the context limit so long
-# sessions don't overflow the window. ON by default.
-#   trigger: "fraction:0.8" | "tokens:120000" | "messages:80"
-# NOTE: "fraction:"/"tokens:" need the model's context-window profile. A custom
-# gateway alias usually lacks one, so the wiring auto-falls back to a
-# message-count trigger (logged). Set "messages:N" explicitly to be deterministic.
-#   model: a cheaper/faster alias to summarize with (blank = main model).
 compaction:
   enabled: true
-  trigger: "fraction:0.8"
+  trigger: "messages:80"
   keep_messages: 20
-  # model: protolabs/fast
-
-# Conversation checkpointer — persists each chat session's history per
-# thread_id so multi-turn chats survive a server restart. Same
-# /sandbox→~/.protoagent writable fallback as the stores. Blank = in-memory
-# (history cleared on restart).
-checkpoint:
-  db_path: /sandbox/checkpoints.db
-  # Pruning keeps the DB bounded: keep the latest N checkpoints per session,
-  # and drop whole sessions idle past max_age_days. Swept every
-  # prune_interval_hours (0 disables the sweep).
-  keep_per_thread: 5
-  max_age_days: 30
-  prune_interval_hours: 6
-  # When a session is retired (aged out or deleted), summarize it into the
-  # knowledge base (searchable via memory_recall) before dropping the raw
-  # checkpoints. Needs the knowledge middleware enabled.
-  harvest_enabled: true
-
-# Model routing / failover.
-#   aux_model: ONE cheap/fast alias for the non-reasoning calls — context
-#     summarization, goal verification, and subagent delegation all fall back
-#     to it unless they set a specific override. Blank = main model everywhere.
-#   fallback_models: on a primary error, retry on each in order. Empty = none.
-routing:
-  # aux_model: protolabs/fast
-  fallback_models: []
-  #  - claude-haiku-4-5
-
-# Goal mode — route the goal verifier to a cheaper model with `eval_model`
-# (else it uses routing.aux_model, else the main model).
-goal:
-  # eval_model: protolabs/fast
-  max_iterations: 8
-
-# Programmatic tool calling — let the model write ONE Python script that
-# composes several tools in a single turn (collapses long tool-call chains).
-# SECURITY: runs model-authored code in a subprocess (scrubbed env + hard
-# timeout). OFF by default — only enable for trusted models or inside a
-# hardened container. `tools: []` exposes all tools except execute_code itself.
-execute_code:
-  enabled: false
-  timeout: 30
-  tools: []
-
-# Tools — fork customization without editing tools/lg_tools.py.
-#   disabled: drop named core tools from the agent (a fork "keeps what it wants"
-#     by listing the rest here; plugins still ADD tools). Live-reloadable.
-#   deferred: withhold tool schemas until the agent searches for them (cuts the
-#     per-turn footprint past ~15 tools). OFF by default.
-tools:
-  disabled: []
-  # - calculator
-  # - daily_log
-  # deferred:
-  #   enabled: false
-  #   keep: []
-
-# React operator console — the beads/notes APIs accept a project path from
-# the (free-text) UI, so the server, not the client, decides which
-# directories they may touch. The protoAgent repo root is always allowed;
-# add any other project roots you operate on here. Empty = repo root only.
-# Editable in-app from the setup wizard's Workspace step.
-operator:
-  allowed_dirs: []
-  # - /home/kj/projects/my-other-repo
-
-# Discord surface (ADR 0015/0016) — inbound DM gateway. Configure this in-app
-# (setup wizard step / System → Settings → Discord) rather than by hand: the
-# bot_token is stored in the gitignored secrets.yaml overlay, never here.
-# `admin_ids` are the Discord user IDs allowed to DM the bot (empty = anyone).
-# Off until enabled with a token. The DISCORD_BOT_TOKEN / DISCORD_ADMIN_IDS env
-# vars remain a fallback for Docker deploys.
-discord:
-  enabled: false
-  # bot_token: stored in secrets.yaml (set via the UI), not here
-  admin_ids: []
-
-# Google surface (ADR 0017) — Gmail + Calendar via the bundled MCP server.
-# Configure in-app (setup wizard / System → Settings → Google): paste your Google
-# Cloud "Desktop app" OAuth client (id + secret → secrets.yaml), then click
-# "Connect Google" to run the consent flow (opens your browser) — the token is
-# cached in the per-user config dir. When enabled + connected the google MCP
-# server is auto-wired (no mcp.servers editing). `tz` sets day bounds for "today".
-google:
-  enabled: false
-  # client_id: set via the UI
-  # client_secret: stored in secrets.yaml (set via the UI)
-  tz: ""
-
-# Plugins (ADR 0027). Roxy IS the protoMaker portfolio manager via the bundled
-# `protomaker` full-bundle plugin: 12 fleet read/triage/board tools + 7 A2A skills
-# + per-project memory resolver + project-scope middleware (dormant until ADR 0032
-# register_middleware syncs) + the Fleet console dashboard. Enable exactly one of
-# protomaker / fleet-onboarding — protomaker supersedes it. (The universal gh_*
-# triage tools now live in the upstream `github` plugin; add `github` here once it
-# syncs in, and drop the gh_* tools from protomaker.)
-plugins:
-  enabled:
-    - protomaker
