@@ -51,6 +51,101 @@ def test_acp_parse_ok_and_requires_command_workdir():
         ADAPTERS["acp"].parse({"name": "x", "type": "acp", "command": "proto"})  # no workdir
 
 
+def test_acp_parse_manage_git_fields():
+    # Managed git (ADR 0076): off by default; fields parse with sane fallbacks.
+    d = ADAPTERS["acp"].parse({"name": "c", "type": "acp", "command": "proto", "workdir": "/tmp"})
+    assert d.manage_git is False and d.base_branch == "main" and d.branch_prefix == ""
+    d = ADAPTERS["acp"].parse(
+        {
+            "name": "c",
+            "type": "acp",
+            "command": "proto",
+            "workdir": "/tmp",
+            "manage_git": "true",
+            "base_branch": "  develop ",
+            "branch_prefix": "wt-1",
+        }
+    )
+    assert d.manage_git is True and d.base_branch == "develop" and d.branch_prefix == "wt-1"
+
+
+def test_acp_parse_claude_code_alias():
+    # `claude-code` is a convenience alias for the claude-agent-acp adapter (#1116):
+    # the operator's intuitive name maps to the real binary, with no launch args.
+    d = ADAPTERS["acp"].parse(
+        {"name": "cc", "type": "acp", "command": "claude-code", "args": ["--stray"], "workdir": "/tmp"}
+    )
+    assert d.command == "claude-agent-acp" and d.args == []
+
+
+async def test_acp_probe_bare_claude_hints_the_adapter():
+    # `claude` is on PATH but has no native ACP mode — the probe must steer to the
+    # adapter rather than show green (the false-green the old PATH check gave, #1116).
+    d = ADAPTERS["acp"].parse({"name": "x", "type": "acp", "command": "claude", "workdir": "/tmp"})
+    res = await ADAPTERS["acp"].probe(d)
+    assert res["ok"] is False and "claude-agent-acp" in res["error"]
+
+
+async def test_acp_probe_fails_when_handshake_fails(monkeypatch):
+    # A command on PATH + valid workdir that does NOT speak ACP must FAIL the probe —
+    # the core fix for #1116 (PATH+workdir alone gave false confidence).
+    import sys
+
+    from plugins.coding_agent.acp_client import AcpClient, AcpError
+
+    async def _boom(self):
+        raise AcpError("agent exited")
+
+    async def _noop(self):
+        pass
+
+    monkeypatch.setattr(AcpClient, "handshake", _boom)
+    monkeypatch.setattr(AcpClient, "close", _noop)
+    d = ADAPTERS["acp"].parse({"name": "x", "type": "acp", "command": sys.executable, "workdir": "/tmp"})
+    res = await ADAPTERS["acp"].probe(d)
+    assert res["ok"] is False and "handshake failed" in res["error"]
+
+
+async def test_acp_probe_ok_on_successful_handshake(monkeypatch):
+    import sys
+
+    from plugins.coding_agent.acp_client import AcpClient
+
+    async def _ok(self):
+        self._protocol_version = 1
+
+    async def _noop(self):
+        pass
+
+    monkeypatch.setattr(AcpClient, "handshake", _ok)
+    monkeypatch.setattr(AcpClient, "close", _noop)
+    d = ADAPTERS["acp"].parse({"name": "x", "type": "acp", "command": sys.executable, "workdir": "/tmp"})
+    res = await ADAPTERS["acp"].probe(d)
+    assert res["ok"] is True and "handshake OK" in res["detail"]
+
+
+async def test_acp_probe_resolves_command_against_delegate_env_path(monkeypatch):
+    # The probe must resolve the command against the SAME PATH the real spawn uses —
+    # the delegate's env PATH overlaid on the process PATH — so a command reachable
+    # only via the delegate env doesn't red-X the Test button while the spawn would
+    # actually find it (#1299 probe-vs-spawn disagreement).
+    import shutil
+
+    seen: dict = {}
+
+    def fake_which(cmd, path=None):
+        seen["path"] = path
+        return None  # force the not-on-PATH branch (so we never spawn a real process)
+
+    monkeypatch.setattr(shutil, "which", fake_which)
+    d = ADAPTERS["acp"].parse(
+        {"name": "x", "type": "acp", "command": "npx", "workdir": "/tmp", "env": {"PATH": "/custom/bin"}}
+    )
+    res = await ADAPTERS["acp"].probe(d)
+    assert res["ok"] is False and "not on PATH" in res["error"]
+    assert seen["path"] == "/custom/bin"  # resolved against the delegate's env PATH
+
+
 def test_secret_value_wins_then_env(monkeypatch):
     assert _secret({"token": "explicit"}, "token", "credentialsEnv") == "explicit"
     monkeypatch.setenv("MY_TOK", "fromenv")

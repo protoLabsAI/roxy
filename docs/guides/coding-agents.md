@@ -154,8 +154,144 @@ The subprocess **inherits protoAgent's environment** (plus any per-agent `env`).
 Run protoAgent under an account whose ambient credentials you're willing to lend
 the coding agent, or scope the `workdir` to a throwaway checkout.
 
-Coming in a later PR (ADR 0024): live narration of the coding agent's progress
-("Editing app.py") onto A2A working-status frames.
+### In a container, wired to a gateway
+
+The setup above assumes the coder binary is already on `PATH` — true for a local run,
+but a **containerized** protoAgent starts from a bare image with no coder and no model
+credentials. Two things to add to your **deploy** (not the template — this is your
+Dockerfile + entrypoint, `COPY . /opt/protoagent/` already ships your config):
+
+**1. Bake the coder into the image.** For `proto` (a Node CLI), that's Node + one
+`npm i -g`; the other adapters install the same way (`@agentclientprotocol/claude-agent-acp`,
+`@zed-industries/codex-acp`, …):
+
+```dockerfile
+ARG PROTOCLI_VERSION=latest
+RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
+    && apt-get install -y --no-install-recommends nodejs \
+    && rm -rf /var/lib/apt/lists/* \
+    && npm install -g "@protolabsai/proto@${PROTOCLI_VERSION}" \
+    && proto --version   # fail the build if it didn't land
+```
+
+**2. Point the coder at your gateway, not a cloud key.** A CLI coder normally wants its
+own provider API key. To reuse the **same OpenAI-compatible gateway** protoAgent already
+uses — one key, one bill, local models available — write the coder's config at
+**entrypoint** rather than baking it: the sandbox `$HOME` is typically a tmpfs mount that
+would shadow a baked file, and writing at start keeps it idempotent and env-tunable.
+`proto` reads `~/.proto/settings.json`; the shape differs per CLI but the idea is the same
+(base URL → your gateway, key from an env var):
+
+```sh
+# entrypoint.sh — before `exec … python -m server`
+if command -v proto >/dev/null 2>&1; then
+    GATEWAY_URL="${CODER_GATEWAY_URL:-http://gateway:4000/v1}"
+    mkdir -p "$HOME/.proto"
+    cat > "$HOME/.proto/settings.json" <<JSON
+{ "modelProviders": { "openai": [
+    { "id": "my/coder-model", "baseUrl": "${GATEWAY_URL}", "envKey": "OPENAI_API_KEY" }
+  ] },
+  "security": { "auth": { "selectedType": "openai" } },
+  "model": { "name": "my/coder-model" } }
+JSON
+fi
+```
+
+Because the ACP child **inherits protoAgent's environment** (see above), `OPENAI_API_KEY`
+— the gateway key protoAgent already has — flows straight through, and so does anything
+else the coder needs from its shell (e.g. a `GH_TOKEN` for `git push` / `gh pr create`
+from its `workdir` — run by the coder itself in the default mode, or by the framework's
+git harness under `manage_git: true`, §Managed git below). No second secret store.
+
+> The `workdir` still has to be a real, writable checkout of the repo the coder edits —
+> provision it however you like (bake a clone, or `git clone` it at entrypoint with a
+> token). A neat trick to keep the token out of the persisted `.git/config`: set it via a
+> global `url.<https://x-access-token:$TOK@github.com/>.insteadOf` rewrite in the tmpfs
+> `$HOME` — written fresh each boot, never stored in the volume.
+
+### Parallel builds: a worktree-backed coder pool
+
+One coder in one `workdir` is **sequential** — a second `code_with`/`delegate_to` into the
+same directory while the first is mid-edit will collide (shared working tree + index +
+branch). An orchestrator that wants to build several independent things at once (a lead
+fanning issues out to a crew) needs each concurrent coder in its **own** working tree.
+
+The clean way is a **pool of coders over git worktrees**: linked worktrees share one clone's
+`.git` object store but have an isolated working dir, index, and checked-out branch — exactly
+the isolation concurrent coders need, without N full clones.
+
+**1. Provision the worktrees at entrypoint** (cap `N` = your concurrency budget):
+
+```sh
+git clone https://github.com/you/repo /work/repo         # the base clone (on main)
+for i in $(seq 1 "${CODER_POOL:-3}"); do
+    git -C /work/repo worktree add --force -B "pool-$i" "/work/wt-$i" origin/main
+done
+# recreate them fresh each boot — worktrees hold no state you keep (coders push to origin)
+```
+
+**2. Declare one coder per worktree** — same binary, distinct `workdir`:
+
+```yaml
+delegates:
+  - { name: coder-1, type: acp, command: proto, args: ["--acp"], workdir: /work/wt-1, manage_git: true }
+  - { name: coder-2, type: acp, command: proto, args: ["--acp"], workdir: /work/wt-2, manage_git: true }
+  - { name: coder-3, type: acp, command: proto, args: ["--acp"], workdir: /work/wt-3, manage_git: true }
+```
+
+**3. Fan out.** The agent issues several `delegate_to(coder-N, …)` calls in one turn (the
+tool node runs a turn's tool calls concurrently), or several `delegate_to(…,
+background=True)` calls — each lands on a free coder in its own worktree. The pool size is
+the cap; extra work queues.
+
+Two caveats worth planning for: worktrees don't share `node_modules`/build caches (install
+per-worktree, or share a package store), and two parallel PRs that touch the same file will
+conflict at *merge* time (normal parallel-dev friction — rebase the loser), not at build time.
+
+### Managed git: the framework owns branch/commit/push/PR (ADR 0076)
+
+By default the coder owns its own git lifecycle — fine for a single supervised coder in a
+disposable checkout. At pool scale it is the reliability ceiling: coders invent colliding
+branch names (linked worktrees refuse the same branch twice), report "done" without ever
+pushing, open duplicate PRs when one item is fanned to several coders, and `git add -A`
+their scratch into the diff. Every one of those is a *deterministic* step an LLM was asked
+to perform.
+
+`manage_git: true` on an `acp` delegate moves the whole lifecycle into the framework
+(`plugins/coding_agent/git_harness.py`); the coder is told to **edit files and run tests
+only**. Per dispatch, the harness:
+
+1. derives a stable **work-item id** — `delegate_to(…, item_id="issue-42")`, or a hash of
+   the query text when omitted — and **claims** it: a second dispatch of an in-flight item
+   (any coder) is refused instead of duplicated, and an already-open PR for the item's
+   branch short-circuits before the coder even runs;
+2. mints the branch deterministically (`<branch_prefix>/<slug>-<id7>`, prefix defaults to
+   the delegate name) and cuts it from **fresh `origin/<base_branch>`** — never local HEAD;
+3. after the coder finishes: refuses to commit on the base branch (work stays recoverable
+   in the worktree — no completion theater), scans the diff for secrets, commits on the
+   coder's behalf, rebases onto fresh base (a conflict is reported and pushed as-is, not
+   fatal), pushes with `--force-with-lease`, **verifies the remote SHA actually moved**,
+   and opens the PR idempotently (re-runs reuse the existing PR).
+
+The lifecycle is idempotent to a coder that did partial git anyway (its commits are
+adopted, not duplicated), and the run's outcome — branch, verified push, PR URL, or the
+exact reason nothing was published — is appended to the coder's reply.
+
+```yaml
+delegates:
+  - name: coder-1
+    type: acp
+    command: proto
+    args: ["--acp"]
+    workdir: /work/wt-1
+    manage_git: true       # framework-owned git lifecycle
+    base_branch: main      # branches cut from origin/<base>; PRs target it
+    # branch_prefix: wt-1  # optional; defaults to the delegate name
+```
+
+The PR step needs `gh` on PATH and a `GH_TOKEN`/`GITHUB_TOKEN` (the same container env as
+above). Without them the branch is still pushed and verified — the reply just reports the
+PR step's failure instead of a URL.
 
 ## How it works
 

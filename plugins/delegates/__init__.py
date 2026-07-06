@@ -27,7 +27,7 @@ def _build_delegate_to(registry: DelegateRegistry):
     listing = registry.listing()
 
     @tool
-    async def delegate_to(target: str, query: str) -> str:
+    async def delegate_to(target: str, query: str, item_id: str = "") -> str:
         """Hand a question or task to one of your configured delegates and return its reply.
 
         Use this to reach beyond your own context: ask a fleet **agent**, consult
@@ -39,11 +39,15 @@ def _build_delegate_to(registry: DelegateRegistry):
                 description).
             query: the full, self-contained question or instruction — the delegate
                 does not see this conversation, so restate what it needs.
+            item_id: stable work-item id for a coding task on a managed-git coding
+                agent — one PR per id, and a second dispatch of an in-flight id is
+                refused instead of duplicating the work. Use the issue/board id when
+                there is one; leave empty to derive one from the query text.
         """
         if not str(query).strip():
             return "Error: `query` is empty — give the delegate something to do."
         try:
-            return await registry.dispatch(target, query)
+            return await registry.dispatch(target, query, item_id=item_id.strip() or None)
         except DelegateError as exc:
             return f"Error: {exc}"
         except Exception as exc:  # noqa: BLE001 — surface as a tool error string

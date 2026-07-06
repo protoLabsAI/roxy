@@ -150,6 +150,33 @@ def _client_for(spec: dict) -> AcpClient:
     return client
 
 
+async def evict_client(spec: dict) -> bool:
+    """Drop the cached client for ``spec`` AND terminate its subprocess.
+
+    A caller that dispatches into a short-lived, per-call ``workdir`` needs a
+    *deterministic* reap — otherwise each scoped ``workdir`` leaves its own
+    ``AcpClient`` subprocess behind (the cache key includes ``workdir``). Pops
+    the cached client and ``await``s ``client.close()`` so the process actually
+    dies. Returns True if a live client was closed; idempotent.
+    (Backported from upstream for the ADR 0076 adapter surface.)"""
+    client = _CLIENTS.pop(_cache_key(spec), None)
+    if client is None:
+        return False
+    try:
+        await client.close()
+    except Exception:  # noqa: BLE001 — teardown is best-effort
+        log.warning("[coding_agent/%s] close during evict failed", spec.get("name"), exc_info=True)
+    return True
+
+
+async def forget_session(spec: dict) -> bool:
+    """Forget the live ACP session for ``spec`` so the next dispatch starts a
+    fresh ``session/new``. This fork has no persisted-session store (upstream
+    #970), so evicting the live client IS the whole forget — kept as a separate
+    entry point to preserve the upstream adapter contract (ADR 0076). Idempotent."""
+    return await evict_client(spec)
+
+
 def _approved(decision) -> bool:
     return str(decision).strip().lower() in _APPROVALS
 
