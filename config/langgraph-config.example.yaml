@@ -45,20 +45,20 @@ model:
 plugins:
   enabled: [delegates, coding_agent]
 
-# coding_agent (ADR 0024) — proto (protoCLI) as an ACP coder, CONFINED to the protoContent
-# working clone. It inherits the container env (gateway key for its ~/.proto/settings.json,
-# GH_TOKEN + git credential rewrite from the entrypoint), so per task it branches off main,
-# edits, commits, pushes, and opens the PR. `auto` permissions = file+shell authority scoped
-# to the workdir (that dir IS the confinement boundary). Coding is slow — generous timeouts.
+# coding_agent (ADR 0024) — a POOL of protoCLI (proto) ACP coders for PARALLEL builds.
+# Each coder is confined to its OWN linked git worktree of the protoContent clone (wt-1..N,
+# provisioned by the entrypoint: shared .git, isolated working dir + branch), so Roxy can
+# fan independent build items across them concurrently without collisions — up to the pool
+# size (the cap). Each inherits the container env (gateway key for ~/.proto/settings.json,
+# GH_TOKEN + git credential rewrite), branches off origin/main per task, and opens its PR.
+# `auto` permissions = file+shell authority scoped to that worktree. Keep the agent count ==
+# ROXY_CODER_POOL in the stack (default 3). Coding is slow — generous timeouts.
 coding_agent:
   default_timeout_s: 900
   agents:
-    - name: proto
-      command: proto
-      args: ["--acp"]
-      workdir: /sandbox/work/protoContent   # the entrypoint clones protoContent here
-      permissions: auto
-      timeout_s: 1200
+    - { name: proto-1, command: proto, args: ["--acp"], workdir: /sandbox/work/wt-1, permissions: auto, timeout_s: 1200 }
+    - { name: proto-2, command: proto, args: ["--acp"], workdir: /sandbox/work/wt-2, permissions: auto, timeout_s: 1200 }
+    - { name: proto-3, command: proto, args: ["--acp"], workdir: /sandbox/work/wt-3, permissions: auto, timeout_s: 1200 }
 
 # filesystem — a READ window onto the same working clone, so Roxy can inspect what the
 # coder actually changed (diffs, files) before she reports the PR back. She never writes or

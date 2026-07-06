@@ -64,15 +64,44 @@ if [ -n "$PC_GH" ]; then
     git config --global url."https://x-access-token:${PC_GH}@github.com/".insteadOf "https://github.com/"
     mkdir -p "$(dirname "$PC_WORKDIR")"
     if [ -d "$PC_WORKDIR/.git" ]; then
-        echo "[entrypoint] protoContent clone exists → refreshing main"
+        # Hard-reset main to origin, not `pull --ff-only`: a coder that commits onto local
+        # main (instead of a branch) leaves it AHEAD, so ff-only silently no-ops and the
+        # cruft persists — then the NEXT feature branch, cut from the dirty main, drags those
+        # stray commits into its PR. A boot is a clean-slate moment: reset to origin/main and
+        # clean untracked scratch (gitignored files like node_modules are left alone) so every
+        # branch starts from a pristine main.
+        echo "[entrypoint] protoContent clone exists → hard-resetting main to origin/main"
         git -C "$PC_WORKDIR" fetch --prune origin \
-            && git -C "$PC_WORKDIR" checkout main \
-            && git -C "$PC_WORKDIR" pull --ff-only \
+            && git -C "$PC_WORKDIR" checkout -B main origin/main \
+            && git -C "$PC_WORKDIR" clean -fd \
             || echo "[entrypoint] WARN: protoContent refresh failed (using existing checkout)"
     else
         echo "[entrypoint] cloning ${PC_REPO} → ${PC_WORKDIR}"
         git clone "https://github.com/${PC_REPO}.git" "$PC_WORKDIR" \
             || echo "[entrypoint] WARN: protoContent clone failed — the coder will have no repo"
+    fi
+
+    # Coder worktree pool — parallel isolated coders. Roxy fans independent build items
+    # across a pool of ACP coders (proto-1..proto-N in coding_agent config), each confined
+    # to its OWN linked git worktree of this clone: shared .git object store, isolated
+    # working dir + index + branch, so concurrent builds never collide. Cap = ROXY_CODER_POOL
+    # (default 3; keep it == the number of proto-N agents in the config). Recreated fresh off
+    # origin/main each boot (worktrees hold no state we keep — coders push to origin). Each
+    # coder still branches off origin/main per task (per SOUL).
+    POOL="${ROXY_CODER_POOL:-3}"
+    if [ -d "$PC_WORKDIR/.git" ]; then
+        git -C "$PC_WORKDIR" worktree prune 2>/dev/null || true
+        i=1
+        while [ "$i" -le "$POOL" ]; do
+            WT="/sandbox/work/wt-$i"
+            git config --global --add safe.directory "$WT"
+            git -C "$PC_WORKDIR" worktree remove --force "$WT" 2>/dev/null || rm -rf "$WT"
+            git -C "$PC_WORKDIR" worktree add --force -B "pool-$i" "$WT" origin/main 2>/dev/null \
+                && echo "[entrypoint] coder worktree $WT ready" \
+                || echo "[entrypoint] WARN: could not add worktree $WT"
+            i=$((i+1))
+        done
+        echo "[entrypoint] coder pool: ${POOL} worktree(s) at /sandbox/work/wt-1..${POOL}"
     fi
 else
     echo "[entrypoint] WARN: no ROXY_PC_GH_TOKEN/GH_TOKEN — skipping protoContent clone (coder can't push)"
