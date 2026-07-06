@@ -8,9 +8,12 @@
 # bot approval, so we gate at branch protection. Run this once per repo Roxy is onboarded to.
 #
 # What it enforces on <default-branch>:
-#   - required_conversation_resolution = true   → unresolved CodeRabbit/review threads block
 #   - required status checks: `check` + `review` (protoPatch, made blocking on HIGH/MEDIUM)
 #   - enforce_admins = true                     → nobody (incl. bots) bypasses
+# Policy B (chosen): the HARD gates are protoPatch HIGH/MEDIUM + Quinn (approve-on-green now
+# honors unresolved threads via protoWorkstacean#903). We do NOT require conversation
+# resolution — it blocked merges on every trivial CodeRabbit nit and re-review churned threads
+# faster than they could be cleared. Real bugs still block; trivial nits inform, don't gate.
 # It also VERIFIES the blocking protoPatch workflow is present, and warns if not.
 #
 # Idempotent — safe to re-run. Requires: gh authenticated with admin on the repo.
@@ -35,10 +38,10 @@ jq -n --argjson contexts "$CTX_JSON" '{
   enforce_admins:                true,
   required_pull_request_reviews: { required_approving_review_count: 0, dismiss_stale_reviews: false, require_code_owner_reviews: false },
   restrictions:                  null,
-  required_conversation_resolution: true
+  required_conversation_resolution: false
 }' | gh api -X PUT "repos/${REPO}/branches/${BRANCH}/protection" --input - >/dev/null
 
-echo "  ✓ branch protection: conversation-resolution ON, required checks = ${CTX_JSON}, admins enforced"
+echo "  ✓ branch protection: required checks = ${CTX_JSON} (protoPatch HIGH/MEDIUM blocks), admins enforced, conversation-resolution off (policy B)"
 
 # The `review` gate only bites if the blocking protoPatch workflow exists in the repo.
 if gh api "repos/${REPO}/contents/.github/workflows/protopatch-review.yml" >/dev/null 2>&1; then
