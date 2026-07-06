@@ -1,0 +1,80 @@
+# roxy (deployed) — Portfolio Manager: stock protoAgent + the pm-stack bundle.
+# Seeded once to the live config volume (PROTOAGENT_SEED_CONFIG); operator console
+# edits then persist and are never clobbered. Most settings inherit protoAgent's code
+# defaults — only what roxy needs is set.
+identity:
+  name: roxy
+
+model:
+  provider: openai
+  name: protolabs/reasoning
+  api_base: http://gateway:4000/v1   # OPENAI_API_KEY (gateway key) from the stack env
+
+# The Portfolio Manager tier (pm-stack): the manager spine. project_board +
+# agent_browser are installed-but-off (the teams roxy spins up discover them on this host).
+plugins:
+  enabled: [delegates, portfolio, github]
+
+# portfolio (ADR 0055) — roxy orchestrates Lead Engineer teams. team_template is the
+# base team config she clones per spawn (carries the managed-git `proto` coder, ADR 0076).
+# team_archetypes are one-word spinup presets for the repos she runs often: a spawned
+# team inherits roxy's own gateway + OPENAI_API_KEY, so no per-team creds prep.
+portfolio:
+  team_template: /opt/roxy/team-template
+  team_archetypes:
+    protocontent:
+      repo: /sandbox/work/protoContent   # cloned + kept fresh by the entrypoint
+      gate: "pnpm -r build"              # the team's verification command (tune to protoContent)
+
+# github (manager tier): file/triage issues + read PRs/CI across the repos roxy watches.
+# write:true loads the write tools (merge stays confirm-guarded). Bounded by GH_TOKEN scope.
+github:
+  write: true
+  default_repo: protoLabsAI/protoContent
+  repos:
+    - protoLabsAI/protoContent
+
+# Semantic recall ON (fleet-wide default), embeds via the gateway (qwen3-embedding).
+knowledge:
+  embeddings: true
+  embed_model: qwen3-embedding
+
+# A2A agent card (served at /.well-known/agent-card.json) — roxy's PUBLIC fleet identity
+# so matt/jon and the console's Fleet ▸ Discover can reach her. The advertised interface
+# URL is set at boot from A2A_PUBLIC_URL (stack env → http://ava:7872). require_routable_url
+# makes her refuse to start if the card would advertise loopback.
+a2a:
+  require_routable_url: true
+  description: >-
+    roxy — Portfolio Manager for the protoLabs.studio engineering fleet. Orchestrates
+    work across many Lead Engineer teams: spins a team up per project, dispatches
+    features to each team's board over A2A, rolls up a bounded cross-board view, sequences
+    cross-board dependencies, and files/triages the GitHub issues a team can't resolve
+    itself. Runs the standing protoContent team (managed-git coder pool). She manages
+    delivery; she does not write code or merge.
+  skills:
+    - id: portfolio_orchestration
+      name: Portfolio Orchestration
+      description: >-
+        Dispatch features to the right Lead Engineer team, roll up + diff cross-board
+        state, sequence dependencies, and report progress as work merges to done.
+      tags: [portfolio, orchestration, delivery, a2a]
+      examples:
+        - "Ship the compare-view feature on protoContent."
+        - "What's blocked across my teams right now?"
+    - id: team_lifecycle
+      name: Team Lifecycle
+      description: >-
+        Spin up a Lead Engineer team for a repo on demand, dispatch its work, and dispose
+        it once its board drains. Standing teams (protoContent) stay up.
+      tags: [teams, spinup, lifecycle]
+      examples:
+        - "Stand up a team for the ORBIS repo and give it this feature."
+    - id: issue_triage
+      name: Issue Triage
+      description: >-
+        File and triage GitHub issues for anything a team can't unblock itself — an
+        external dependency, a cross-repo ask, a decision that needs a human.
+      tags: [github, issues, triage]
+      examples:
+        - "File an issue for the API change protoContent is blocked on."

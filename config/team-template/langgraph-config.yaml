@@ -1,0 +1,64 @@
+# TEAM TEMPLATE for portfolio_spinup_team — roxy's Lead Engineer teams.
+#
+# Based on the portfolio plugin's shipped example, with ONE deliberate addition:
+# the acp coders run under MANAGED GIT (ADR 0076) — the framework owns
+# branch/commit/push/PR, the coder only edits files. That kills the failure taxonomy
+# a coder-owned git lifecycle produced at pool scale (branch collisions, "edited but
+# never pushed", duplicate PRs, stray scratch files).
+#
+# portfolio_spinup_team clones this dir and fills the per-spawn sentinels:
+#     {{REPO}}       → the repo the team's board manages
+#     {{TEAM_NAME}}  → the team / board name
+#     {{GATE}}       → the pre-PR gate command (empty = none)
+# model.api_base blank → the team INHERITS roxy's gateway (+ her OPENAI_API_KEY via env).
+
+identity:
+  name: "{{TEAM_NAME}}"
+
+model:
+  provider: openai
+  name: protolabs/reasoning
+  api_base: ""        # blank → INHERITS roxy's gateway
+  api_key: ""         # blank → roxy's OPENAI_API_KEY reaches the team via its environment
+  temperature: 0.2
+
+agent_runtime: native
+
+plugins:
+  enabled: [delegates, project_board, coder]
+
+# Coding agents the board's loop dispatches to (ACP). manage_git:true (ADR 0076) makes
+# the framework mint a deterministic branch off origin/<base_branch>, keep the coder
+# edit-only, then commit → rebase → push (--force-with-lease, remote-SHA verified) →
+# open the PR idempotently. base_branch = main; branch_prefix namespaces each coder's
+# branches so siblings in linked worktrees never collide.
+delegates:
+  - { name: proto,  type: acp, command: proto,       args: ["--acp"], workdir: "{{REPO}}", permissions: auto, manage_git: true, base_branch: main, branch_prefix: proto }
+  - { name: claude, type: acp, command: claude-code,                  workdir: "{{REPO}}", permissions: auto, manage_git: true, base_branch: main, branch_prefix: claude }
+  # fusion (ADR 0064 P3) — rung 4, an openai-type completion delegate (can't tool-call,
+  # so it's NOT managed-git; the board seam writes its files into a worktree the harness
+  # then ships). Blank url → inherits roxy's gateway.
+  - { name: fusion, type: openai, model: protolabs/fusion, url: "", api_key: "" }
+
+project_board:
+  repo: "{{REPO}}"            # the repo the board manages; worktrees branch off it
+  coders:                     # escalation ladder (model tier climbs smart → reasoning → opus)
+    smart: proto
+    reasoning: claude
+    opus: claude
+  loop_enabled: true          # auto-dispatch ready features
+  local_gate_cmd: "{{GATE}}"  # pre-PR gate — the repo's real check command (empty = none)
+  coder_solve_fusion_delegate: fusion
+  coder_solve_fusion_k: 2
+
+# coder (ADR 0064) — execution-grounded escalation: greedy → best-of-k → tree-search →
+# fusion, gated on the feature's compiled acceptance tests passing (not an LLM judge).
+coder:
+  delegate: proto
+
+# Fenced filesystem (ADR 0007): the team reads its repo + writes planning/grounding.
+filesystem:
+  enabled: true
+  allow_run: false
+  projects:
+    - { name: "{{TEAM_NAME}}", path: "{{REPO}}", write: true }
