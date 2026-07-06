@@ -45,6 +45,25 @@ model:
 plugins:
   enabled: [delegates, coding_agent]
 
+# delegates (ADR 0025) — the OTHER dev team Roxy coordinates, over A2A (spec-compliant
+# SendMessage/GetTask via the a2a adapter). Roxy OWNS coordination: she assigns general
+# building to her coder pool (coding_agent, below) and design-system / frontend / a11y / QA
+# work to `matt` — jon's DS engineer (+ his design-critic + component-author) — as a second,
+# peer team, then tracks both to completion. matt is reached through jon's hub proxy on
+# ai_default; auth = jon's operator token (JON_API_KEY env). Prefer background (async) A2A so
+# assignments run in parallel and their task ids/states are Roxy's in-flight ledger.
+delegates:
+  - name: matt
+    type: a2a
+    url: http://jon:7870/agents/matt-7689/a2a
+    auth: { scheme: bearer, credentialsEnv: JON_API_KEY }
+    description: >-
+      jon's design-system / frontend engineer team (matt + design-critic + component-author).
+      Assign him design-system, component, accessibility, theme, and DS-review/QA work — he
+      returns a reviewed PR on protoContent or a design-critic verdict. Use him for DS
+      expertise + QA; use the coder pool for general building. He's a peer team, not a coder
+      I drive tool-by-tool.
+
 # coding_agent (ADR 0024) — a POOL of protoCLI (proto) ACP coders for PARALLEL builds.
 # Each coder is confined to its OWN linked git worktree of the protoContent clone (wt-1..N,
 # provisioned by the entrypoint: shared .git, isolated working dir + branch), so Roxy can

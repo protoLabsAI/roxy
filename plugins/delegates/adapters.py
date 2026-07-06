@@ -171,7 +171,10 @@ class A2aAdapter(Adapter):
         blocked = security.check_url(d.url)
         if blocked:
             raise DelegateError(blocked.replace("destination", f"delegate {d.name!r}", 1))
-        headers = {"Content-Type": "application/json"}
+        # A2A-Version is MANDATORY for an a2a-sdk >=1.0 peer — a missing header makes the peer
+        # default to the v0.3 dialect and reject our 1.0 SendMessage ("version '0.3' not
+        # supported"). Declare 1.0 to match the SendMessage/GetTask dialect we speak below.
+        headers = {"Content-Type": "application/json", "A2A-Version": "1.0"}
         if d.auth_token:
             headers["Authorization"] = (
                 f"Bearer {d.auth_token}" if d.auth_scheme != "apiKey" else d.auth_token
