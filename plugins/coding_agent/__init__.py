@@ -241,21 +241,6 @@ def _build_code_with(agents: dict[str, dict], default_timeout_s: float):
             if not _approved(decision):
                 return f"Declined: the operator did not approve running '{agent}' on this task."
 
-        # Branch-collision guard for a worktree pool: sibling coders share one repo's .git
-        # via linked worktrees, and git REFUSES to check out the same branch in two worktrees.
-        # If a lead fans the same item onto several coders, each grabbing a bare shared branch
-        # name, they DEADLOCK (`worktree remove --force` loops — the "crash"). Force each coder
-        # onto its OWN branch namespace so distinct names can never collide. Injected here at
-        # the plugin layer, not left to the caller's prompt, so it always holds.
-        namespaced_task = (
-            f"[worktree isolation] You are coder '{agent}', sharing this repo's git object store "
-            f"with sibling coders through linked worktrees — git refuses the same branch in two "
-            f"worktrees. ALWAYS create your working branch under your own unique prefix "
-            f"'{agent}/' (e.g. `git checkout -b {agent}/<short-slug> origin/main`); NEVER use a "
-            f"bare branch name a sibling might also pick. Everything else proceeds normally.\n\n"
-            f"{task}"
-        )
-
         lock = _LOCKS.setdefault(agent, asyncio.Lock())
         timeout = float(spec.get("timeout_s") or default_timeout_s)
         client = _client_for(spec)
@@ -266,7 +251,7 @@ def _build_code_with(agents: dict[str, dict], default_timeout_s: float):
 
         try:
             async with lock:
-                answer = await client.prompt(namespaced_task, progress_callback=_narrate, timeout=timeout)
+                answer = await client.prompt(task, progress_callback=_narrate, timeout=timeout)
         except AcpError as exc:
             _CLIENTS.pop(_cache_key(spec), None)  # drop so the next call relaunches
             return f"Error: {agent} (coding agent) failed: {exc}"
