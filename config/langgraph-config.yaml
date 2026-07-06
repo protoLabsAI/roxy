@@ -34,6 +34,13 @@ github:
   repos:
     - protoLabsAI/protoContent
 
+# roxy is a Portfolio Manager — she orchestrates via portfolio_* tools, she doesn't shell.
+# Drop run_command entirely (allow_run:false): headless, there's no operator to answer its
+# HITL approval, so any shell call the model attempts stalls the turn forever. Team-side
+# shell (readiness/gate/coder) runs inside the spawned team, not here.
+filesystem:
+  allow_run: false
+
 # Semantic recall ON (fleet-wide default), embeds via the gateway (qwen3-embedding).
 knowledge:
   embeddings: true
