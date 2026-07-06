@@ -111,7 +111,12 @@ class Adapter:
     def parse(self, raw: dict) -> Delegate:
         raise NotImplementedError
 
-    async def dispatch(self, d: Delegate, query: str, *, timeout: float | None = None) -> str:
+    async def dispatch(
+        self, d: Delegate, query: str, *, timeout: float | None = None, item_id: str | None = None
+    ) -> str:
+        """Dispatch ``query`` to ``d``. ``item_id`` is the work-item identity used by
+        adapters that manage a git lifecycle (acp, ADR 0076); identity-less adapters
+        accept and ignore it, so the registry can forward it uniformly."""
         raise NotImplementedError
 
     async def probe(self, d: Delegate) -> dict:
@@ -167,7 +172,9 @@ class A2aAdapter(Adapter):
         d.auth_token = _secret(auth, "token", "credentialsEnv")
         return d
 
-    async def dispatch(self, d: Delegate, query: str, *, timeout: float | None = None) -> str:
+    async def dispatch(
+        self, d: Delegate, query: str, *, timeout: float | None = None, item_id: str | None = None
+    ) -> str:
         import asyncio
 
         import httpx
@@ -298,7 +305,9 @@ class OpenAiAdapter(Adapter):
             d.temperature = 0.4
         return d
 
-    async def dispatch(self, d: Delegate, query: str, *, timeout: float | None = None) -> str:
+    async def dispatch(
+        self, d: Delegate, query: str, *, timeout: float | None = None, item_id: str | None = None
+    ) -> str:
         import httpx
 
         messages = []

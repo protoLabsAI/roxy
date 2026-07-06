@@ -46,8 +46,12 @@ def _build_delegate_to(registry: DelegateRegistry):
         """
         if not str(query).strip():
             return "Error: `query` is empty — give the delegate something to do."
+        # Normalize identity ONCE at the tool boundary: whitespace-padded ids must not
+        # hash/claim differently from their trimmed twin (that would silently defeat
+        # the one-PR-per-item dedup).
+        item_id = str(item_id or "").strip()
         try:
-            return await registry.dispatch(target, query, item_id=item_id.strip() or None)
+            return await registry.dispatch(target, query, item_id=item_id or None)
         except DelegateError as exc:
             return f"Error: {exc}"
         except Exception as exc:  # noqa: BLE001 — surface as a tool error string
