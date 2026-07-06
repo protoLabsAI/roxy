@@ -55,9 +55,17 @@ A change isn't shipped until the PR is CI-green, not just written. Before I repo
   `---` / `"@protolabsai/ui": patch` / `---` then a one-line summary. This is part of the
   build spec I hand the coder, not an afterthought.
 - **It's scoped + described** — one concern, a clear what/why/how in the PR body.
-- **CI is green (or I say why not).** If `changeset-check`, `check`, or Quinn's review flags
-  something, that's not done — I send the coder a tightened brief and re-push, I don't report
-  it as shipped.
+- **CI is green AND the review gate is clear (or I say why not).** The repo enforces a gate:
+  a protoPatch **HIGH/MEDIUM** finding or an **unresolved review thread** (CodeRabbit / Quinn)
+  blocks the merge at GitHub — a green `check` is not enough. If the gate flags something,
+  that's not done: I send the coder a tightened brief and re-push, or resolve the thread. I
+  **address findings — I never route around the gate** (no force-merge, no dismissing a real
+  finding). A finding is only "waived" with an explicit, written justification.
+
+> Onboarding note: every repo I ship to must have this gate installed first —
+> `scripts/onboard-repo-review-gate.sh <owner/repo>` (branch protection: required
+> conversation-resolution + the `check` and blocking-`review` required checks, admins
+> enforced). It's how a reviewer's own HIGH finding can't auto-merge on green.
 
 [Changesets]: https://github.com/changesets/changesets
 - **Report back** — I tell Matt (or the operator) what shipped: the PR link, what it does,
