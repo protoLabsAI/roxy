@@ -38,20 +38,31 @@ model:
   max_tokens: 32768
   max_iterations: 50
 
-# Plugins. delegates = the fleet spine (inbound A2A + delegate_to, so Roxy can escalate to
-# Matt/operator). coding_agent = the ACP coder (proto) that writes the code. github is
-# intentionally NOT enabled — it isn't baked into this fork, and the coder does its own
-# git/gh (push + `gh pr create`) from its confined shell, returning the PR URL.
+# Plugins. delegates = the fleet spine (inbound A2A + delegate_to): Roxy's whole roster —
+# matt over a2a AND the coder pool as managed-git acp delegates (ADR 0076). coding_agent
+# stays enabled as the ACP machinery the acp adapter drives (client cache + permission
+# policy), but declares no agents of its own — dispatch goes through delegate_to.
 plugins:
   enabled: [delegates, coding_agent]
 
-# delegates (ADR 0025) — the OTHER dev team Roxy coordinates, over A2A (spec-compliant
-# SendMessage/GetTask via the a2a adapter). Roxy OWNS coordination: she assigns general
-# building to her coder pool (coding_agent, below) and design-system / frontend / a11y / QA
-# work to `matt` — jon's DS engineer (+ his design-critic + component-author) — as a second,
-# peer team, then tracks both to completion. matt is reached through jon's hub proxy on
-# ai_default; auth = jon's operator token (JON_API_KEY env). Prefer background (async) A2A so
-# assignments run in parallel and their task ids/states are Roxy's in-flight ledger.
+# delegates (ADR 0025) — Roxy's whole roster, one tool (`delegate_to`):
+#
+# • matt — the OTHER dev team, over A2A (spec-compliant SendMessage/GetTask). Roxy OWNS
+#   coordination: design-system / frontend / a11y / QA work goes to matt (jon's DS
+#   engineer + design-critic + component-author, reached through jon's hub proxy on
+#   ai_default; auth = jon's operator token, JON_API_KEY env); general building goes to
+#   the coder pool below. Fan independent assignments in one turn so they run in parallel.
+#
+# • proto-1..3 — the CODER POOL: protoCLI (proto) ACP coders for PARALLEL builds, each
+#   confined to its OWN linked git worktree of the protoContent clone (wt-1..N,
+#   provisioned by the entrypoint: shared .git, isolated working dir + branch).
+#   `manage_git: true` (ADR 0076): the FRAMEWORK owns branch/commit/rebase/push/PR — the
+#   coder only edits + tests. Branch = `<name>/<slug>-<id7>` (prefix defaults to the
+#   delegate name → per-coder namespace, no collisions); base fetched fresh per dispatch;
+#   push is remote-SHA-verified; `gh pr create` is idempotent. Dispatch with `item_id` =
+#   the work-item id so fan-out dedups (one id → one branch → one PR).
+#   `auto` permissions = file+shell authority scoped to that worktree. Keep the pool
+#   size == ROXY_CODER_POOL in the stack (default 3). Coding is slow — generous timeouts.
 delegates:
   - name: matt
     type: a2a
@@ -63,21 +74,23 @@ delegates:
       returns a reviewed PR on protoContent or a design-critic verdict. Use him for DS
       expertise + QA; use the coder pool for general building. He's a peer team, not a coder
       I drive tool-by-tool.
+  - { name: proto-1, type: acp, command: proto, args: ["--acp"], workdir: /sandbox/work/wt-1,
+      permissions: auto, timeout_s: 1200, manage_git: true, base_branch: main,
+      description: "Coder 1 of the pool — general protoContent builds; managed git (edits+tests only, framework opens the PR). Pass item_id." }
+  - { name: proto-2, type: acp, command: proto, args: ["--acp"], workdir: /sandbox/work/wt-2,
+      permissions: auto, timeout_s: 1200, manage_git: true, base_branch: main,
+      description: "Coder 2 of the pool — general protoContent builds; managed git (edits+tests only, framework opens the PR). Pass item_id." }
+  - { name: proto-3, type: acp, command: proto, args: ["--acp"], workdir: /sandbox/work/wt-3,
+      permissions: auto, timeout_s: 1200, manage_git: true, base_branch: main,
+      description: "Coder 3 of the pool — general protoContent builds; managed git (edits+tests only, framework opens the PR). Pass item_id." }
 
-# coding_agent (ADR 0024) — a POOL of protoCLI (proto) ACP coders for PARALLEL builds.
-# Each coder is confined to its OWN linked git worktree of the protoContent clone (wt-1..N,
-# provisioned by the entrypoint: shared .git, isolated working dir + branch), so Roxy can
-# fan independent build items across them concurrently without collisions — up to the pool
-# size (the cap). Each inherits the container env (gateway key for ~/.proto/settings.json,
-# GH_TOKEN + git credential rewrite), branches off origin/main per task, and opens its PR.
-# `auto` permissions = file+shell authority scoped to that worktree. Keep the agent count ==
-# ROXY_CODER_POOL in the stack (default 3). Coding is slow — generous timeouts.
+# coding_agent (ADR 0024) — kept enabled for the ACP client machinery the acp delegate
+# adapter reuses; no agents declared here anymore (the pool lives in `delegates:` above,
+# where the managed-git lifecycle applies). Declaring the same coder in both places would
+# give it a second, UNmanaged dispatch path (code_with) — don't.
 coding_agent:
   default_timeout_s: 900
-  agents:
-    - { name: proto-1, command: proto, args: ["--acp"], workdir: /sandbox/work/wt-1, permissions: auto, timeout_s: 1200 }
-    - { name: proto-2, command: proto, args: ["--acp"], workdir: /sandbox/work/wt-2, permissions: auto, timeout_s: 1200 }
-    - { name: proto-3, command: proto, args: ["--acp"], workdir: /sandbox/work/wt-3, permissions: auto, timeout_s: 1200 }
+  agents: []
 
 # filesystem — a READ window onto the same working clone, so Roxy can inspect what the
 # coder actually changed (diffs, files) before she reports the PR back. She never writes or
