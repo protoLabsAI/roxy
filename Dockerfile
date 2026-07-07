@@ -28,14 +28,24 @@ RUN set -eux; \
 
 # --- coder runtime for spun-up Lead Engineer teams ------------------------------
 # A spawned team's project_board spawn loop dispatches builds to the `proto` acp coder
-# in per-feature git worktrees (git is already in the base). Node 20 LTS via NodeSource;
-# pin PROTOCLI_VERSION to upgrade.
+# in per-feature git worktrees (git is already in the base). The teams also need the
+# repo's real build toolchain to run its pre-PR GATE — for protoContent that's
+# `pnpm -r build`, which requires Node 22 (packageManager: pnpm@10.12.1 declares
+# node>=22) and pnpm ON PATH: its build scripts shell out to `pnpm` (e.g. payload's
+# prebuild → `pnpm generate:importmap`), which fails if pnpm is only reachable via
+# `corepack pnpm`. `corepack enable` installs a real pnpm shim on PATH. Pin versions
+# to upgrade.
 ARG PROTOCLI_VERSION=latest
-RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
+ARG PNPM_VERSION=10.12.1
+RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
     && apt-get install -y --no-install-recommends nodejs \
     && rm -rf /var/lib/apt/lists/* \
+    && corepack enable \
+    && corepack prepare "pnpm@${PNPM_VERSION}" --activate \
     && npm install -g "@protolabsai/proto@${PROTOCLI_VERSION}" \
-    && command -v proto && proto --version || (echo "proto install failed" >&2; exit 1)
+    && command -v proto && proto --version \
+    && command -v pnpm && pnpm --version \
+    && node --version || (echo "coder-runtime install failed (node/pnpm/proto)" >&2; exit 1)
 
 # --- config + persona seeds (seed-not-force; never clobbers live operator edits) --
 COPY config/langgraph-config.yaml /opt/roxy/seed/langgraph-config.yaml

@@ -64,6 +64,32 @@ else
     echo "[roxy] WARN: no ROXY_PC_GH_TOKEN/GH_TOKEN — skipping protoContent clone (team can't push)"
 fi
 
+# --- coder toolchain PREFLIGHT: never start work against a gate that can't run ----
+# Smoke-run the EXACT pre-PR gate on a clean main once at boot. A spawned team's coder
+# runs the same command in its per-feature worktree, so a green preflight proves the
+# coder can actually pass the gate; a red one is an environment problem (missing tool,
+# broken deps, base build failing) to fix BEFORE any coder burns generations on it.
+# The pnpm store lives under /sandbox so deps persist across image rolls and the
+# per-worktree install is a warm-cache no-op (~seconds). Result is surfaced in the log
+# and left as /sandbox/.preflight-failed for the operator/board to read.
+PC_GATE="${ROXY_PC_GATE:-pnpm install --frozen-lockfile --prefer-offline && pnpm -r build}"
+rm -f /sandbox/.preflight-failed
+if [ -d "$PC_WORKDIR/.git" ] && command -v pnpm >/dev/null 2>&1; then
+    pnpm config set store-dir /sandbox/.pnpm-store >/dev/null 2>&1 || true
+    echo "[roxy] PREFLIGHT: running the coder gate on clean main -> ${PC_GATE}"
+    if ( cd "$PC_WORKDIR" && eval "$PC_GATE" ) >/tmp/preflight.log 2>&1; then
+        echo "[roxy] PREFLIGHT OK: gate is runnable — teams may dispatch work."
+    else
+        echo "[roxy] !!! PREFLIGHT FAILED: the coder gate does not pass on clean main." >&2
+        tail -25 /tmp/preflight.log >&2
+        echo "[roxy] !!! Coder environment is broken — do NOT dispatch work until fixed." >&2
+        cp /tmp/preflight.log /sandbox/.preflight-failed 2>/dev/null || date > /sandbox/.preflight-failed
+    fi
+elif [ -d "$PC_WORKDIR/.git" ]; then
+    echo "[roxy] !!! PREFLIGHT SKIPPED: pnpm not on PATH — coder gate 'pnpm -r build' can't run." >&2
+    date > /sandbox/.preflight-failed
+fi
+
 # --- hand off to the stock upstream launch ---------------------------------------
 echo "[roxy] prep done -> exec stock protoAgent entrypoint"
 exec /opt/protoagent/entrypoint.sh
