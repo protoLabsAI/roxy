@@ -9,7 +9,8 @@
 # portfolio_spinup_team clones this dir and fills the per-spawn sentinels:
 #     {{REPO}}       → the repo the team's board manages
 #     {{TEAM_NAME}}  → the team / board name
-#     {{GATE}}       → the pre-PR gate command (empty = none)
+# (The pre-PR gate is no longer a per-spawn sentinel: local_gate_cmd is "auto", so the
+#  board DISCOVERS the gate from {{REPO}} itself — see project_board.local_gate_cmd below.)
 # model.api_base blank → the team INHERITS roxy's gateway (+ her OPENAI_API_KEY via env).
 
 identity:
@@ -54,7 +55,11 @@ project_board:
     reasoning: proto-reasoning # protocli @ protolabs/reasoning
     opus: proto-reasoning     # protocli @ protolabs/reasoning (no separate opus binary)
   loop_enabled: true          # auto-dispatch ready features
-  local_gate_cmd: "{{GATE}}"  # pre-PR gate — the repo's real check command (empty = none)
+  local_gate_cmd: "auto"      # DISCOVER the pre-PR gate from the repo (package.json
+                              # ci/check script → `pnpm run <it>`, Makefile/justfile ci
+                              # target, else `pnpm -r --if-present typecheck build test`).
+                              # Repo-declared so local == its own CI; never transcribed.
+                              # Override with an explicit command; "" = no gate.
   coder_solve_fusion_delegate: fusion
   coder_solve_fusion_k: 2
 

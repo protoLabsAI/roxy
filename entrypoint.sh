@@ -65,31 +65,55 @@ else
 fi
 
 # --- coder toolchain PREFLIGHT: never start work against a gate that can't run ----
-# Smoke-run the EXACT pre-PR gate on a clean main once at boot. A spawned team's coder
-# runs the same command in its per-feature worktree, so a green preflight proves the
-# coder can actually pass the gate; a red one is an environment problem (missing tool,
-# broken deps, base build failing) to fix BEFORE any coder burns generations on it.
-# The pnpm store lives under /sandbox so deps persist across image rolls and the
-# per-worktree install is a warm-cache no-op (~seconds). Result is surfaced in the log
-# and left as /sandbox/.preflight-failed for the operator/board to read.
-# Gate = install + build + TEST. A build-only gate can't catch a coder's broken test
-# assertions (they compile fine, then fail at runtime → slip to CI); running the tests
-# here makes the coder's own solve-loop iterate to green before a PR ever opens.
-PC_GATE="${ROXY_PC_GATE:-pnpm install --frozen-lockfile --prefer-offline && pnpm -r build && pnpm -r test}"
+# Early boot smoke of the SAME gate the spawned teams run. The team's project_board
+# loop is the AUTHORITATIVE fail-closed preflight (it HOLDS ready work when the gate
+# can't run on clean base); this is just an early operator signal before the server is
+# even up. The gate is DISCOVERED from the repo, never hard-coded — a transcribed gate
+# rots the moment the repo's CI changes or a team is pointed at a different repo (this
+# is the same resolution the plugin does for local_gate_cmd: "auto"):
+#   1. package.json ci/check/verify script → `pnpm run <it>` (repo-declared; its own
+#      CI should call the same target, so this smoke == CI by construction)
+#   2. Makefile/justfile ci|check target   → `make/just <it>`
+#   3. package.json, none declared         → `pnpm -r --if-present typecheck build test`
+#   4. nothing recognized                  → gateless (teams will be too)
+# Override with ROXY_PC_GATE. The pnpm store lives under /sandbox so deps persist across
+# image rolls (per-worktree install is a warm-cache no-op). Result left in the log and
+# /sandbox/.preflight-failed for the operator/board to read.
+resolve_gate() {
+    local repo="$1" install="pnpm install --frozen-lockfile --prefer-offline"
+    if [ -n "${ROXY_PC_GATE:-}" ]; then printf '%s' "$ROXY_PC_GATE"; return; fi
+    if [ -f "$repo/package.json" ]; then
+        for s in ci check verify; do
+            if node -e "process.exit((((require('$repo/package.json').scripts)||{})['$s'])?0:1)" 2>/dev/null; then
+                printf '%s && pnpm run %s' "$install" "$s"; return
+            fi
+        done
+        printf '%s && pnpm -r --if-present typecheck && pnpm -r --if-present build && pnpm -r --if-present test' "$install"; return
+    fi
+    for f in Makefile makefile justfile Justfile; do
+        [ -f "$repo/$f" ] || continue
+        local runner=make; case "$f" in justfile|Justfile) runner=just;; esac
+        for t in ci check; do grep -qE "^${t}:" "$repo/$f" && { printf '%s %s' "$runner" "$t"; return; }; done
+    done
+    printf ''
+}
+PC_GATE="$(resolve_gate "$PC_WORKDIR")"
 rm -f /sandbox/.preflight-failed
-if [ -d "$PC_WORKDIR/.git" ] && command -v pnpm >/dev/null 2>&1; then
+if [ -z "$PC_GATE" ]; then
+    echo "[roxy] PREFLIGHT: no gate discovered for $PC_WORKDIR — running gateless (teams will too)"
+elif [ -d "$PC_WORKDIR/.git" ] && command -v pnpm >/dev/null 2>&1; then
     pnpm config set store-dir /sandbox/.pnpm-store >/dev/null 2>&1 || true
-    echo "[roxy] PREFLIGHT: running the coder gate on clean main -> ${PC_GATE}"
+    echo "[roxy] PREFLIGHT: smoking the discovered gate on clean main -> ${PC_GATE}"
     if ( cd "$PC_WORKDIR" && eval "$PC_GATE" ) >/tmp/preflight.log 2>&1; then
         echo "[roxy] PREFLIGHT OK: gate is runnable — teams may dispatch work."
     else
-        echo "[roxy] !!! PREFLIGHT FAILED: the coder gate does not pass on clean main." >&2
+        echo "[roxy] !!! PREFLIGHT FAILED: the discovered gate does not pass on clean main." >&2
         tail -25 /tmp/preflight.log >&2
         echo "[roxy] !!! Coder environment is broken — do NOT dispatch work until fixed." >&2
         cp /tmp/preflight.log /sandbox/.preflight-failed 2>/dev/null || date > /sandbox/.preflight-failed
     fi
 elif [ -d "$PC_WORKDIR/.git" ]; then
-    echo "[roxy] !!! PREFLIGHT SKIPPED: pnpm not on PATH — coder gate 'pnpm -r build' can't run." >&2
+    echo "[roxy] !!! PREFLIGHT SKIPPED: pnpm not on PATH." >&2
     date > /sandbox/.preflight-failed
 fi
 
