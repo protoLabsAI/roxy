@@ -37,6 +37,10 @@ RUN set -eux; \
 # to upgrade.
 ARG PROTOCLI_VERSION=latest
 ARG PNPM_VERSION=10.12.1
+# Never prompt when corepack auto-switches to a repo's pinned packageManager (e.g.
+# protoContent's pnpm@10.12.1) at runtime — an interactive prompt would hang the
+# entrypoint preflight and the coder gates.
+ENV COREPACK_ENABLE_DOWNLOAD_PROMPT=0
 RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
     && apt-get install -y --no-install-recommends nodejs \
     && rm -rf /var/lib/apt/lists/* \
