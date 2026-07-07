@@ -37,8 +37,11 @@ delegates:
   - { name: claude, type: acp, command: claude-code,                  workdir: "{{REPO}}", permissions: auto, manage_git: true, base_branch: main, branch_prefix: claude }
   # fusion (ADR 0064 P3) — rung 4, an openai-type completion delegate (can't tool-call,
   # so it's NOT managed-git; the board seam writes its files into a worktree the harness
-  # then ships). Blank url → inherits roxy's gateway.
-  - { name: fusion, type: openai, model: protolabs/fusion, url: "", api_key: "" }
+  # then ships). Blank url → inherits roxy's gateway. api_key does NOT inherit like url
+  # does (adapters.py _secret only reads a literal or the api_key_env var) — a blank key
+  # sends NO Authorization header and the gateway 401s, blocking every gen that reaches
+  # this rung. Point it at OPENAI_API_KEY (roxy's gateway key, present in the team env).
+  - { name: fusion, type: openai, model: protolabs/fusion, url: "http://gateway:4000/v1", api_key_env: OPENAI_API_KEY }
 
 project_board:
   repo: "{{REPO}}"            # the repo the board manages; worktrees branch off it
