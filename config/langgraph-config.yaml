@@ -34,6 +34,29 @@ github:
   repos:
     - protoLabsAI/protoContent
 
+# Delegates (the `delegates` plugin) — named peers roxy can reach over A2A. matt is jon's
+# design-system engineer, hosted as an A2A tenant UNDER jon's hub (A2A URL-based multi-tenancy,
+# https://a2a-protocol.org/latest/topics/multi-tenancy/): roxy dials his /agents/matt-7689
+# tenant sub-path DIRECTLY, so the message lands on matt's own task queue — jon's agent loop is
+# never invoked (no "wasted jon route" through jon-the-agent). The hub is the single auth
+# boundary; roxy presents jon's hub token (JON_API_KEY, surfaced in the stack env — the same
+# value as jon's inbound A2A_AUTH_TOKEN). This finishes the coordinator→team wiring intended in
+# roxy commit 067fb63.
+delegates:
+  - name: matt
+    type: a2a
+    url: http://jon:7870/agents/matt-7689/a2a
+    auth:
+      scheme: bearer
+      credentialsEnv: JON_API_KEY
+    description: >-
+      Design-system & frontend specialist for protoLabs.studio — owns the design system
+      (tokens/themes/variants, @protolabsai/design), the packages/ui component library, the
+      marketing-site frontend, and accessibility on protoLabsAI/protoContent. Hand him a
+      design-system / component / a11y concern to scope or QA: he triages it into a buildable
+      brief, delegates the build back to roxy's protoContent team, and verifies the returned PR
+      against the tokens + a11y. He opens PRs; he never merges.
+
 # roxy is a Portfolio Manager — she orchestrates via portfolio_* tools, she doesn't shell.
 # Drop run_command entirely (allow_run:false): headless, there's no operator to answer its
 # HITL approval, so any shell call the model attempts stalls the turn forever. Team-side
