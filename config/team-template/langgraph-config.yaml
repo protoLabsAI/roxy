@@ -33,8 +33,12 @@ plugins:
 # open the PR idempotently. base_branch = main; branch_prefix namespaces each coder's
 # branches so siblings in linked worktrees never collide.
 delegates:
-  - { name: proto,  type: acp, command: proto,       args: ["--acp"], workdir: "{{REPO}}", permissions: auto, manage_git: true, base_branch: main, branch_prefix: proto }
-  - { name: claude, type: acp, command: claude-code,                  workdir: "{{REPO}}", permissions: auto, manage_git: true, base_branch: main, branch_prefix: claude }
+  # The escalation ladder climbs gateway MODELS via protocli (proto -m/--model, passed
+  # through args) — NOT a second binary. The claude-code ACP coder (claude-agent-acp) is
+  # not installed in roxy's image, so a claude tier would fail "agent binary not found".
+  # Keep every rung on protocli and climb the model instead: smart → reasoning.
+  - { name: proto,           type: acp, command: proto, args: ["--acp", "--model", "protolabs/smart"],     workdir: "{{REPO}}", permissions: auto, manage_git: true, base_branch: main, branch_prefix: proto }
+  - { name: proto-reasoning, type: acp, command: proto, args: ["--acp", "--model", "protolabs/reasoning"], workdir: "{{REPO}}", permissions: auto, manage_git: true, base_branch: main, branch_prefix: proto }
   # fusion (ADR 0064 P3) — rung 4, an openai-type completion delegate (can't tool-call,
   # so it's NOT managed-git; the board seam writes its files into a worktree the harness
   # then ships). Blank url → inherits roxy's gateway. api_key does NOT inherit like url
@@ -45,10 +49,10 @@ delegates:
 
 project_board:
   repo: "{{REPO}}"            # the repo the board manages; worktrees branch off it
-  coders:                     # escalation ladder (model tier climbs smart → reasoning → opus)
-    smart: proto
-    reasoning: claude
-    opus: claude
+  coders:                     # escalation ladder via protocli, climbing gateway models
+    smart: proto              # protocli @ protolabs/smart
+    reasoning: proto-reasoning # protocli @ protolabs/reasoning
+    opus: proto-reasoning     # protocli @ protolabs/reasoning (no separate opus binary)
   loop_enabled: true          # auto-dispatch ready features
   local_gate_cmd: "{{GATE}}"  # pre-PR gate — the repo's real check command (empty = none)
   coder_solve_fusion_delegate: fusion
