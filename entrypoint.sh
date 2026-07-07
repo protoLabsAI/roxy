@@ -72,7 +72,10 @@ fi
 # The pnpm store lives under /sandbox so deps persist across image rolls and the
 # per-worktree install is a warm-cache no-op (~seconds). Result is surfaced in the log
 # and left as /sandbox/.preflight-failed for the operator/board to read.
-PC_GATE="${ROXY_PC_GATE:-pnpm install --frozen-lockfile --prefer-offline && pnpm -r build}"
+# Gate = install + build + TEST. A build-only gate can't catch a coder's broken test
+# assertions (they compile fine, then fail at runtime → slip to CI); running the tests
+# here makes the coder's own solve-loop iterate to green before a PR ever opens.
+PC_GATE="${ROXY_PC_GATE:-pnpm install --frozen-lockfile --prefer-offline && pnpm -r build && pnpm -r test}"
 rm -f /sandbox/.preflight-failed
 if [ -d "$PC_WORKDIR/.git" ] && command -v pnpm >/dev/null 2>&1; then
     pnpm config set store-dir /sandbox/.pnpm-store >/dev/null 2>&1 || true
