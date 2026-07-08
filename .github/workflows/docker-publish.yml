@@ -1,0 +1,87 @@
+name: Publish Docker image to GHCR
+
+# Rolling image build on every push to main (and on demand / on a repository_dispatch
+# from a base bump): pushes ghcr.io/protolabsai/roxy:latest — what Watchtower polls —
+# plus a pinned sha-<short> for rollbacks.
+#
+# roxy is a thin image: stock ghcr.io/protolabsai/protoagent base + the pm-stack bundle
+# plugins (all cloned at PINNED TAGS, so no per-plugin SHA cache-bust is needed) + the
+# proto/node/pnpm coder runtime + seed config/SOUL. `pull: true` re-resolves the base each
+# build so roxy tracks upstream protoAgent releases instead of pinning the first base digest.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+  repository_dispatch:
+    types: [protoagent-base-published]
+
+concurrency:
+  group: docker-publish-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: protolabsai/roxy
+
+jobs:
+  build-and-push:
+    runs-on: namespace-profile-protolabs-linux
+    timeout-minutes: 40
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Generate image metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=latest
+            type=sha,prefix=sha-,format=short
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64
+          push: true
+          # Re-resolve `FROM …/protoagent:latest` each build so roxy tracks upstream.
+          pull: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:buildcache
+          cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:buildcache,mode=max
+
+      - name: Verify — pm-stack bundle + seed config baked in
+        run: |
+          SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
+          docker run --rm --entrypoint sh \
+            "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:sha-${SHORT_SHA}" \
+            -c 'test -f /opt/protoagent/plugins/portfolio/protoagent.plugin.yaml \
+                && test -f /opt/protoagent/plugins/github/protoagent.plugin.yaml \
+                && test -f "$PROTOAGENT_SEED_CONFIG" \
+                && test -f "$PROTOAGENT_SEED_SOUL" \
+                && command -v proto && command -v pnpm \
+                && echo "OK: portfolio+github plugins + seed config/SOUL + coder runtime present"'
