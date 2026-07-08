@@ -61,8 +61,8 @@ ENV PROTOAGENT_SEED_SOUL=/opt/roxy/seed/SOUL.md
 # --- team template roxy clones per spawned team (carries the managed-git coder) ---
 COPY config/team-template /opt/roxy/team-template
 
-# roxy's entrypoint preps the coder runtime (proto -> gateway, protoContent clone)
-# then execs the stock upstream launch.
+# roxy's entrypoint preps the coder runtime (proto -> gateway, git push auth for the
+# teams she spins up on demand) then execs the stock upstream launch.
 COPY entrypoint.sh /opt/protoagent/entrypoint.roxy.sh
 RUN chmod +x /opt/protoagent/entrypoint.roxy.sh \
     && chown -R sandbox:sandbox /opt/protoagent/config /opt/roxy

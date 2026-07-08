@@ -17,45 +17,54 @@ plugins:
 
 # portfolio (ADR 0055) — roxy orchestrates Lead Engineer teams. team_template is the
 # base team config she clones per spawn (carries the managed-git `proto` coder, ADR 0076).
-# team_archetypes are one-word spinup presets for the repos she runs often: a spawned
-# team inherits roxy's own gateway + OPENAI_API_KEY, so no per-team creds prep.
+# She keeps NO standing team: every team is spun up on demand for an ecosystem repo
+# (`portfolio_spinup_team(name, repo)`) and disposed when its board drains. A spawned team
+# inherits roxy's own gateway + OPENAI_API_KEY, so no per-team creds prep. (No team_archetypes
+# — the old `protocontent` standing preset is gone; protoContent is jon's/matt's domain now.)
 portfolio:
   team_template: /opt/roxy/team-template
-  team_archetypes:
-    protocontent:
-      repo: /sandbox/work/protoContent   # cloned + kept fresh by the entrypoint
-      gate: "pnpm -r build"              # the team's verification command (tune to protoContent)
 
-# github (manager tier): file/triage issues + read PRs/CI across the repos roxy watches.
-# write:true loads the write tools (merge stays confirm-guarded). Bounded by GH_TOKEN scope.
+# github (manager tier): file/triage issues + read PRs/CI across the ECOSYSTEM repos roxy
+# owns — the product/runtime line beyond content/design (protoContent → jon/matt; homelab →
+# frank). write:true loads the write tools (merge stays confirm-guarded). Bounded by GH_TOKEN
+# scope — the token must carry write on these repos for on-demand teams to push.
 github:
   write: true
-  default_repo: protoLabsAI/protoContent
+  default_repo: protoLabsAI/protoAgent
   repos:
-    - protoLabsAI/protoContent
+    - protoLabsAI/protoAgent
+    - protoLabsAI/protoLab
+    - protoLabsAI/ORBIS
 
-# Delegates (the `delegates` plugin) — named peers roxy can reach over A2A. matt is jon's
-# design-system engineer, hosted as an A2A tenant UNDER jon's hub (A2A URL-based multi-tenancy,
-# https://a2a-protocol.org/latest/topics/multi-tenancy/): roxy dials his /agents/matt-7689
-# tenant sub-path DIRECTLY, so the message lands on matt's own task queue — jon's agent loop is
-# never invoked (no "wasted jon route" through jon-the-agent). The hub is the single auth
-# boundary; roxy presents jon's hub token (JON_API_KEY, surfaced in the stack env — the same
-# value as jon's inbound A2A_AUTH_TOKEN). This finishes the coordinator→team wiring intended in
-# roxy commit 067fb63.
+# Delegates (the `delegates` plugin) — the two domain PMs roxy hands domain-specific work to
+# (she keeps cross-repo / ecosystem / infra herself). Both are STANDALONE Portfolio Managers
+# on the ai net (their own containers), reached by container name; roxy presents each one's own
+# inbound token (surfaced in her stack env). They're peers — she routes, they run their teams.
 delegates:
-  - name: matt
+  - name: jon
     type: a2a
-    url: http://jon:7870/agents/matt-7689/a2a
+    url: http://jon:7870/a2a
     auth:
       scheme: bearer
       credentialsEnv: JON_API_KEY
     description: >-
-      Design-system & frontend specialist for protoLabs.studio — owns the design system
-      (tokens/themes/variants, @protolabsai/design), the packages/ui component library, the
-      marketing-site frontend, and accessibility on protoLabsAI/protoContent. Hand him a
-      design-system / component / a11y concern to scope or QA: he triages it into a buildable
-      brief, delegates the build back to roxy's protoContent team, and verifies the returned PR
-      against the tokens + a11y. He opens PRs; he never merges.
+      jon — content Portfolio Manager (peer). Owns the protoContent Payload pipeline (ideas →
+      drafts → publications), the locked brand voice, and docs/blog/social. Hand him any
+      writing / content / copy / docs need — his content team drafts it into Payload and he
+      gates the brand voice. He owns the words; he never merges.
+  - name: matt
+    type: a2a
+    url: http://matt:7870/a2a
+    auth:
+      scheme: bearer
+      credentialsEnv: MATT_A2A_TOKEN
+    description: >-
+      matt — design/brand Portfolio Manager (peer). Owns the design system (@protolabsai/design
+      tokens, @protolabsai/ui component library) and the marketing-site UI on protoLabsAI/
+      protoContent, and runs his OWN design/frontend Lead Engineer team. Hand him any design /
+      component / theme / a11y need — he scopes it into a brief, builds it through his team, and
+      GATES the returned PR on tokens + a11y + DS consistency. He owns the pixels; you own the
+      broader ecosystem delivery. He directs + gatekeeps; he never merges.
 
 # roxy is a Portfolio Manager — she orchestrates via portfolio_* tools, she doesn't shell.
 # Drop run_command entirely (allow_run:false): headless, there's no operator to answer its
@@ -76,11 +85,13 @@ knowledge:
 a2a:
   require_routable_url: true
   description: >-
-    roxy — Portfolio Manager for the protoLabs.studio engineering fleet. Orchestrates
-    work across many Lead Engineer teams: spins a team up per project, dispatches
-    features to each team's board over A2A, rolls up a bounded cross-board view, sequences
-    cross-board dependencies, and files/triages the GitHub issues a team can't resolve
-    itself. Runs the standing protoContent team (managed-git coder pool). She manages
+    roxy — Ecosystem Portfolio Manager for protoLabs.studio. Owns cross-repo delivery across
+    the wider fleet — the product/runtime repos beyond content and design (protoAgent, protoLab,
+    ORBIS), ecosystem features, and infra-adjacent work — and coordinates across the domain PMs.
+    She spins up managed-git Lead Engineer teams on demand per project, dispatches features to
+    their boards over A2A, rolls up a bounded cross-board view, sequences cross-board
+    dependencies, and files/triages the GitHub issues a team can't resolve itself. Content she
+    routes to jon, design/brand to matt; anything cross-repo or ecosystem she keeps. She manages
     delivery; she does not write code or merge.
   skills:
     - id: portfolio_orchestration
@@ -90,16 +101,25 @@ a2a:
         state, sequence dependencies, and report progress as work merges to done.
       tags: [portfolio, orchestration, delivery, a2a]
       examples:
-        - "Ship the compare-view feature on protoContent."
+        - "Ship the trace-export feature on protoAgent."
         - "What's blocked across my teams right now?"
     - id: team_lifecycle
       name: Team Lifecycle
       description: >-
-        Spin up a Lead Engineer team for a repo on demand, dispatch its work, and dispose
-        it once its board drains. Standing teams (protoContent) stay up.
+        Spin up a Lead Engineer team for an ecosystem repo on demand, dispatch its work, and
+        dispose it once its board drains. She keeps no standing team.
       tags: [teams, spinup, lifecycle]
       examples:
         - "Stand up a team for the ORBIS repo and give it this feature."
+    - id: cross_domain_coordination
+      name: Cross-Domain Coordination
+      description: >-
+        Route domain-specific work to the owning PM (content → jon, design/brand → matt),
+        sequence cross-repo dependencies between the domains, and keep the shared roadmap moving.
+      tags: [coordination, routing, portfolio, a2a]
+      examples:
+        - "This release needs a blog post and a UI refresh — coordinate jon and matt."
+        - "Sequence the ORBIS API change ahead of the work that depends on it."
     - id: issue_triage
       name: Issue Triage
       description: >-
@@ -107,4 +127,4 @@ a2a:
         external dependency, a cross-repo ask, a decision that needs a human.
       tags: [github, issues, triage]
       examples:
-        - "File an issue for the API change protoContent is blocked on."
+        - "File an issue for the API change protoAgent is blocked on."
