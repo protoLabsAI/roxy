@@ -23,8 +23,10 @@ RUN set -eux; \
     clone() { git clone --depth 1 --branch "$2" "$1" "/opt/protoagent/plugins/$3" && rm -rf "/opt/protoagent/plugins/$3/.git"; }; \
     clone https://github.com/protoLabsAI/portfolio-plugin       v0.16.0 portfolio; \
     clone https://github.com/protoLabsAI/github-plugin          v0.1.3  github; \
-    clone https://github.com/protoLabsAI/projectBoard-plugin    v0.33.0 project_board; \
-    clone https://github.com/protoLabsAI/agent-browser-plugin   v0.5.1  agent_browser
+    clone https://github.com/protoLabsAI/projectBoard-plugin    v0.33.0 project_board
+# agent_browser is no longer cloned here — protoagent base now bundles it
+# (currently v0.7.0); an explicit clone into the same path fails the build
+# ("destination path already exists and is not an empty directory").
 
 # --- coder runtime for spun-up Lead Engineer teams ------------------------------
 # A spawned team's project_board spawn loop dispatches builds to the `proto` acp coder
